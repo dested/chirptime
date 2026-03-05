@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicovince/tauri/refs/heads/dev/crates/tauri-cli/schema.json",
+  "productName": "Screener",
+  "version": "1.0.0",
+  "identifier": "com.screener.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "bun run vite:dev",
+    "beforeBuildCommand": "bun run vite:build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Screener",
+        "width": 1280,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    },
+    "fs": {}
+  }
+}
