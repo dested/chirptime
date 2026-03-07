@@ -35,6 +35,7 @@ export interface CaptureConfig {
   video_framerate: number;
   video_preset: string;
   record_audio: boolean;
+  audio_device: string | null;
   pip_overlay: boolean;
   webcam_device: string | null;
   output_dir: string;

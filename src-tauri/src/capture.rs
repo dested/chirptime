@@ -104,10 +104,19 @@ pub async fn run_capture_cycle(
     let ffmpeg = find_ffmpeg().ok_or("FFmpeg not found in PATH")?;
 
     // Auto-detect webcam if not configured
+    let (auto_video, auto_audio) = list_dshow_devices(&ffmpeg);
     let webcam_device = config.webcam_device.clone().or_else(|| {
-        let (video_devices, _) = list_dshow_devices(&ffmpeg);
-        video_devices.into_iter().next()
+        auto_video.into_iter().next()
     });
+
+    // Auto-detect audio device if not configured but record_audio is on
+    let audio_device = if config.record_audio {
+        config.audio_device.clone().or_else(|| {
+            auto_audio.into_iter().next()
+        })
+    } else {
+        None
+    };
 
     // Capture screenshot
     let screenshot_path = screenshots_dir.join(format!("{}.png", timestamp));
@@ -147,22 +156,33 @@ pub async fn run_capture_cycle(
             let framerate = config.video_framerate.to_string();
             let preset = config.video_preset.clone();
             let path = screen_path.clone();
+            let audio_dev = audio_device.clone();
             std::thread::spawn(move || {
-                silent_command(&ffmpeg)
-                    .args([
-                        "-f", "gdigrab",
-                        "-framerate", &framerate,
-                        "-i", "desktop",
-                        "-t", &duration,
-                        "-vf", &format!("scale=3840:-2,drawtext=text='%{{localtime\\:%Y-%m-%d %H\\\\\\:%M\\\\\\:%S}}':fontsize=24:fontcolor=white:borderw=2:bordercolor=black:x=10:y=10"),
-                        "-c:v", "libx264",
-                        "-preset", &preset,
-                        "-crf", "23",
-                        "-pix_fmt", "yuv420p",
-                        "-y",
-                    ])
-                    .arg(&path)
-                    .output()
+                let mut cmd = silent_command(&ffmpeg);
+                cmd.args([
+                    "-f", "gdigrab",
+                    "-framerate", &framerate,
+                    "-i", "desktop",
+                ]);
+                // Add audio input if available
+                if let Some(ref dev) = audio_dev {
+                    cmd.args([
+                        "-f", "dshow",
+                        "-i", &format!("audio={}", dev),
+                    ]);
+                }
+                cmd.args([
+                    "-t", &duration,
+                    "-vf", &format!("scale=3840:-2,drawtext=text='%{{localtime\\:%Y-%m-%d %H\\\\\\:%M\\\\\\:%S}}':fontsize=24:fontcolor=white:borderw=2:bordercolor=black:x=10:y=10"),
+                    "-c:v", "libx264",
+                    "-preset", &preset,
+                    "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                ]);
+                if audio_dev.is_some() {
+                    cmd.args(["-c:a", "aac", "-b:a", "128k"]);
+                }
+                cmd.args(["-y"]).arg(&path).output()
             })
         };
 
@@ -173,21 +193,33 @@ pub async fn run_capture_cycle(
             let preset = config.video_preset.clone();
             let device = device.clone();
             let path = webcam_path.clone();
+            let audio_dev = audio_device.clone();
             std::thread::spawn(move || {
-                silent_command(&ffmpeg)
-                    .args([
+                let mut cmd = silent_command(&ffmpeg);
+                // If audio device available, combine video+audio in one dshow input
+                if let Some(ref adev) = audio_dev {
+                    cmd.args([
+                        "-f", "dshow",
+                        "-i", &format!("video={}:audio={}", device, adev),
+                    ]);
+                } else {
+                    cmd.args([
                         "-f", "dshow",
                         "-i", &format!("video={}", device),
-                        "-t", &duration,
-                        "-vf", &format!("drawtext=text='%{{localtime\\:%Y-%m-%d %H\\\\\\:%M\\\\\\:%S}}':fontsize=24:fontcolor=white:borderw=2:bordercolor=black:x=10:y=10"),
-                        "-c:v", "libx264",
-                        "-preset", &preset,
-                        "-crf", "23",
-                        "-pix_fmt", "yuv420p",
-                        "-y",
-                    ])
-                    .arg(&path)
-                    .output()
+                    ]);
+                }
+                cmd.args([
+                    "-t", &duration,
+                    "-vf", &format!("drawtext=text='%{{localtime\\:%Y-%m-%d %H\\\\\\:%M\\\\\\:%S}}':fontsize=24:fontcolor=white:borderw=2:bordercolor=black:x=10:y=10"),
+                    "-c:v", "libx264",
+                    "-preset", &preset,
+                    "-crf", "23",
+                    "-pix_fmt", "yuv420p",
+                ]);
+                if audio_dev.is_some() {
+                    cmd.args(["-c:a", "aac", "-b:a", "128k"]);
+                }
+                cmd.args(["-y"]).arg(&path).output()
             })
         });
 
