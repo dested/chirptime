@@ -18,5 +18,5 @@ warp = "0.3"
 tauri-build = { version = "2", features = [] }
 
 [lib]
-name = "screener_lib"
+name = "chirptime_lib"
 crate-type = ["lib", "cdylib", "staticlib"]

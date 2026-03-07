@@ -99,7 +99,7 @@ export function Layout({ state, onSelectDate, onSelectTimestamp, onSelectMonitor
   const totalEntries = state.dateEntry?.entries.length ?? 0;
 
   return (
-    <div style={{ display: "flex", height: "100vh", overflow: "hidden", background: "#09090b" }}>
+    <div style={{ display: "flex", height: "100vh", overflow: "hidden", background: "#09090b", color: "#fafafa" }}>
       {/* Sidebar */}
       <div style={{ display: "flex", flexDirection: "column" }}>
         <DatePicker

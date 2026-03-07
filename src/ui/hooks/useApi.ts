@@ -48,3 +48,7 @@ export async function runSingleCapture(): Promise<string> {
 export async function listDevices(): Promise<{ video: string[]; audio: string[] }> {
   return invoke<{ video: string[]; audio: string[] }>("list_devices");
 }
+
+export async function openViewer(): Promise<void> {
+  return invoke("open_viewer");
+}

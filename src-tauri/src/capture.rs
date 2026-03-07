@@ -10,6 +10,24 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn Beep(dwFreq: u32, dwDuration: u32) -> i32;
+}
+
+/// Play a pleasant two-tone chirp before capture starts.
+fn chirp() {
+    #[cfg(target_os = "windows")]
+    {
+        std::thread::spawn(|| {
+            unsafe {
+                Beep(1200, 80);
+                Beep(1600, 120);
+            }
+        });
+    }
+}
+
 /// Create a Command that won't spawn a visible console window on Windows.
 fn silent_command(program: &str) -> Command {
     let mut cmd = Command::new(program);
@@ -88,6 +106,9 @@ pub fn list_dshow_devices(ffmpeg: &str) -> (Vec<String>, Vec<String>) {
 pub async fn run_capture_cycle(
     state: Arc<Mutex<AppState>>,
 ) -> Result<String, String> {
+    // Chirp before capture
+    chirp();
+
     let config = {
         let s = state.lock().await;
         s.config.clone()

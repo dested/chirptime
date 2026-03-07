@@ -1,9 +1,15 @@
 {
   "identifier": "default",
-  "description": "Default capability for the main window",
-  "windows": ["main"],
+  "description": "Capabilities for all windows",
+  "windows": ["main", "viewer"],
   "permissions": [
     "core:default",
+    "core:window:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-close",
+    "core:window:allow-set-focus",
+    "core:window:allow-create",
     "shell:allow-open",
     "shell:allow-execute",
     "shell:allow-spawn",

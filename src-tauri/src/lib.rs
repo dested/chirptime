@@ -41,6 +41,7 @@ pub fn run() {
             commands::run_single_capture,
             commands::get_ffmpeg_path,
             commands::list_devices,
+            commands::open_viewer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

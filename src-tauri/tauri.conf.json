@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicovince/tauri/refs/heads/dev/crates/tauri-cli/schema.json",
-  "productName": "Screener",
+  "productName": "ChirpTime",
   "version": "1.0.0",
-  "identifier": "com.screener.app",
+  "identifier": "com.chirptime.app",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -12,11 +12,15 @@
   "app": {
     "windows": [
       {
-        "title": "Screener",
-        "width": 1280,
-        "height": 800,
-        "resizable": true,
-        "fullscreen": false
+        "label": "main",
+        "title": "ChirpTime",
+        "width": 320,
+        "height": 540,
+        "resizable": false,
+        "fullscreen": false,
+        "decorations": false,
+        "transparent": false,
+        "alwaysOnTop": true
       }
     ],
     "security": {

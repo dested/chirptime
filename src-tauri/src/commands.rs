@@ -3,6 +3,7 @@ use crate::state::{AppState, CaptureConfig, CaptureStatus};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tauri::Manager;
 use tokio::sync::Mutex;
 
 type State = Arc<Mutex<AppState>>;
@@ -347,4 +348,25 @@ pub async fn list_devices() -> Result<DshowDevices, String> {
     let ffmpeg = capture::find_ffmpeg().ok_or("FFmpeg not found")?;
     let (video, audio) = capture::list_dshow_devices(&ffmpeg);
     Ok(DshowDevices { video, audio })
+}
+
+#[tauri::command]
+pub async fn open_viewer(app: tauri::AppHandle) -> Result<(), String> {
+    // If viewer window already exists, just focus it
+    if let Some(w) = app.get_webview_window("viewer") {
+        w.set_focus().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "viewer",
+        tauri::WebviewUrl::App("/?mode=viewer".into()),
+    )
+    .title("ChirpTime - Viewer")
+    .inner_size(1280.0, 800.0)
+    .build()
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
 }
