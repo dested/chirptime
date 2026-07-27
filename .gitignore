@@ -5,3 +5,6 @@ output/
 src-tauri/target/
 src/viewer-ui/.build/
 .idea
+# Staging dir the release workflow assembles installers into
+dist-release/
+release-notes.md

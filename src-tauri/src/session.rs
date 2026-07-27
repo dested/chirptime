@@ -269,7 +269,17 @@ pub struct ProbeResult {
     pub has_video: bool,
 }
 
+/// Locate `ffprobe.exe`. **Mirrors `capture::find_ffmpeg`'s candidate order** —
+/// hand-picked folder, then PATH and the two classic install dirs, then the
+/// app-managed install. The two must stay in step: the recorder resolves both,
+/// and an ffmpeg without a matching ffprobe records segments it cannot index.
 pub fn find_ffprobe() -> Option<String> {
+    if let Some(p) = crate::settings::ffmpeg_dir_override() {
+        let exe = Path::new(&p).join("ffprobe.exe");
+        if exe.is_file() {
+            return Some(exe.to_string_lossy().to_string());
+        }
+    }
     if crate::recorder::silent_command("ffprobe")
         .arg("-version")
         .output()
@@ -286,7 +296,7 @@ pub fn find_ffprobe() -> Option<String> {
             return Some(c.to_string());
         }
     }
-    None
+    crate::ffmpeg_install::managed("ffprobe.exe")
 }
 
 /// ffprobe one closed segment. Returns `Err` for a file that is missing,

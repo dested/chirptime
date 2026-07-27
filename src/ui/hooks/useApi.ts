@@ -7,6 +7,7 @@ import type {
   CaptureConfig,
   CaptureStatus,
   EnvironmentInfo,
+  FfmpegSetup,
   SessionManifest,
   SessionMarker,
   SessionOptions,
@@ -97,6 +98,34 @@ export async function getEnvironment(): Promise<EnvironmentInfo> {
  */
 export async function pickOutputDir(): Promise<string | null> {
   return invoke<string | null>("pick_output_dir");
+}
+
+/** Where FFmpeg is (or is not), and what a download would cost. */
+export async function getFfmpegSetup(): Promise<FfmpegSetup> {
+  return invoke<FfmpegSetup>("get_ffmpeg_setup");
+}
+
+/**
+ * Download, verify and install FFmpeg. Only ever call this from an explicit
+ * button — it spends ~105 MB of the user's bandwidth. Progress arrives as
+ * `ffmpeg-install-progress` events; the promise resolves to the ffmpeg path.
+ */
+export async function installFfmpeg(): Promise<string> {
+  return invoke<string>("install_ffmpeg");
+}
+
+/**
+ * Point ChirpTime at an FFmpeg the user already has — the way out when the
+ * download is blocked. Rejects a folder without both runnable binaries.
+ * Resolves to `null` when the picker was cancelled.
+ */
+export async function pickFfmpegDir(): Promise<string | null> {
+  return invoke<string | null>("pick_ffmpeg_dir");
+}
+
+/** Forget the hand-picked folder and go back to the normal lookup order. */
+export async function clearFfmpegDir(): Promise<void> {
+  return invoke("clear_ffmpeg_dir");
 }
 
 /** Show a folder in Explorer. No argument means the configured output folder. */

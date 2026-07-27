@@ -57,7 +57,25 @@ pub fn ensure_day_dirs(output_dir: &PathBuf, date_str: &str) -> std::io::Result<
     Ok((screenshots, video, webcam))
 }
 
+/// Locate `ffmpeg.exe`.
+///
+/// Order matters and is deliberate. A folder the user pointed at by hand wins
+/// outright — they said so explicitly. Then the three lookups that predate the
+/// first-run installer, so a machine that already had FFmpeg keeps using the
+/// exact binary it always used and downloads nothing. The app-managed install
+/// from `ffmpeg_install` is last: it is the fallback for a machine that had
+/// none, and it must never quietly displace a user's own build.
+///
+/// **`session::find_ffprobe` mirrors this list** and has to keep mirroring it —
+/// the recorder needs both halves, and finding one without the other records
+/// footage it then cannot index.
 pub fn find_ffmpeg() -> Option<String> {
+    if let Some(p) = crate::settings::ffmpeg_dir_override() {
+        let exe = std::path::Path::new(&p).join("ffmpeg.exe");
+        if exe.is_file() {
+            return Some(exe.to_string_lossy().to_string());
+        }
+    }
     // Try ffmpeg in PATH
     if silent_command("ffmpeg").arg("-version").output().is_ok() {
         return Some("ffmpeg".to_string());
@@ -72,7 +90,7 @@ pub fn find_ffmpeg() -> Option<String> {
             return Some(c.to_string());
         }
     }
-    None
+    crate::ffmpeg_install::managed("ffmpeg.exe")
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

@@ -96,6 +96,11 @@ pub struct AppState {
     pub session_options: serde_json::Value,
     /// The first-run panel has been dismissed.
     pub onboarded: bool,
+    /// A folder holding FFmpeg that the user pointed at by hand, or `None`.
+    /// Mirrored here only so `settings()` can round-trip it — the lookups in
+    /// `capture::find_ffmpeg` read it off disk, because they run on threads
+    /// that never see this state.
+    pub ffmpeg_dir: Option<String>,
 }
 
 impl AppState {
@@ -104,6 +109,7 @@ impl AppState {
             config: s.capture,
             session_options: s.session,
             onboarded: s.onboarded,
+            ffmpeg_dir: s.ffmpeg_dir,
             ..Default::default()
         }
     }
@@ -115,6 +121,7 @@ impl AppState {
             capture: self.config.clone(),
             session: self.session_options.clone(),
             onboarded: self.onboarded,
+            ffmpeg_dir: self.ffmpeg_dir.clone(),
         }
     }
 }

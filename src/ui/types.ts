@@ -64,6 +64,34 @@ export interface Settings {
    */
   session: Partial<SessionOptions> | null;
   onboarded: boolean;
+  /** A folder the user pointed at by hand, or null for the normal lookup order. */
+  ffmpeg_dir: string | null;
+}
+
+/**
+ * Mirrors `commands::FfmpegSetup`. Everything the first-run panel needs to
+ * decide whether to offer the download and what to say about it — the size is
+ * here so the user is told before agreeing, never after.
+ */
+export interface FfmpegSetup {
+  /** Non-null means a usable FFmpeg was found; nothing is offered. */
+  ffmpeg_path: string | null;
+  /** Resolved separately — the session recorder needs both halves. */
+  ffprobe_path: string | null;
+  managed: boolean;
+  manual_dir: string | null;
+  install_dir: string;
+  download_url: string;
+  download_bytes: number;
+  version: string;
+  installing: boolean;
+}
+
+/** Payload of the `ffmpeg-install-progress` event. */
+export interface FfmpegProgress {
+  phase: "downloading" | "verifying" | "extracting" | "checking" | "done";
+  downloaded_bytes: number;
+  total_bytes: number;
 }
 
 /** Mirrors `settings::LegacyOutput`. Reported only; nothing is ever moved. */

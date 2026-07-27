@@ -1,0 +1,114 @@
+# ChirpTime is Windows-only by design (gdigrab/ddagrab/dshow, WASAPI COM, DXGI,
+# NVENC/QSV) — see decisions.md, "Windows-only, deliberately". There is
+# deliberately no mac/linux matrix here; those jobs could only ever fail.
+#
+# This file is separate from the Drydock-owned workflow on purpose. Do not merge
+# the two.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Keyed on src-tauri/ so the Rust cache is not invalidated by frontend churn.
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      # `tauri build` runs `bun run vite:build` itself via beforeBuildCommand,
+      # then bundles the MSI and the NSIS installer (bundle.targets in
+      # tauri.conf.json). The WiX and NSIS toolchains are downloaded by the
+      # Tauri CLI on first use.
+      - name: Build
+        run: bun run build
+
+      # Tauri names bundles from the version in tauri.conf.json, not from the
+      # tag, so the paths are globbed rather than constructed. The portable zip
+      # is just the exe: ChirpTime is a single binary that relies on the WebView2
+      # runtime already present on Windows 10/11.
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-release | Out-Null
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+
+          $msi = Get-ChildItem src-tauri/target/release/bundle/msi/*.msi | Select-Object -First 1
+          $nsis = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          # Cargo names the binary after the crate (`chirptime`), not after
+          # productName — verified against a local `tauri build`.
+          $exe = Get-Item src-tauri/target/release/chirptime.exe
+
+          if (-not $msi) { throw "no .msi produced" }
+          if (-not $nsis) { throw "no NSIS installer produced" }
+
+          Copy-Item $msi.FullName "dist-release/ChirpTime_${version}_x64.msi"
+          Copy-Item $nsis.FullName "dist-release/ChirpTime_${version}_x64-setup.exe"
+          Compress-Archive -Path $exe.FullName -DestinationPath "dist-release/ChirpTime_${version}_x64-portable.zip" -Force
+
+          Get-ChildItem dist-release | Select-Object Name, Length | Format-Table
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          Set-Content -Path release-notes.md -Encoding utf8 -Value @'
+          ## Install
+
+          Download the **`-setup.exe`** (recommended) or the **`.msi`**. The **`.zip`**
+          is the bare executable if you would rather not install anything.
+
+          These builds are **not code-signed**, so Windows SmartScreen shows
+          "Windows protected your PC" the first time you run them. Choose
+          *More info* then *Run anyway*.
+
+          ## Before it can record
+
+          - Windows 10 or 11.
+          - **FFmpeg.** You do not need to install it yourself. On first run, if it is
+            not already on your machine, ChirpTime tells you the size (~105 MB) and
+            offers to fetch it — nothing downloads until you press the button. The
+            archive is verified against a SHA-256 hash built into the app before
+            anything is unpacked or run, and it installs per-user with no admin
+            rights. If you already have FFmpeg on `PATH` or in `C:\ffmpeg`, it is used
+            as-is and nothing is downloaded.
+          - An NVIDIA GPU is optional; it takes the faster encoder path.
+
+          Recording writes roughly 5-8 GB per hour, and nothing is ever deleted
+          automatically.
+
+          ChirpTime is MIT licensed. FFmpeg is a separate GPL program that ChirpTime
+          runs as a subprocess; it is not bundled in these installers.
+          '@
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $files = Get-ChildItem dist-release | ForEach-Object { $_.FullName }
+          gh release create "${{ github.ref_name }}" $files `
+            --title "ChirpTime ${{ github.ref_name }}" `
+            --notes-file release-notes.md `
+            --generate-notes

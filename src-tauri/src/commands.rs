@@ -411,6 +411,163 @@ pub async fn pick_output_dir(
     Ok(Some(capture::get_output_dir(&s.config).to_string_lossy().to_string()))
 }
 
+// ---------------------------------------------------------------------------
+// First-run FFmpeg install
+// ---------------------------------------------------------------------------
+
+/// What the widget needs to decide whether to offer the download, and what to
+/// say about it. `download_bytes` and `version` are surfaced so the user is told
+/// the size *before* agreeing to a 105 MB transfer, never after.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FfmpegSetup {
+    /// A usable ffmpeg was found. False is the only state that offers a download.
+    pub ffmpeg_path: Option<String>,
+    /// Resolved separately from ffmpeg because a machine can have one without
+    /// the other, and the session recorder needs both.
+    pub ffprobe_path: Option<String>,
+    /// This app's own install exists under `%APPDATA%`.
+    pub managed: bool,
+    /// The folder the user pointed at by hand, if any.
+    pub manual_dir: Option<String>,
+    /// Where a download would land.
+    pub install_dir: String,
+    pub download_url: String,
+    pub download_bytes: u64,
+    pub version: String,
+    /// True while an install is running, so a reopened panel rejoins rather than
+    /// offering a second download.
+    pub installing: bool,
+}
+
+/// One install at a time. Two concurrent runs would fight over the same staging
+/// directory and the loser would delete the winner's work.
+static INSTALLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[tauri::command]
+pub async fn get_ffmpeg_setup() -> Result<FfmpegSetup, String> {
+    // Both lookups spawn a process when PATH is populated; keep them off the
+    // async runtime like `get_environment` does.
+    tokio::task::spawn_blocking(|| FfmpegSetup {
+        ffmpeg_path: capture::find_ffmpeg(),
+        ffprobe_path: crate::session::find_ffprobe(),
+        managed: crate::ffmpeg_install::is_installed(),
+        manual_dir: crate::settings::ffmpeg_dir_override(),
+        install_dir: crate::nativeui::display_path(&crate::ffmpeg_install::bin_dir()),
+        download_url: crate::ffmpeg_install::FFMPEG_URL.to_string(),
+        download_bytes: crate::ffmpeg_install::FFMPEG_ZIP_BYTES,
+        version: crate::ffmpeg_install::FFMPEG_VERSION.to_string(),
+        installing: INSTALLING.load(std::sync::atomic::Ordering::SeqCst),
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Download, verify and install FFmpeg. **Only ever called from a button** —
+/// nothing in the app reaches this on its own, because ~105 MB of someone
+/// else's bandwidth is not ours to spend unasked.
+///
+/// Progress is emitted as `ffmpeg-install-progress` events rather than returned,
+/// so a 105 MB download is not a silent hang. The returned string is the
+/// resolved `ffmpeg.exe` path.
+#[tauri::command]
+pub async fn install_ffmpeg(app: tauri::AppHandle) -> Result<String, String> {
+    use std::sync::atomic::Ordering;
+    if INSTALLING.swap(true, Ordering::SeqCst) {
+        return Err("An FFmpeg install is already running.".into());
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::ffmpeg_install::install(|p| {
+            use tauri::Emitter;
+            // A dropped progress event is cosmetic; it must never fail the
+            // install that is otherwise going fine.
+            let _ = app.emit("ffmpeg-install-progress", p);
+        })
+    })
+    .await;
+
+    INSTALLING.store(false, Ordering::SeqCst);
+
+    let dir = result.map_err(|e| e.to_string())??;
+    capture::find_ffmpeg().ok_or_else(|| {
+        format!(
+            "FFmpeg installed to {} but still cannot be resolved.",
+            dir.display()
+        )
+    })
+}
+
+/// Point ChirpTime at an FFmpeg the user already has. This is the way out for
+/// someone whose network blocks the download — without it, a blocked download is
+/// a dead end.
+///
+/// The folder is rejected unless it holds **both** binaries and both of them
+/// run, so an accepted choice is one that will actually work rather than one
+/// that fails later during a recording.
+#[tauri::command]
+pub async fn pick_ffmpeg_dir(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, State>,
+) -> Result<Option<String>, String> {
+    // The widget is always-on-top; an unowned dialog opens behind it.
+    let parent = app
+        .get_webview_window("main")
+        .and_then(|w| w.hwnd().ok())
+        .map(|h| h.0 as isize);
+
+    let picked = tokio::task::spawn_blocking(move || crate::nativeui::pick_folder(None, parent))
+        .await
+        .map_err(|e| e.to_string())??;
+
+    let Some(picked) = picked else { return Ok(None) };
+
+    let dir = std::path::PathBuf::from(&picked);
+    // gyan-style archives put the binaries in `bin/`, so accept either the
+    // folder itself or its `bin` — picking the extracted root is the obvious
+    // mistake and there is no reason to punish it.
+    let candidates = [dir.clone(), dir.join("bin")];
+    let found = candidates.iter().find(|d| {
+        d.join("ffmpeg.exe").is_file() && d.join("ffprobe.exe").is_file()
+    });
+    let Some(found) = found else {
+        return Err(format!(
+            "{} does not contain both ffmpeg.exe and ffprobe.exe. Pick the folder \
+             holding them (often the build's \"bin\" folder).",
+            crate::nativeui::display_path(&dir)
+        ));
+    };
+
+    let resolved = found.to_string_lossy().to_string();
+    {
+        let mut s = state.lock().await;
+        s.ffmpeg_dir = Some(resolved.clone());
+        persist(&s);
+    }
+
+    // Persisted before verifying so `find_ffmpeg` picks it up, then verified for
+    // real — a folder with the right filenames but an unrunnable binary is
+    // rejected and the setting rolled back rather than left to fail mid-capture.
+    let ok = tokio::task::spawn_blocking(|| capture::find_ffmpeg().is_some() && crate::session::find_ffprobe().is_some())
+        .await
+        .map_err(|e| e.to_string())?;
+    if !ok {
+        let mut s = state.lock().await;
+        s.ffmpeg_dir = None;
+        persist(&s);
+        return Err(format!("{resolved} holds both binaries but they could not be run."));
+    }
+    Ok(Some(resolved))
+}
+
+/// Forget a hand-picked folder and fall back to the normal lookup order.
+#[tauri::command]
+pub async fn clear_ffmpeg_dir(state: tauri::State<'_, State>) -> Result<(), String> {
+    let mut s = state.lock().await;
+    s.ffmpeg_dir = None;
+    persist(&s);
+    Ok(())
+}
+
 /// Show a folder in Explorer. With no argument this is "where are my
 /// recordings" — the configured output dir, created first if the user has not
 /// recorded yet so the button is never a dead end.

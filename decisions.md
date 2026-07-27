@@ -6,6 +6,82 @@
 > Entries below dated 2026-03-xx were reconstructed from the code on 2026-07-27
 > when this file was created; the reasoning is inferred from the implementation.
 
+## 2026-07-27 — ChirpTime is MIT, and that is what keeps FFmpeg out of the installer
+**Why:** the repo had no LICENSE at all, which made "can we ship FFmpeg with
+this" unanswerable. MIT settles it, and the two questions turn out to be one:
+ChirpTime **invokes** FFmpeg as a separate subprocess and neither links it nor
+distributes its binaries, so FFmpeg's GPL does not reach ChirpTime's own
+distribution. Bundling `ffmpeg.exe` into the MSI *would* make the installer a
+GPL distribution; fetching it at the user's request does not.
+**Chosen:** MIT `LICENSE`, and FFmpeg downloaded on first run — see the next
+entry. The README says plainly that the build ChirpTime offers to fetch is GPL
+and that the license covers that download, not ChirpTime.
+**Rejected:** GPL for ChirpTime itself (would have made bundling free, but the
+user chose permissive); shipping with no license (leaves the project
+all-rights-reserved by default, which is worse for something published as open
+source).
+**Consequence:** the licensing argument now *depends* on FFmpeg staying a
+subprocess. Anything that links an FFmpeg library — `ffmpeg-next`, a static
+build — reopens this decision, as does putting the binary inside the installer.
+
+## 2026-07-27 — FFmpeg is downloaded on first run, verified against a pinned hash
+**Why:** the app shells out to FFmpeg for every capture, so someone who installs
+the MSI and presses record gets an unexplained failure. Telling them to go and
+install a second program is a real cliff at exactly the moment they are deciding
+whether to bother. Bundling it is the other extreme and is what the MIT decision
+above rules out.
+**Chosen:** ask, then fetch. `src-tauri/src/ffmpeg_install.rs` downloads a pinned
+gyan.dev **essentials** build over HTTPS, verifies a **compiled-in SHA-256**
+before anything is extracted or executed, unpacks only `ffmpeg.exe` and
+`ffprobe.exe` into `%APPDATA%\com.chirptime.app\ffmpeg\bin` (per-user, no
+elevation), runs each binary once as a smoke test, and only then renames the
+staging directory into place. The user is told the size *before* pressing the
+button; nothing downloads on its own.
+**Why essentials, not full:** 105 MB instead of 170 MB, and verified against the
+actual archive to carry everything this app asks for — `libx264`, all three
+NVENC encoders, `h264_qsv` via libvpl, `aac`, the `drawtext` filter that burns in
+the timestamps, `overlay`, `scale`, and the `gdigrab` / `ddagrab` / `dshow`
+inputs. `ffplay.exe` (another ~100 MB) is deliberately not extracted.
+**Rejected:** bundling (licensing, above, plus 105 MB on every download for the
+majority who already have FFmpeg); a silent background download (spending
+someone's bandwidth unasked); trusting HTTPS alone without a hash (we download an
+executable and then *run* it — TLS says who sent it, not what it is); extracting
+the whole archive (doubles the install for a player the app never invokes);
+`tauri-plugin-updater`-style signing infrastructure (a pinned hash needs no key
+management and is auditable by reading one constant).
+**Consequence:** the pin is three constants that must move together
+(`FFMPEG_URL`, `FFMPEG_SHA256`, `FFMPEG_ZIP_BYTES`), and updating it requires
+re-deriving the hash. `find_ffmpeg` gained a fifth candidate and
+`session::find_ffprobe` had to be extended in lockstep — the recorder resolves
+both, and an ffmpeg without a matching ffprobe records footage it cannot index.
+A hand-picked folder (`settings.ffmpeg_dir`) sits *ahead* of everything so a
+blocked download is not a dead end.
+
+## 2026-07-27 — Releases are Windows-only, tag-triggered, and unsigned
+**Why:** `tauri build` was producing a bare exe because `bundle.active` was never
+set, so there was nothing to hand anyone. A tagged pipeline is the smallest thing
+that turns a commit into something a stranger can install.
+**Chosen:** `.github/workflows/release.yml` on `v*` tags, `windows-latest` only,
+building MSI + NSIS + a portable zip of the bare exe, published with the built-in
+`GITHUB_TOKEN` via `gh release create`. It is a **separate file** from the
+Drydock-owned `.github/workflows/drydock.yml`, which is overwritten by that
+system. **Version stays 1.0.0** — proposed as 0.1.0 on the grounds that the app
+is early; the user kept 1.0.0, and the README says plainly that it is early
+instead.
+**No code signing.** No certificate exists and none is being bought, so the
+installers are unsigned and SmartScreen shows "Windows protected your PC" on
+first run. Documented in the README and in the release notes rather than worked
+around: an unexplained blue box is what makes people delete the download.
+**Rejected:** a mac/linux matrix — the capture path is gdigrab/ddagrab/dshow,
+WASAPI COM, DXGI and NVENC/QSV behind 26 `#[cfg(target_os = "windows")]` blocks,
+so those jobs could only ever fail (see *Windows-only, deliberately*);
+`tauri-apps/tauri-action` (it creates the release but not the portable zip, and
+`gh` needs no third-party trust); per-machine NSIS install (an unsigned installer
+that also demands UAC is a worse first run than a per-user one).
+**Consequence:** the version lives in three files and the workflow names its
+uploads from the git tag while Tauri names bundles from `tauri.conf.json` — a
+mismatch ships a file whose name lies about its contents.
+
 ## 2026-07-27 — Where recordings go is stated on first run, and never guessed at again
 **Why:** the default output dir moved off the original author's hardcoded
 `G:/code/screener/output` to `%USERPROFILE%\Videos\ChirpTime`. This app writes

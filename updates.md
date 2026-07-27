@@ -3,6 +3,78 @@
 > Terse log of every task: what was asked → what was done. Newest first.
 > Older entries: `updates-archive.md` (created once this passes ~300 lines).
 
+## 2026-07-27 — MIT license + first-run FFmpeg install
+Four settled calls from the user, on top of the release pipeline below.
+**MIT `LICENSE`** added (Sal Aiello, 2026) and referenced from the README. The
+reasoning that unlocks it: ChirpTime *invokes* FFmpeg as a subprocess and
+neither links it nor ships its binaries, so FFmpeg's GPL never reaches
+ChirpTime's own distribution — which is exactly why the binary is fetched rather
+than bundled. **Version stays 1.0.0** (the 0.1.0 downgrade was reverted in all
+three files). **No code signing** — documented honestly in the README instead:
+what the SmartScreen box says and how to get past it.
+**FFmpeg is downloaded on first run**, never bundled. New
+`src-tauri/src/ffmpeg_install.rs`: pinned HTTPS URL + compiled-in SHA-256,
+hashed *while* streaming to disk, verified before anything is extracted or
+executed, extracts only `ffmpeg.exe` + `ffprobe.exe` (skipping ffplay's ~100 MB),
+runs each once as a smoke test, then renames staging into place — so a failed
+install can never leave something that looks like a working FFmpeg. Per-user
+under `%APPDATA%\com.chirptime.app\ffmpeg\bin`, no elevation. Progress events
+(`ffmpeg-install-progress`) drive a real progress bar.
+Pin: gyan.dev **8.1.2 essentials**, 104.6 MB, verified to carry every encoder,
+filter and input the app uses. Nothing downloads without a button press, and the
+size is stated first.
+`find_ffmpeg` / `find_ffprobe` extended in lockstep to five candidates:
+hand-picked folder → PATH → `C:\ffmpeg\bin` → `C:\Program Files\ffmpeg\bin` →
+managed install. New `settings.ffmpeg_dir` + a folder picker ("I Already Have
+It") so a network that blocks the download is not a dead end. Shared
+`FfmpegSetupCard` renders in both the first-run panel and a persistent banner —
+one flow, not two.
+Verified: real install run twice end to end (fresh, then over an existing
+install to exercise the replace path) — 194.2 MB on disk, both binaries report
+8.1.2, no debris left; hash-mismatch path proven to fail and delete; `cargo
+check`, `cargo test --lib` (67 pass), `bunx tsc --noEmit`; full `bun run build`.
+Not verified: the install UI has not been driven from a running widget (this
+machine has FFmpeg on PATH, so the missing branch never renders here).
+Touched: LICENSE (new), src-tauri/src/ffmpeg_install.rs (new),
+src-tauri/tests/ffmpeg_install.rs (new), src-tauri/src/{capture,session,settings,
+state,commands,lib}.rs, src-tauri/Cargo.toml (ureq/native-tls/sha2/zip),
+src/ui/{CompactApp.tsx,types.ts,hooks/useApi.ts}, README.md,
+.github/workflows/release.yml, tauri.conf.json + package.json (version back to 1.0.0).
+
+## 2026-07-27 — tagged Windows release pipeline
+"Set up a tagged Windows release pipeline." Enabled the Tauri bundler
+(`bundle.active`, targets `msi` + `nsis`, publisher/description/category,
+`icons/icon.ico`, NSIS `installMode: currentUser` so an unsigned installer needs
+no UAC). Proposed dropping the version 1.0.0 → 0.1.0; **the user kept 1.0.0**,
+so all three files (`tauri.conf.json`, `src-tauri/Cargo.toml`, `package.json`)
+stay at 1.0.0 and the README carries the "this is early" note instead.
+New `.github/workflows/release.yml`, triggered on `v*` tags, `windows-latest`
+only (Windows-only by decision — no cross-platform matrix, those jobs could only
+fail). Bun + Rust + `Swatinem/rust-cache` → `bun run build` → globs the bundles,
+zips the bare exe as a portable, and `gh release create` with `GITHUB_TOKEN`
+(no third-party release action, no new secret). Deliberately a separate file
+from the Drydock-owned `.github/workflows/drydock.yml`.
+FFmpeg gap: a non-dismissible red notice above the mode switch whenever no
+ffmpeg is found, and the same content in the first-run panel. Probed once at
+startup, never on a poll. **Not bundled** — the app calls `libx264`
+unconditionally, so any usable build is GPL. Superseded the same day by the
+download-on-first-run entry above.
+Real README (was `# screener`): what it is, download, FFmpeg requirement and the
+three probe paths, 5–8 GB/hour + nothing auto-deleted, build-from-source,
+"don't run bare `cargo test`".
+Verified: local `bun run build` produced `ChirpTime_0.1.0_x64_en-US.msi` (5.01 MB)
+and `ChirpTime_0.1.0_x64-setup.exe` (3.34 MB); the workflow's collect step
+dry-run against that output produced all three artifacts; release-notes
+here-string executed; workflow YAML parses; `cargo check`, `cargo test --lib`
+(64 pass), `bunx tsc --noEmit`.
+Not verified: the banner's rendered appearance (this machine has FFmpeg, so the
+`false` branch never renders here), and the workflow itself has never run — no
+GitHub remote exists yet. Installers were built, not installed. Unsigned:
+SmartScreen will warn.
+Touched: src-tauri/tauri.conf.json, src-tauri/Cargo.toml, package.json,
+src/ui/CompactApp.tsx, README.md, .gitignore,
+.github/workflows/release.yml (new).
+
 ## 2026-07-27 — config persistence + first-run onboarding
 "The default output dir just moved — make sure the user knows that!!" Added
 `settings.rs`: `%APPDATA%\com.chirptime.app\settings.json` holds the capture

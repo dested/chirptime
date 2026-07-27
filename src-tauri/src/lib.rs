@@ -1,5 +1,8 @@
 mod capture;
 mod commands;
+// Public so the pin (URL + SHA-256) and the install layout can be asserted
+// without a window system.
+pub mod ffmpeg_install;
 mod fileserver;
 mod nativeui;
 // Public so the settings round-trip can be exercised without a window system.
@@ -76,6 +79,11 @@ pub fn run() {
             commands::get_environment,
             commands::pick_output_dir,
             commands::open_folder,
+            // First-run FFmpeg install
+            commands::get_ffmpeg_setup,
+            commands::install_ffmpeg,
+            commands::pick_ffmpeg_dir,
+            commands::clear_ffmpeg_dir,
             // Continuous session recording
             commands::start_session,
             commands::stop_session,

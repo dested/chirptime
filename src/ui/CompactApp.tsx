@@ -1,5 +1,7 @@
 import React, { useState, useEffect, useCallback } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
+import { listen } from "@tauri-apps/api/event";
 import {
   startCapture,
   stopCapture,
@@ -22,12 +24,17 @@ import {
   getEnvironment,
   pickOutputDir,
   openFolder,
+  getFfmpegSetup,
+  installFfmpeg,
+  pickFfmpegDir,
 } from "./hooks/useApi";
 import type {
   CaptureStatus,
   CaptureEntry,
   DisplayOutputInfo,
   EnvironmentInfo,
+  FfmpegProgress,
+  FfmpegSetup,
   SessionOptions,
   SessionStatus,
   TrackSummary,
@@ -266,10 +273,16 @@ function Onboarding({ onDone }: { onDone: () => void }) {
   const [legacyDismissed, setLegacyDismissed] = useState(false);
   const [busy, setBusy] = useState(false);
 
+  const [ffmpeg, setFfmpeg] = useState<FfmpegSetup | null>(null);
+
   const load = useCallback(() => {
     getEnvironment()
       .then(setEnv)
       .catch((e) => setError(String(e)));
+    // Kept separate from `env` so installing FFmpeg does not also re-probe disk
+    // space and the legacy output folder, and so a failure in one does not
+    // blank the other.
+    getFfmpegSetup().then(setFfmpeg).catch(() => setFfmpeg(null));
   }, []);
   useEffect(load, [load]);
 
@@ -403,9 +416,9 @@ function Onboarding({ onDone }: { onDone: () => void }) {
           ) : (
             <>
               <Requirement
-                ok={env.ffmpeg_path !== null}
+                ok={ffmpeg?.ffmpeg_path != null}
                 label="FFmpeg"
-                value={env.ffmpeg_path ?? "Not found"}
+                value={ffmpeg?.ffmpeg_path ?? "Not found"}
               />
               <Requirement
                 ok={env.nvenc}
@@ -416,11 +429,13 @@ function Onboarding({ onDone }: { onDone: () => void }) {
           )}
         </div>
 
-        {env && env.ffmpeg_path === null && (
+        {/* The one thing on this panel that stops the app working at all, so it
+            is offered here rather than discovered later on a failed capture. */}
+        {ffmpeg && ffmpeg.ffmpeg_path === null && (
           <div className="mt-2">
-            <Notice tone="warn">
-              FFmpeg was not found on PATH or in the usual install folders. Nothing can be
-              captured until it is installed.
+            <Notice tone="error">
+              <span className="block font-semibold mb-1">FFmpeg is missing</span>
+              <FfmpegSetupCard setup={ffmpeg} onResolved={load} />
             </Notice>
           </div>
         )}
@@ -441,6 +456,198 @@ function Onboarding({ onDone }: { onDone: () => void }) {
           <span>Continue</span>
         </button>
       </div>
+    </div>
+  );
+}
+
+/** Where someone who would rather install it themselves is sent. */
+const FFMPEG_DOWNLOAD_URL = "https://www.gyan.dev/ffmpeg/builds/";
+
+const PHASE_LABEL: Record<FfmpegProgress["phase"], string> = {
+  downloading: "Downloading FFmpeg",
+  verifying: "Checking the download",
+  extracting: "Unpacking",
+  checking: "Making sure it runs",
+  done: "Done",
+};
+
+/**
+ * The missing-FFmpeg recovery, shared by the first-run panel and the persistent
+ * banner so there is exactly one flow rather than two that drift apart.
+ *
+ * ChirpTime records through FFmpeg but does not ship it, so someone who
+ * installed the .msi has never been told they need a second program. This says
+ * what is missing, offers to fetch it — **stating the size first, and only on a
+ * button press** — and, for the person whose network blocks the download, takes
+ * a folder they already have.
+ *
+ * Progress is not optional: a silent 105 MB transfer is indistinguishable from
+ * a hang.
+ */
+function FfmpegSetupCard({
+  setup,
+  onResolved,
+}: {
+  setup: FfmpegSetup;
+  onResolved: () => void;
+}) {
+  const [progress, setProgress] = useState<FfmpegProgress | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // The backend owns the install; this window only reports it. Subscribing for
+  // the life of the card (not just while installing) means a panel reopened
+  // mid-install rejoins the progress instead of showing a dead bar.
+  useEffect(() => {
+    let dispose: (() => void) | null = null;
+    let live = true;
+    listen<FfmpegProgress>("ffmpeg-install-progress", (e) => setProgress(e.payload))
+      .then((un) => {
+        if (live) dispose = un;
+        else un();
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+      dispose?.();
+    };
+  }, []);
+
+  const download = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    setProgress({ phase: "downloading", downloaded_bytes: 0, total_bytes: setup.download_bytes });
+    try {
+      await installFfmpeg();
+      onResolved();
+    } catch (e) {
+      setError(String(e));
+      setProgress(null);
+    } finally {
+      setBusy(false);
+    }
+  }, [setup.download_bytes, onResolved]);
+
+  const locate = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const picked = await pickFfmpegDir();
+      // null is a cancelled picker, which is not a failure and says nothing.
+      if (picked) onResolved();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [onResolved]);
+
+  const recheck = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      onResolved();
+    } finally {
+      setBusy(false);
+    }
+  }, [onResolved]);
+
+  if (progress && busy) {
+    const pct =
+      progress.total_bytes > 0
+        ? Math.min(100, Math.round((progress.downloaded_bytes / progress.total_bytes) * 100))
+        : 0;
+    return (
+      <div className="flex flex-col gap-1.5">
+        <div className="flex items-baseline justify-between gap-2">
+          <span className="text-[11px] font-semibold text-slate-900">
+            {PHASE_LABEL[progress.phase]}
+          </span>
+          {progress.phase === "downloading" && (
+            <span className="text-[10px] text-slate-400 tabular-nums font-mono">
+              {fmtBytes(progress.downloaded_bytes)} / {fmtBytes(progress.total_bytes)}
+            </span>
+          )}
+        </div>
+        <div className="h-1.5 w-full rounded-full bg-slate-100 overflow-hidden">
+          <div
+            className={`h-full rounded-full bg-sky-500 transition-[width] duration-200 ${
+              progress.phase === "downloading" ? "" : "animate-pulse"
+            }`}
+            style={{ width: progress.phase === "downloading" ? `${pct}%` : "100%" }}
+          />
+        </div>
+        <span className="text-[10px] text-slate-400 leading-snug">
+          Leave this open. Nothing is installed until the download has been checked
+          against its expected checksum.
+        </span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className="text-[11px] leading-snug text-slate-600">
+        ChirpTime records through FFmpeg and cannot capture anything without it.
+        ChirpTime can fetch it for you — about {fmtBytes(setup.download_bytes)}, verified
+        against a known checksum and installed just for you, no admin needed.
+      </span>
+      <span className="text-[10px] text-slate-400 font-mono break-all leading-snug">
+        {setup.install_dir}
+      </span>
+
+      {error && (
+        <div className="text-[10px] leading-snug text-red-600 break-words">{error}</div>
+      )}
+
+      <div className="flex flex-col gap-1.5 mt-0.5">
+        <button
+          className="w-full py-1.5 rounded-lg text-[11px] font-semibold cursor-pointer border-none bg-sky-500 text-white hover:bg-sky-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          onClick={() => void download()}
+          disabled={busy}
+        >
+          {error ? "Try Again" : `Download FFmpeg (${fmtBytes(setup.download_bytes)})`}
+        </button>
+        <div className="flex gap-1.5">
+          <button
+            className={`${SECONDARY_BTN} flex-1 py-1 text-[11px]`}
+            onClick={() => void locate()}
+            disabled={busy}
+            title="Choose a folder containing ffmpeg.exe and ffprobe.exe"
+          >
+            I Already Have It
+          </button>
+          <button
+            className={`${SECONDARY_BTN} px-2 py-1 text-[11px]`}
+            onClick={() => void recheck()}
+            disabled={busy}
+          >
+            Re-check
+          </button>
+        </div>
+      </div>
+
+      <button
+        className="self-start text-[10px] text-slate-400 hover:text-slate-600 bg-transparent border-none p-0 cursor-pointer underline"
+        onClick={() => void openUrl(FFMPEG_DOWNLOAD_URL).catch(() => {})}
+      >
+        Or install it yourself
+      </button>
+    </div>
+  );
+}
+
+/**
+ * The persistent form of the above, above the mode switch so it applies to both
+ * panes. Not dismissible — nothing records until it is resolved.
+ */
+function FfmpegBanner({ setup, onResolved }: { setup: FfmpegSetup; onResolved: () => void }) {
+  return (
+    <div className="px-4 pt-3">
+      <Notice tone="error">
+        <span className="block font-semibold mb-1">FFmpeg is not installed</span>
+        <FfmpegSetupCard setup={setup} onResolved={onResolved} />
+      </Notice>
     </div>
   );
 }
@@ -1261,6 +1468,10 @@ export function CompactApp() {
   // null until settings have been read. The first-run panel is decided by the
   // persisted flag, so nothing else may render before it is known.
   const [onboarded, setOnboardedLocal] = useState<boolean | null>(null);
+  // `null` = not probed yet, or the probe failed. Only a resolved setup with no
+  // ffmpeg renders the banner, so a failed probe never invents a missing
+  // dependency.
+  const [ffmpeg, setFfmpeg] = useState<FfmpegSetup | null>(null);
 
   useEffect(() => {
     getSettings()
@@ -1269,6 +1480,21 @@ export function CompactApp() {
       // would be worse than none.
       .catch(() => setOnboardedLocal(true));
   }, []);
+
+  // Both lookups spawn a process, so this runs once at startup and afterwards
+  // only when the user does something that could have changed the answer —
+  // never on a poll.
+  const checkFfmpeg = useCallback(async () => {
+    try {
+      setFfmpeg(await getFfmpegSetup());
+    } catch {
+      setFfmpeg(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void checkFfmpeg();
+  }, [checkFfmpeg]);
 
   // Both loops are polled from here regardless of which tab is showing, so the
   // mode switch can always say which one is live. They are independent: interval
@@ -1358,6 +1584,10 @@ export function CompactApp() {
         <Onboarding onDone={() => setOnboardedLocal(true)} />
       ) : (
         <>
+          {ffmpeg !== null && ffmpeg.ffmpeg_path === null && (
+            <FfmpegBanner setup={ffmpeg} onResolved={() => void checkFfmpeg()} />
+          )}
+
           {/* Mode switch. The red dot follows whichever mode is actually running,
               so switching tabs never hides that something is recording. */}
           <div className="px-4 pt-3">

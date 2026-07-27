@@ -32,5 +32,19 @@
       "open": true
     },
     "fs": {}
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi", "nsis"],
+    "publisher": "ChirpTime",
+    "category": "Productivity",
+    "shortDescription": "Background life recorder for Windows",
+    "longDescription": "ChirpTime records your screens, webcam, microphone and system audio continuously so you can watch a day back. It also takes a periodic screenshot and short clip on an interval. Requires FFmpeg on PATH.",
+    "icon": ["icons/icon.ico"],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
   }
 }

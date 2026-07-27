@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ChirpTime — keep your days</title>
+    <meta
+      name="description"
+      content="ChirpTime records quietly in the background — every screen, your camera, your voice — so months from now you can sit down and watch an ordinary Tuesday."
+    />
+    <meta name="theme-color" content="#FAF7F2" />
+    <meta name="color-scheme" content="light" />
+
+    <link rel="preload" href="/fonts/instrument-serif-400.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/archivo-400.woff2" as="font" type="font/woff2" crossorigin />
+
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23FAF7F2'/%3E%3Ccircle cx='12' cy='16' r='4.5' fill='%23C2643B'/%3E%3Cpath d='M19 11a7 7 0 0 1 0 10M23.5 8a11 11 0 0 1 0 16' fill='none' stroke='%23C2643B' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E"
+    />
+
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+
+  <body>
+    <div class="grain" aria-hidden="true"></div>
+    <a class="skip" href="#main">Skip to content</a>
+
+    <header class="topbar">
+      <a class="brand" href="#top" aria-label="ChirpTime, home">
+        <svg class="brand__mark" viewBox="0 0 32 32" aria-hidden="true">
+          <circle cx="11" cy="16" r="4.5" />
+          <path d="M18 11a7 7 0 0 1 0 10M22.5 8a11 11 0 0 1 0 16" fill="none" stroke-width="2" stroke-linecap="round" />
+        </svg>
+        <span>ChirpTime</span>
+      </a>
+      <nav class="topnav" aria-label="Primary">
+        <a href="#playback">Playback</a>
+        <a href="#catalog">Your days</a>
+        <a class="topnav__cta" href="{{REPO_URL}}" rel="noreferrer noopener">GitHub</a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <!-- ─────────────────────────────────────────────────────────── hero ── -->
+      <section class="hero" id="top">
+        <div class="hero__inner">
+          <p class="eyebrow" data-reveal="0"><span class="eyebrow__rule"></span>An everyday recorder</p>
+
+          <h1 class="hero__title" data-reveal="1">
+            Most of your days<br />
+            just <span class="vanish">disappear.</span>
+          </h1>
+
+          <p class="hero__sub" data-reveal="2">
+            ChirpTime keeps them. It records quietly in the background — every screen, your camera, your voice — so
+            months from now you can sit down and watch an ordinary Tuesday.
+          </p>
+
+          <p class="hero__cta" data-reveal="3">
+            <a class="btn btn--primary" href="{{REPO_URL}}" rel="noreferrer noopener">
+              Get it on GitHub
+              <svg viewBox="0 0 16 16" aria-hidden="true" class="btn__arrow">
+                <path d="M2 8h11M9 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </a>
+            <a class="btn btn--ghost" href="#how">See how it works</a>
+          </p>
+        </div>
+
+        <div class="hero__ribbon" data-reveal="4"><!--@ribbon--></div>
+      </section>
+
+      <!-- ──────────────────────────────────────────── 01 · runs by itself ── -->
+      <section class="sec sec--quiet" id="how">
+        <div class="sec__head">
+          <p class="eyebrow" data-reveal="0"><span class="num">01</span> It runs and you forget it</p>
+          <h2 class="sec__title" data-reveal="1">Start it in the morning.<br />Forget it&rsquo;s there.</h2>
+          <p class="sec__body" data-reveal="2">
+            ChirpTime sits in a small window in the corner and records all day. No clips to manage, no folders to name,
+            nothing to remember to press. You go do your work. It keeps up.
+          </p>
+        </div>
+
+        <figure class="desk" data-reveal="3">
+          <div class="desk__pane" aria-hidden="true">
+            <span class="desk__ghost desk__ghost--1">
+              <b></b><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            </span>
+            <span class="desk__ghost desk__ghost--2"> <b></b><u></u><i></i><i></i> </span>
+            <span class="desk__ghost desk__ghost--3"> <b></b><i></i><i></i> </span>
+            <span class="desk__ghost desk__ghost--4"> <b></b><i></i><i></i><i></i> </span>
+          </div>
+
+          <div class="widget" aria-hidden="true">
+            <div class="widget__top">
+              <span class="widget__name">ChirpTime</span>
+              <span class="widget__live"><i></i>recording</span>
+            </div>
+            <p class="widget__time">6:41:07</p>
+            <div class="widget__wave">
+              <svg viewBox="0 0 120 18" preserveAspectRatio="none">
+                <polyline
+                  points="0,9 6,6 12,12 18,4 24,13 30,7 36,10 42,3 48,14 54,8 60,9 66,5 72,12 78,7 84,11 90,4 96,13 102,8 108,10 114,6 120,9"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </div>
+            <div class="widget__row">
+              <span class="widget__btn">Mark this moment</span>
+              <span class="widget__chip">4 screens</span>
+            </div>
+          </div>
+
+          <svg class="desk__arrow" viewBox="0 0 220 160" aria-hidden="true">
+            <path
+              d="M8 12c46 6 76 26 92 54 15 26 16 52 9 76"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+            />
+            <path d="M96 132l13 16 16-10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          <figcaption class="desk__note">all of it, from down here</figcaption>
+        </figure>
+      </section>
+
+      <!-- ───────────────────────────────────────────────── 02 · one moment ── -->
+      <section class="sec sec--together" id="together">
+        <div class="sec__head sec__head--center">
+          <p class="eyebrow" data-reveal="0"><span class="num">02</span> Everything together</p>
+          <h2 class="sec__title" data-reveal="1">Every screen. Your camera.<br />Your voice.</h2>
+          <p class="sec__body" data-reveal="2">
+            All of it captured at once and lined up. When you go back, your face, your words and whatever you were
+            looking at are the same moment — not three recordings you have to reconcile.
+          </p>
+        </div>
+
+        <figure class="pile" data-reveal="3">
+          <div class="pile__stack" aria-hidden="true">
+            <div class="card card--screen card--s1">
+              <span class="card__bar"><b></b><b></b><b></b></span>
+              <span class="card__lines"><i></i><i></i><i></i><i></i><i></i><i></i></span>
+              <span class="card__tag">Main screen</span>
+            </div>
+
+            <div class="card card--screen card--s2">
+              <span class="card__bar"><b></b><b></b><b></b></span>
+              <span class="card__grid"><i></i><i></i><i></i><i class="is-live"></i></span>
+              <span class="card__tag">Second screen</span>
+            </div>
+
+            <div class="card card--cam">
+              <svg viewBox="0 0 120 90" class="card__figure">
+                <circle cx="60" cy="34" r="16" />
+                <path d="M25 90c4-20 16-30 35-30s31 10 35 30Z" />
+              </svg>
+              <span class="card__tag">Camera</span>
+            </div>
+
+            <div class="card card--voice">
+              <!--@voicecard-->
+              <span class="card__tag">Voice</span>
+            </div>
+
+            <span class="pile__line"><em>3:02 PM</em></span>
+          </div>
+          <figcaption class="pile__note">One line down the middle. Everything on it is the same second.</figcaption>
+        </figure>
+      </section>
+
+      <!-- ────────────────────────────────────── 03 · playback, the centre ── -->
+      <section class="sec sec--playback" id="playback">
+        <div class="sec__head sec__head--wide">
+          <p class="eyebrow" data-reveal="0"><span class="num">03</span> Playback</p>
+          <h2 class="sec__title sec__title--big" data-reveal="1">Scrub to any moment<br />of any day.</h2>
+          <p class="sec__body" data-reveal="2">
+            Move through a whole day on one timeline. Watch every monitor at once, or focus on one with your camera in
+            the corner. Slow it down, speed it up, jump straight to the part you were looking for.
+          </p>
+          <p class="sec__hint" data-reveal="3">Drag the timeline</p>
+        </div>
+
+        <div class="playback__stage" data-reveal="4"><!--@player--></div>
+      </section>
+
+      <!-- ──────────────────────────────────────────────── 04 · the shelf ── -->
+      <section class="sec sec--catalog" id="catalog">
+        <div class="sec__head">
+          <p class="eyebrow" data-reveal="0"><span class="num">04</span> Catalog</p>
+          <h2 class="sec__title" data-reveal="1">Your days, kept.</h2>
+          <p class="sec__body" data-reveal="2">
+            Every recording is filed by date and ready to browse. Mark the moments worth keeping as they happen — the
+            call that went well, the bug that finally broke, your kid wandering in — and find them again later.
+          </p>
+        </div>
+
+        <ul class="shelf"><!--@catalog--></ul>
+      </section>
+
+      <!-- ──────────────────────────────────────────── 05 · honest + CTA ── -->
+      <section class="sec sec--get" id="get">
+        <div class="get">
+          <div class="get__left" data-reveal="0">
+            <p class="eyebrow"><span class="num">05</span> Where it&rsquo;s at</p>
+            <p class="get__body">
+              ChirpTime is open source and early. There&rsquo;s no installer yet, so you&rsquo;ll need to build it
+              yourself. It runs on Windows, uses FFmpeg, and works best with an NVIDIA graphics card. Recordings run
+              about 5&ndash;8&nbsp;GB an hour, and nothing is ever deleted unless you delete it.
+            </p>
+          </div>
+
+          <div class="get__right" data-reveal="1">
+            <p class="get__pitch">Start keeping<br /><em>today</em>.</p>
+            <a class="btn btn--primary btn--lg" href="{{REPO_URL}}" rel="noreferrer noopener">
+              Get it on GitHub
+              <svg viewBox="0 0 16 16" aria-hidden="true" class="btn__arrow">
+                <path d="M2 8h11M9 4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+            </a>
+            <p class="get__repo">{{REPO_LABEL}}</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <div class="foot__inner">
+        <p class="foot__brand">ChirpTime</p>
+        <p class="foot__line">Record your day. Watch it back years later.</p>
+        <a class="foot__link" href="{{REPO_URL}}" rel="noreferrer noopener">{{REPO_LABEL}}</a>
+      </div>
+    </footer>
+  </body>
+</html>

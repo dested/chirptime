@@ -36,6 +36,14 @@ pub struct Settings {
     /// True once the first-run panel has been dismissed. The whole point of
     /// persisting anything is that this stays true.
     pub onboarded: bool,
+    /// A folder holding `ffmpeg.exe` + `ffprobe.exe` that the user pointed us
+    /// at by hand. It exists for the person whose network will not let the
+    /// first-run download through — without it, a blocked download is a dead
+    /// end. Checked *before* everything else by `capture::find_ffmpeg`, and read
+    /// straight off disk by [`ffmpeg_dir_override`] because that function runs
+    /// on capture threads with no access to `AppState`.
+    #[serde(default)]
+    pub ffmpeg_dir: Option<String>,
 }
 
 impl Default for Settings {
@@ -45,6 +53,7 @@ impl Default for Settings {
             capture: CaptureConfig::default(),
             session: serde_json::Value::Null,
             onboarded: false,
+            ffmpeg_dir: None,
         }
     }
 }
@@ -141,7 +150,26 @@ pub fn load_from(path: &Path) -> Settings {
         out.onboarded = v;
     }
 
+    // A blank string here would resolve to the process cwd, exactly like the
+    // output dir above, so it is treated as "not set" rather than as a folder.
+    if let Some(v) = map.get("ffmpeg_dir").and_then(|v| v.as_str()) {
+        if !v.trim().is_empty() {
+            out.ffmpeg_dir = Some(v.to_string());
+        }
+    }
+
     out
+}
+
+/// The hand-picked FFmpeg folder, read straight off disk.
+///
+/// `capture::find_ffmpeg` and `session::find_ffprobe` are free functions called
+/// from capture threads that never see `AppState`, so they cannot ask the
+/// in-memory settings. The read is a sub-kilobyte file plus a JSON parse, next
+/// to a process spawn — it is not worth caching, and caching it would mean a
+/// user who just picked a folder had to restart the app.
+pub fn ffmpeg_dir_override() -> Option<String> {
+    load().ffmpeg_dir
 }
 
 /// Write settings to `path` via a temp file + rename, so a crash mid-write can

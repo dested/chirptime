@@ -13,6 +13,13 @@ tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
 urlencoding = "2"
 warp = "0.3"
+# First-run FFmpeg install (src/ffmpeg_install.rs). `native-tls` rather than the
+# default rustls so the TLS stack is schannel — the Windows cert store, and no
+# ring/aws-lc C toolchain to break a CI build.
+ureq = { version = "3", default-features = false, features = ["native-tls", "gzip"] }
+native-tls = "0.2"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # Native WASAPI loopback capture (src/sysaudio.rs) — this machine has no loopback
 # device, so system audio cannot go through ffmpeg's dshow input.
 windows = { version = "0.61", features = [

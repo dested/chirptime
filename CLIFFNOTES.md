@@ -50,6 +50,10 @@ FFmpeg for everything capture-related.
 
 ```
 chirptime/
+├── .github/workflows/release.yml   Tag-triggered (`v*`) Windows release: MSI +
+│                               NSIS + portable zip, published with GITHUB_TOKEN.
+│                               Separate from the Drydock-owned drydock.yml.
+├── README.md                   Public-facing: what it is, download, FFmpeg, disk
 ├── index.html                  Vite entry — bare shell, mounts /src/ui/main.tsx
 ├── vite.config.ts              React + Tailwind plugins, port 5173 strict
 ├── package.json                Scripts: dev/build (tauri), vite:dev/vite:build
@@ -97,6 +101,9 @@ chirptime/
 │       │                       tolerant load, atomic save, legacy `output/` detection
 │       ├── nativeui.rs         IFileOpenDialog folder picker, open-in-Explorer, disk space
 │       ├── commands.rs         All #[tauri::command] handlers
+│       ├── ffmpeg_install.rs   First-run FFmpeg fetch: pinned URL + SHA-256,
+│       │                       streaming hash, staged extract of ffmpeg/ffprobe
+│       │                       only, smoke test, atomic promote
 │       ├── capture.rs          chirp, monitor detection, FFmpeg capture cycle
 │       ├── recorder.rs         Continuous session recorder: DXGI/encoder resolution,
 │       │                       device selection, per-track supervisors, disk guard
@@ -132,7 +139,12 @@ chirptime/
 | FFmpeg args, chirp, monitor detection | `src-tauri/src/capture.rs` |
 | Capture defaults (interval, duration, output dir) | `src-tauri/src/state.rs` → `CaptureConfig::default()` |
 | Media HTTP serving / MIME / Range | `src-tauri/src/fileserver.rs` |
+| "FFmpeg is missing" + install flow | `src/ui/CompactApp.tsx` (`FfmpegSetupCard`, `FfmpegBanner`) |
+| Where FFmpeg is downloaded from / verified | `src-tauri/src/ffmpeg_install.rs` (the pin is 3 consts) |
+| FFmpeg / ffprobe lookup order | `capture::find_ffmpeg` + `session::find_ffprobe` — **keep in step** |
 | Window size, decorations, always-on-top | `src-tauri/tauri.conf.json` |
+| Installer targets, publisher, version | `src-tauri/tauri.conf.json` → `bundle` |
+| Cutting a release | tag `vX.Y.Z` → `.github/workflows/release.yml` |
 | Window permissions (new window labels!) | `src-tauri/capabilities/default.json` |
 
 ## Routes / URLs
@@ -375,6 +387,37 @@ from that window is denied.
   PowerShell). Every subprocess must go through `silent_command()` or a console
   window flashes on screen — and lands in the capture.
 - **Port 9120 is hardcoded** in both `lib.rs` and `src/ui/hooks/mediaUrl.ts`.
+- **The version lives in three files** — `src-tauri/tauri.conf.json`,
+  `src-tauri/Cargo.toml`, `package.json` (all at **1.0.0**). Bump all three before tagging: the
+  release workflow names its uploads from the git tag, but Tauri names the
+  bundles it produces from `tauri.conf.json`, so a mismatch ships a file whose
+  name lies about its contents.
+- **The release binary is `chirptime.exe`, not `ChirpTime.exe`.** Cargo names it
+  after the crate; `productName` only names the installer and the installed app.
+- **Releases are unsigned.** No certificate exists, so SmartScreen warns on
+  download and first run. That is expected output, not a broken build.
+- **`src-tauri/icons/` holds exactly one 16×16 `icon.ico`.** It builds, but
+  Windows upscales it everywhere it matters — the installer, the taskbar, the
+  Programs list. A proper multi-size .ico (16/32/48/256) is a real missing asset,
+  not a config problem; `bundle.icon` already points at the one file that exists.
+- **`find_ffmpeg` and `find_ffprobe` must stay in lockstep.** Both look in the
+  same five places, in the same order: hand-picked `settings.ffmpeg_dir` → PATH →
+  `C:\ffmpeg\bin` → `C:\Program Files\ffmpeg\bin` → the app-managed install under
+  `%APPDATA%`. The recorder resolves both, and an ffmpeg found without a matching
+  ffprobe records footage it then cannot index. The managed install is **last**
+  on purpose — a machine that already had FFmpeg keeps using the exact binary it
+  always used.
+- **`ffmpeg_install` never downloads on its own.** `commands::install_ffmpeg` is
+  reachable only from a button, and the size is shown before the press. The
+  pinned SHA-256 is checked *while* streaming, before anything is extracted or
+  executed; a mismatch deletes the file. Do not add a "fetch it automatically if
+  missing" path.
+- **The pin is three constants that move together** — `FFMPEG_URL`,
+  `FFMPEG_SHA256`, `FFMPEG_ZIP_BYTES`. Bumping the version means re-deriving the
+  hash; the module doc says how it was cross-checked.
+- **`tests/ffmpeg_install.rs` is `#[ignore]`d and must stay that way** — it pulls
+  ~105 MB and writes ~200 MB into `%APPDATA%`. Run it deliberately with
+  `cargo test --test ffmpeg_install -- --ignored`.
 - **`SessionOptions` is read once, when `start_session` spawns the tracks.** The
   settings panel is disabled while recording for that reason; changing anything
   mid-session does nothing until stop → start.
@@ -449,7 +492,13 @@ from that window is denied.
 - **Done (2026-07-27)** — config persistence, the first-run onboarding panel, the
   native folder picker, "open my recordings" from the titlebar and settings, and
   legacy-`output/` detection.
-- **Not built** — a settings UI for the *interval clip* capture
+- **Done (2026-07-27)** — Tauri bundler configured (MSI + NSIS), tag-triggered
+  Windows release workflow, MIT `LICENSE`, a real README, and the first-run
+  FFmpeg install (pinned + hash-verified download, or point at your own). The
+  workflow has **never run** — the repo has no GitHub remote yet.
+- **Not built** — code signing (deliberately: no certificate, installers are
+  unsigned and SmartScreen warns), a settings UI for the
+  *interval clip* capture
   (`get/set_capture_config`, `get_ffmpeg_path` still have no caller), the
   `*_full.mp4` day compile (the viewer reads `full_day_video` but nothing produces
   it), a frontend test runner, tray icon / autostart.
