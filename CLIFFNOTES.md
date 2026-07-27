@@ -375,6 +375,14 @@ from that window is denied.
   clock ticks, so second granularity is exact), or count packets: two consecutive
   10s mic segments held **469 + 468** AAC packets = 19989ms for 20000ms of wall
   clock. Dropping 110ms/boundary would need ~464 per segment.
+- **Segment length is per-OUTPUT, not per-session.** `mic` and `sysaudio` cut at
+  `AUDIO_SEGMENT_SECONDS` (600s); everything with a picture uses the session's
+  `segment_seconds`. The shared webcam+mic process passes a different
+  `-segment_time` for each of its two outputs, and the watchdog is per-output for
+  the same reason. `manifest.segment_seconds` is therefore the **video** length,
+  not a promise about every track — the player never reads it (it derives
+  everything from each segment's own `start_epoch_ms`/`duration_ms`), so only the
+  rebuild's unreadable-segment gap width still assumes it.
 - **A supervisor can own more than one manifest track.** `TrackSpec.outputs` is a
   list, and the watchdog, gap accounting, status and restart counters all iterate
   it. Anything assuming one process == one track is wrong for the webcam/mic pair.

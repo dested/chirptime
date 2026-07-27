@@ -357,6 +357,7 @@ fn lipsync() {
     );
 
     let mut overrun = std::collections::HashMap::new();
+    let mut first_start = std::collections::HashMap::new();
     for t in &m.tracks {
         let Some(first) = t.segments.first() else {
             println!("{:<12} {:>10}", t.id, "(none)");
@@ -366,6 +367,7 @@ fn lipsync() {
         let media: i64 = t.segments.iter().map(|s| s.duration_ms).sum();
         let ov = last.start_epoch_ms + last.duration_ms - t1;
         overrun.insert(t.id.clone(), ov);
+        first_start.insert(t.id.clone(), first.start_epoch_ms);
         println!(
             "{:<12} {:>+10} {:>10} {:>6} {:>+10}",
             t.id,
@@ -376,16 +378,34 @@ fn lipsync() {
         );
     }
 
-    let (Some(&cam), Some(&mic)) = (overrun.get("webcam"), overrun.get("mic")) else {
+    let (Some(&cam0), Some(&mic0)) = (first_start.get("webcam"), first_start.get("mic")) else {
         panic!("webcam and mic must both have produced segments; got {:?}", overrun.keys());
     };
 
-    // Positive = audio ahead of picture, which is the direction that was broken.
-    let err = mic - cam;
-    println!("\nimplied A/V error (mic vs webcam): {:+}ms", err);
+    // THE assertion. What the shared process guarantees is that both streams are
+    // stamped against one clock, so their first segments name the same instant --
+    // which is exactly what lip-sync is. Positive = audio ahead of picture, the
+    // direction that was broken (+1239ms with two processes).
+    let err = mic0 - cam0;
+    println!("\nwebcam/mic start-label delta: {:+}ms", err);
+
+    // Deliberately NOT asserted on: total media, or how far past session end each
+    // track runs. Those compare TAILS, and the mic is segmented at
+    // AUDIO_SEGMENT_SECONDS while the webcam follows the session length, so the
+    // graceful stop cuts the two tails at unrelated instants. That proxy worked
+    // only while both tracks shared a segment cadence; it now reads a few hundred
+    // ms even when the anchors agree exactly.
+    let (Some(&cam_ov), Some(&mic_ov)) = (overrun.get("webcam"), overrun.get("mic")) else {
+        unreachable!()
+    };
+    println!(
+        "tail difference (informational, not a sync measure): {:+}ms",
+        mic_ov - cam_ov
+    );
+
     assert!(
         err.abs() < 45,
-        "webcam and mic are {}ms apart — they were not anchored to a common clock",
+        "webcam and mic first segments are {}ms apart -- not anchored to a common clock",
         err
     );
 }

@@ -6,6 +6,31 @@
 > Entries below dated 2026-03-xx were reconstructed from the code on 2026-07-27
 > when this file was created; the reasoning is inferred from the implementation.
 
+## 2026-07-27 — Segment-boundary choppiness is ACCEPTED, and mitigated only by longer audio segments
+**Why:** the user, told the tradeoff explicitly (~40s of audio lost per 6-hour
+day, a brief hiccup around each boundary), chose to live with it: *"it doesnt
+have to be nano second perfect, the entire time, it can be choppy here and
+there."* This is a deliberate product call, not an oversight — **do not "fix" it
+later without reopening the decision.**
+**Measurement note for whoever revisits this:** investigation found no media loss
+on any track (screen-3/QSV has the largest seam gaps and exactly 0.0ms of loss;
+two consecutive mic segments held 469+468 AAC packets = 19989ms per 20000ms of
+wall clock). The seam gaps are label jitter from the drift filter's biased input.
+Judge any future claim of loss by media-vs-clock-span or packet count, never by
+seam gaps — see cliffnotes Gotchas.
+**Chosen mitigation:** `AUDIO_SEGMENT_SECONDS = 600` for `mic` and `sysaudio`
+only, since the loss is per *boundary* and audio is cheap (~350MB per 6h at
+128kbps). Cuts boundaries from ~360 to ~36 per six-hour day.
+**Rejected:** changing the audio codec (risk, no time); chasing encoder-drain /
+segment-muxer flush behaviour (explicitly dropped by the user); touching
+screen-3/QSV video loss (accepted as-is).
+**Consequence and the real cost:** a force-killed process leaves its final
+segment without a moov atom, so a crash now loses up to 10 minutes of audio
+instead of 60 seconds. This trades a small distributed loss for a rarer but much
+larger one — the right call only while crashes stay rare. Segment length is
+per-*output* (`OutputSpec.segment_seconds`), so the shared webcam+mic process
+cuts video at the session length and audio at 600s in the same command.
+
 ## 2026-07-27 — The webcam and mic share ONE ffmpeg process, via ONE dshow input
 **Why:** lip-sync. As two independent processes each device's own open latency
 (a BRIO takes ~1.3s to hand over its first MJPEG frame, a mic ~0.15s) is baked

@@ -3,6 +3,18 @@
 > Terse log of every task: what was asked → what was done. Newest first.
 > Older entries: `updates-archive.md` (created once this passes ~300 lines).
 
+## 2026-07-27 — audio tracks get 10-minute segments; boundary choppiness accepted
+User accepted the segment-boundary hiccup rather than eliminating it ("it doesnt
+have to be nano second perfect"). Cheap mitigation only: `mic` and `sysaudio` now
+segment at `AUDIO_SEGMENT_SECONDS` (600s) instead of the session length, cutting
+boundaries ~10x. Segment length moved to per-*output* (`OutputSpec`), so the
+shared webcam+mic process cuts video at 60s and audio at 600s in one command;
+watchdog is per-output too. Video/screens unchanged, codec unchanged.
+Verified live: all tracks produce segments, webcam/mic start-label delta **+0ms**
+(lip-sync intact), mic 3 segments -> 1, long audio segments finalize playable.
+Caveat recorded in decisions.md: a crash now loses up to 10min of audio, not 60s.
+Touched: src-tauri/src/recorder.rs, src-tauri/tests/live_session.rs
+
 ## 2026-07-27 — fixed webcam/mic lip-sync in the session recorder
 "My mouth doesn't move with my audio." Webcam and mic were two independent ffmpeg
 processes, so each device's open latency was baked into its track start —

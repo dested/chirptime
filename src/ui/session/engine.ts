@@ -444,8 +444,12 @@ export class SyncEngine {
   private stateSubs = new Set<(s: EngineSnapshot) => void>();
   private maxSpreadMs = 0;
   private spreadMs = 0;
-  /** the one track allowed to make noise */
-  private audioTrackId: string | null = null;
+  /**
+   * Which tracks are allowed to make noise. More than one may be unmuted at
+   * once — mic and system audio played together is the point of "All", so you
+   * hear what you said AND what you were listening to. Empty set = silent.
+   */
+  private audioIds = new Set<string>();
   private volume = 1;
 
   constructor(manifest: SessionManifest) {
@@ -526,14 +530,24 @@ export class SyncEngine {
     this.seekTo(this.masterEpochMs + delta * 1000);
   }
 
-  setAudioTrack(id: string | null) {
-    this.audioTrackId = id;
+  /** Unmute exactly these tracks; everything else goes silent. */
+  setAudioTracks(ids: Iterable<string>) {
+    this.audioIds = new Set(ids);
     this.applyAudioRouting();
     this.emitState();
   }
 
-  getAudioTrack() {
-    return this.audioTrackId;
+  /** Convenience for the single-source case; `null` mutes everything. */
+  setAudioTrack(id: string | null) {
+    this.setAudioTracks(id === null ? [] : [id]);
+  }
+
+  getAudioTracks(): string[] {
+    return [...this.audioIds];
+  }
+
+  isAudible(id: string) {
+    return this.audioIds.has(id);
   }
 
   setVolume(v: number) {
@@ -546,8 +560,16 @@ export class SyncEngine {
   }
 
   private applyAudioRouting() {
+    /*
+     * Mixing N sources at full volume can clip, so scale back as more are
+     * unmuted — but sub-linearly (1/sqrt(n)), because equal-loudness for
+     * uncorrelated sources goes as the square root, not the count. Two tracks
+     * at 1/2 each sounds like someone turned it down; at 1/sqrt(2) it doesn't.
+     */
+    const n = this.audioIds.size;
+    const vol = n > 1 ? this.volume / Math.sqrt(n) : this.volume;
     for (const [id, c] of this.controllers) {
-      c.setAudio(this.audioTrackId !== id, this.volume);
+      c.setAudio(!this.audioIds.has(id), vol);
     }
   }
 

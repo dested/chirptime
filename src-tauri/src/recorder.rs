@@ -70,6 +70,20 @@ const ANCHOR_WINDOW_MS: i64 = 5_000;
 /// would trade the feature away for a transient. At 4, the retry backoff
 /// (500ms x n) gives the camera ~5s to appear, and the mic loses at most that.
 const PAIR_SPLIT_AFTER: u32 = 4;
+/// Segment length for audio-only tracks (`mic`, `sysaudio`), overriding the
+/// session's `segment_seconds`.
+///
+/// Every segment boundary costs a few tens of ms of label jitter, and on the
+/// audio tracks that shows up as a brief hiccup. The loss is per *boundary*, so
+/// the cheapest mitigation is simply to have far fewer of them: at 60s segments a
+/// six-hour session crosses 360 boundaries, at 600s it crosses 36.
+///
+/// Audio can afford this where video cannot — six hours of 128kbps AAC is ~350MB,
+/// so long segments cost little disk and little seek granularity. The real cost is
+/// crash exposure: a force-killed process leaves its final segment without a moov
+/// atom, so this trades a bounded, distributed loss for a rarer but much larger
+/// one. See decisions.md — this was a deliberate call, not an oversight.
+const AUDIO_SEGMENT_SECONDS: u32 = 600;
 
 // ---------------------------------------------------------------------------
 // Process helpers
@@ -1170,6 +1184,9 @@ impl Anchor {
 struct OutputSpec {
     track_id: String,
     dir_name: String,
+    /// Per-output, not per-process: the webcam and mic share one ffmpeg but are
+    /// segmented at different lengths. See [`AUDIO_SEGMENT_SECONDS`].
+    segment_seconds: u32,
 }
 
 /// One supervised ffmpeg process, and the manifest track(s) it feeds.
@@ -1250,13 +1267,25 @@ fn combined_dshow_unsupported(video: &str, audio: &str) -> Option<String> {
     None
 }
 
+/// How long a track's segments should be, given the session's setting.
+///
+/// Audio-only tracks override it; everything with a picture keeps the session
+/// length, because video is where segment size actually buys crash granularity.
+fn segment_seconds_for(track_id: &str, session_seconds: u32) -> u32 {
+    match track_id {
+        "mic" | "sysaudio" => AUDIO_SEGMENT_SECONDS,
+        _ => session_seconds,
+    }
+}
+
 impl TrackSpec {
-    fn solo(id: &str, source: TrackSource) -> Self {
+    fn solo(id: &str, source: TrackSource, session_seconds: u32) -> Self {
         Self {
             id: id.to_string(),
             outputs: vec![OutputSpec {
                 track_id: id.to_string(),
                 dir_name: id.to_string(),
+                segment_seconds: segment_seconds_for(id, session_seconds),
             }],
             launch_delay_ms: 0,
             source,
@@ -1476,12 +1505,12 @@ impl Recorder {
             mut warnings,
         } = env;
 
-        let mut manifest = SessionManifest::new(
-            id.clone(),
-            now.timestamp_millis(),
-            opts.segment_seconds.max(5),
-            desktop,
-        );
+        // The session-wide length, which the video tracks use verbatim. Audio
+        // tracks override it via `segment_seconds_for`, so the manifest's value is
+        // the video length, not a promise about every track.
+        let seg_secs = opts.segment_seconds.max(5);
+        let mut manifest =
+            SessionManifest::new(id.clone(), now.timestamp_millis(), seg_secs, desktop);
 
         let mut specs: Vec<TrackSpec> = Vec::new();
 
@@ -1515,6 +1544,7 @@ impl Recorder {
                         encoder,
                         fps: opts.screen_fps,
                     },
+                    seg_secs,
                 );
                 spec.launch_delay_ms = screen_n * SCREEN_STAGGER_MS;
                 specs.push(spec);
@@ -1581,6 +1611,7 @@ impl Recorder {
                             video_size: opts.webcam_size.clone(),
                             fps: opts.webcam_fps,
                         },
+                        seg_secs,
                     ));
                     specs.push(TrackSpec::solo(
                         "mic",
@@ -1588,18 +1619,25 @@ impl Recorder {
                             device: audio_device.clone(),
                             sidecar: opts.mic_sidecar_16k,
                         },
+                        seg_secs,
                     ));
                 } else {
                     specs.push(TrackSpec {
                         id: "webcam".into(),
+                        // One process, two segment lengths: the video is cut at
+                        // the session length and the audio at the much longer
+                        // audio one. The muxer takes `-segment_time` per output,
+                        // so sharing a clock costs nothing here.
                         outputs: vec![
                             OutputSpec {
                                 track_id: "webcam".into(),
                                 dir_name: "webcam".into(),
+                                segment_seconds: segment_seconds_for("webcam", seg_secs),
                             },
                             OutputSpec {
                                 track_id: "mic".into(),
                                 dir_name: "mic".into(),
+                                segment_seconds: segment_seconds_for("mic", seg_secs),
                             },
                         ],
                         launch_delay_ms: 0,
@@ -1622,6 +1660,7 @@ impl Recorder {
                     video_size: opts.webcam_size.clone(),
                     fps: opts.webcam_fps,
                 },
+                seg_secs,
             )),
             (None, Some(device)) => specs.push(TrackSpec::solo(
                 "mic",
@@ -1629,6 +1668,7 @@ impl Recorder {
                     device: device.clone(),
                     sidecar: opts.mic_sidecar_16k,
                 },
+                seg_secs,
             )),
             (None, None) => {}
         }
@@ -1644,7 +1684,7 @@ impl Recorder {
                 0,
                 0,
             ));
-            specs.push(TrackSpec::solo("sysaudio", TrackSource::SysAudio));
+            specs.push(TrackSpec::solo("sysaudio", TrackSource::SysAudio, seg_secs));
         }
 
         if specs.is_empty() {
@@ -1815,6 +1855,8 @@ struct OutputState {
     /// Cleared by the first segment indexed in each run — only that one gets to
     /// use the run's anchor.
     anchor_pending: bool,
+    /// This output's own segment length; see [`OutputSpec::segment_seconds`].
+    segment_seconds: u32,
     /// Segments indexed during the current run. Reset by [`run_track_once`].
     produced: u32,
     /// Consecutive completed runs in which this output produced nothing.
@@ -1840,6 +1882,7 @@ impl OutputState {
             seen,
             pending: None,
             anchor_pending: true,
+            segment_seconds: o.segment_seconds,
             produced: 0,
             barren_runs: 0,
         }
@@ -2001,12 +2044,15 @@ fn split_pair(
 
     outs.retain(|o| o.track_id != "mic");
 
+    // `segment_seconds_for` keys off the track id, so the mic keeps the same
+    // audio segment length it had inside the pair.
     let mic_spec = TrackSpec::solo(
         "mic",
         TrackSource::Mic {
             device: audio_device.clone(),
             sidecar: *sidecar,
         },
+        inner.segment_seconds,
     );
     let inner2 = inner.clone();
     match std::thread::Builder::new()
@@ -2180,7 +2226,14 @@ fn run_track_once(
     // whose camera has died still writes mic segments on schedule; watching only
     // the process would never notice the picture had stopped.
     let mut last_new_segment: Vec<i64> = vec![launched; outs.len()];
-    let watchdog_ms = (inner.segment_seconds as i64) * 2000;
+    // Per output, because outputs of one process can be segmented at different
+    // lengths (webcam 60s, mic 600s) and a shared deadline would either fire
+    // spuriously on the long one or never fire on the short one.
+    //
+    // This is the weaker of the two liveness checks, and the only one that scales
+    // with segment length. `PROGRESS_STALL_MS` (30s) still catches a wedged or
+    // dead ffmpeg regardless of how long its segments are.
+    let watchdog_ms: Vec<i64> = outs.iter().map(|o| o.segment_seconds as i64 * 2000).collect();
 
     // Why the run ended. Deliberately *not* a message: the message quotes ffmpeg's
     // stderr, and that can only be read after the drain thread has been joined
@@ -2244,7 +2297,8 @@ fn run_track_once(
         let now = now_ms();
         if let Some(i) = last_new_segment
             .iter()
-            .position(|t| now - t > watchdog_ms)
+            .zip(&watchdog_ms)
+            .position(|(t, limit)| now - t > *limit)
         {
             let silent = (now - last_new_segment[i]) / 1000;
             let track = outs[i].track_id.clone();
@@ -2441,7 +2495,15 @@ fn index_output_segment(
     let a = if o.anchor_pending { anchor.resolve() } else { None };
     o.anchor_pending = false;
     o.produced += 1;
-    index_segment(inner, &o.track_id, &o.dir, file, observed, a);
+    index_segment(
+        inner,
+        &o.track_id,
+        &o.dir,
+        file,
+        observed,
+        a,
+        o.segment_seconds,
+    );
 }
 
 fn scan_new(dir: &Path, seen: &mut std::collections::BTreeSet<String>) -> Vec<String> {
@@ -2545,6 +2607,7 @@ pub fn decide_segment_start(
 
 /// ffprobe a segment that has just closed and append it to the manifest, with its
 /// start time chosen by [`decide_segment_start`].
+#[allow(clippy::too_many_arguments)]
 fn index_segment(
     inner: &Arc<Inner>,
     track_id: &str,
@@ -2552,6 +2615,7 @@ fn index_segment(
     file: &str,
     observed: i64,
     anchor: Option<i64>,
+    segment_seconds: u32,
 ) {
     let path = dir.join(file);
     let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -2565,7 +2629,7 @@ fn index_segment(
                 inner,
                 track_id,
                 from,
-                from + inner.segment_seconds as i64 * 1000,
+                from + segment_seconds as i64 * 1000,
                 &format!("unreadable segment {}", file),
             );
             inner.flush();
@@ -2718,10 +2782,11 @@ fn push_mic_sidecar_args(cmd: &mut Command, inner: &Arc<Inner>, secs: u32, map: 
 }
 
 fn build_command(inner: &Arc<Inner>, source: &TrackSource, outs: &[OutputState]) -> Command {
-    let secs = inner.segment_seconds;
     // Every source but the webcam/mic pair writes exactly one output, and that
-    // one is always first.
+    // one is always first. `secs` is that output's own length, which for an
+    // audio-only track is not the session's.
     let out = outs[0].out_pattern();
+    let secs = outs[0].segment_seconds;
 
     let mut cmd = silent_command(&inner.ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "warning", "-progress", "pipe:1"]);
@@ -2832,20 +2897,24 @@ fn build_command(inner: &Arc<Inner>, source: &TrackSource, outs: &[OutputState])
                 &format!("video={}:audio={}", video_device, audio_device),
             ]);
 
-            let webcam_out = output_for(outs, "webcam")
-                .map(|o| o.out_pattern())
-                .unwrap_or_else(|| out.clone());
+            let cam = output_for(outs, "webcam");
             cmd.args(["-map", "0:v:0"]);
             push_video_encoder_args(&mut cmd, encoder, 28, "12M", "24M", *fps);
-            push_segment_args(&mut cmd, secs, &webcam_out);
+            push_segment_args(
+                &mut cmd,
+                cam.map(|o| o.segment_seconds).unwrap_or(secs),
+                &cam.map(|o| o.out_pattern()).unwrap_or_else(|| out.clone()),
+            );
 
+            // The mic's own, much longer segment length — the two outputs of this
+            // one process are deliberately cut at different rates.
             if let Some(mic) = output_for(outs, "mic") {
                 cmd.args([
                     "-map", "0:a:0", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
                 ]);
-                push_segment_args(&mut cmd, secs, &mic.out_pattern());
+                push_segment_args(&mut cmd, mic.segment_seconds, &mic.out_pattern());
                 if *sidecar {
-                    push_mic_sidecar_args(&mut cmd, inner, secs, Some("0:a:0"));
+                    push_mic_sidecar_args(&mut cmd, inner, mic.segment_seconds, Some("0:a:0"));
                 }
             }
         }

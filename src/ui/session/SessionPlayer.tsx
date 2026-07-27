@@ -40,8 +40,12 @@ export function SessionPlayer({ manifest, onBack, initialEpochMs, onRebuild }: P
 
   // Starts muted, always. A session can be opened by a deep link, and a
   // life recorder's mic track is the last thing that should start playing out
-  // loud without the user asking for it. They pick a source from the transport.
-  const [audioId, setAudioId] = useState<string | null>(null);
+  // loud without the user asking for it. They pick sources from the transport.
+  // A set, not a single id: mic + system audio together is the useful default
+  // once you do opt in — your voice and what you were listening to.
+  const [audioIds, setAudioIds] = useState<Set<string>>(() => new Set());
+  const audioTrackIds = useMemo(() => audioTracks.map((t) => t.id), [audioTracks]);
+  const allAudible = audioTrackIds.length > 0 && audioTrackIds.every((id) => audioIds.has(id));
 
   /* ---- engine lifecycle ---- */
   useEffect(() => {
@@ -54,8 +58,8 @@ export function SessionPlayer({ manifest, onBack, initialEpochMs, onRebuild }: P
   }, [engine]);
 
   useEffect(() => {
-    engine.setAudioTrack(audioId);
-  }, [engine, audioId]);
+    engine.setAudioTracks(audioIds);
+  }, [engine, audioIds]);
 
   /* Deep link lands on an instant, paused — `seekTo` clamps into the session, so
      a stale link never leaves the playhead outside the footage. */
@@ -430,16 +434,25 @@ export function SessionPlayer({ manifest, onBack, initialEpochMs, onRebuild }: P
           <span className="text-[11px] text-white/25 tabular-nums font-mono">max {snap.maxSpreadMs.toFixed(0)}</span>
         </div>
 
-        {/* audio source */}
+        {/* audio sources — multi-select, so mic + system audio can play together */}
         <div className="flex gap-0.5 p-0.5 bg-white/[0.04] rounded-lg border border-white/[0.06]">
           <button
             className={`px-2.5 py-1 rounded-md text-[11px] font-semibold cursor-pointer transition-all ${
-              audioId === null ? "text-white bg-white/10" : "text-white/40 hover:text-white/70 hover:bg-white/[0.06]"
+              audioIds.size === 0 ? "text-white bg-white/10" : "text-white/40 hover:text-white/70 hover:bg-white/[0.06]"
             }`}
-            onClick={() => setAudioId(null)}
-            title="Mute all"
+            onClick={() => setAudioIds(new Set())}
+            title="Mute everything"
           >
             Muted
+          </button>
+          <button
+            className={`px-2.5 py-1 rounded-md text-[11px] font-semibold cursor-pointer transition-all ${
+              allAudible ? "text-white bg-white/10" : "text-white/40 hover:text-white/70 hover:bg-white/[0.06]"
+            }`}
+            onClick={() => setAudioIds(allAudible ? new Set() : new Set(audioTrackIds))}
+            title="Play every audio track at once, mixed together"
+          >
+            All
           </button>
           {manifest.tracks
             .filter((t) => t.kind !== "screen")
@@ -447,10 +460,19 @@ export function SessionPlayer({ manifest, onBack, initialEpochMs, onRebuild }: P
               <button
                 key={t.id}
                 className={`px-2.5 py-1 rounded-md text-[11px] font-semibold cursor-pointer transition-all ${
-                  audioId === t.id ? "text-white bg-white/10" : "text-white/40 hover:text-white/70 hover:bg-white/[0.06]"
+                  audioIds.has(t.id)
+                    ? "text-white bg-white/10"
+                    : "text-white/40 hover:text-white/70 hover:bg-white/[0.06]"
                 }`}
-                onClick={() => setAudioId(t.id)}
-                title={t.label}
+                onClick={() =>
+                  setAudioIds((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(t.id)) next.delete(t.id);
+                    else next.add(t.id);
+                    return next;
+                  })
+                }
+                title={`${t.label} — click to toggle; combines with the others`}
               >
                 {t.id}
               </button>
