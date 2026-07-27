@@ -55,4 +55,7 @@ pub struct AppState {
     pub config: CaptureConfig,
     pub status: CaptureStatus,
     pub capture_cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Continuous-session recorder. Independent of the interval capture loop
+    /// above — both can run at once.
+    pub recorder: Option<std::sync::Arc<crate::recorder::Recorder>>,
 }

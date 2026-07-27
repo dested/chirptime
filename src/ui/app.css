@@ -1,0 +1,31 @@
+@import "tailwindcss";
+
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body, #root {
+    height: 100%;
+    margin: 0;
+  }
+  body {
+    font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+}
+
+@layer components {
+  /* Pulse animation for recording dot */
+  @keyframes pulse-dot {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.15); }
+    50% { opacity: 0.7; box-shadow: 0 0 0 6px rgba(220, 38, 38, 0.08); }
+  }
+  .dot-active {
+    animation: pulse-dot 1.5s ease-in-out infinite;
+  }
+}
+
+/* Thin scrollbars */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #E2E8F0; border-radius: 4px; }
+.dark-scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); }

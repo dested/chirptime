@@ -6,6 +6,155 @@
 > Entries below dated 2026-03-xx were reconstructed from the code on 2026-07-27
 > when this file was created; the reasoning is inferred from the implementation.
 
+## 2026-07-27 — Continuous recording is a second mode in the widget, not a replacement
+**Why:** the interval chirp/clip capture and the all-day session recorder answer
+different questions ("what was I doing at 3pm" vs "replay the last four hours"),
+and the spec is explicit that `run_capture_cycle` keeps working unchanged. They
+also share nothing in the backend — separate state, separate loops, both can run
+at once.
+**Rejected:** replacing the widget's primary button with a mode-aware one (the
+two have different stop semantics and different failure surfaces), and a second
+window (the widget is the app; ui.md forbids modals and drawers).
+**Consequence:** a **Clips | Session** segmented control at the top of the 320px
+widget swaps the pane below it. Both statuses are polled from the root regardless
+of which pane is showing, so the inactive tab still carries a live red dot — a
+user can never hide a running recording by switching tabs.
+
+## 2026-07-27 — `ts` means epoch-ms for a session link and `HH-MM-SS` for a clip link
+**Why:** the viewer already deep-links clips as `?mode=viewer&date=…&ts=HH-MM-SS`.
+A session has no per-clip timestamps to name — its playhead is an absolute
+instant on the master clock, which is epoch-ms everywhere in the engine and the
+manifest. Inventing a second parameter name for the same idea would have made the
+scheme harder to read, not easier.
+**Rejected:** `?session=…&at=…` (two names for one concept), and an offset in
+seconds from session start (breaks the moment a rebuild re-anchors the start).
+**Consequence:** `date` and `session` are the discriminator. `ViewerApp` reads
+`ts` as a number only in the `session` branch and passes it to
+`SessionPlayer.initialEpochMs`, which goes through `engine.seekTo` — so a stale
+link is clamped into the session rather than parking the playhead in nothing.
+
+## 2026-07-27 — "Recording" in the session browser requires a live recorder, not a null end time
+**Why:** `SessionSummary.ended_epoch_ms === null` was being read as "still
+recording". Two of the six real sessions on disk were force-killed and never got
+an end time written, so the browser showed them as recording — permanently, and
+for two sessions at once, which is impossible.
+**Rejected:** having the backend backfill `ended_epoch_ms` during
+`list_sessions` (it would be a guess written into the manifest as fact), and
+dropping the badge entirely (losing the one state worth seeing at a glance).
+**Consequence:** the browser takes `liveSessionId` from `get_session_status`.
+Only that id gets the red **Recording** badge; any other session with no end time
+gets an amber **Interrupted** badge explaining that the footage is intact but the
+last segment of each track may be unplayable.
+
+## 2026-07-27 — Amber is the widget's advisory tone
+**Why:** the session recorder has a class of outcome that is neither fine nor
+broken: the mic was skipped because the only one is a Bluetooth headset, a
+monitor is not capturable, a track is restarting. ui.md's light palette had only
+sky (live/selected) and red (recording/destruction), so these were going to
+render either as alarming failures or as invisible grey.
+**Rejected:** red for everything not perfect (trains the user to ignore red, and
+red already means "recording" two inches higher up), and muted slate (the
+Bluetooth explanation is the single most important sentence the recorder emits —
+it explains why the user's headphones did *not* degrade).
+**Consequence:** amber-50/amber-800 notices for advisories, red-50/red-700 for
+failures, and amber was already the marker/`drift-warn` colour on dark surfaces,
+so nothing new entered the palette. Documented in ui.md.
+
+## 2026-07-27 — Session options live in the widget, not in `CaptureConfig`
+**Why:** `SessionOptions` is read once, when `start_session` spawns the tracks;
+`CaptureConfig` is the interval capture's persistent-ish state. Merging them
+would have implied that changing fps mid-session does something (it does not) and
+coupled two features that share no backend state.
+**Rejected:** persisting options to disk as part of this change (nothing in this
+app persists anything yet — that is one decision, to be made once, for config
+generally).
+**Consequence:** the settings panel holds a `SessionOptions` in React state,
+seeded from a mirror of `SessionOptions::default()`, and posts the whole object
+to `start_session`. Two Rust tests pin that mirror: one deserializes the exact
+payload the widget sends, one asserts the defaults match. The panel is disabled
+while recording, because the backend has already read it.
+
+## 2026-07-27 — A seam under 250ms is a keyframe artifact, not a gap
+**Why:** real recordings do not produce contiguous segments. Measured across the
+first 6 real sessions (108 seams): 60 seams left a 0–50ms hole, 2 more up to
+250ms, and **41 seams actually overlapped**, by as much as 4.2s on `sysaudio`.
+Strict `[start, start+duration)` containment made `segmentAt()` return "nothing
+here" inside those sub-frame holes, so every track blanked to **No footage** for
+a frame at most segment boundaries — 1.04s of spurious blanking across 30 tracks.
+The synthetic fixture was perfectly contiguous and never showed it.
+**Rejected:** trusting `contig` and rewriting segment starts on load (edits the
+backend's measured truth), rendering the previous frame frozen (hides that the
+clock moved on).
+**Consequence:** `segmentAt()` rolls onto the next segment when a hole is
+≤ `SEAM_TOLERANCE_MS` (250ms), and the binary search naturally prefers the later
+segment where two overlap. **No footage** now means only a gap the manifest
+declares. Verified: 715,393 instants sampled at 10ms across all 6 sessions, zero
+unexplained blanks.
+
+## 2026-07-27 — `SessionSummary` mirrors the Rust struct, and derives nothing extra
+**Why:** the frontend type was written before `list_sessions` existed and invented
+two fields the backend never sends — `screen_count` and `recording`. Against real
+data the browser rendered "undefined + NaN" for the track count. A type that
+describes what we wish the wire format were is worse than no type.
+**Rejected:** having the backend add the fields (screen count is a display
+detail; "recording" is just `ended_epoch_ms === null`).
+**Consequence:** `SessionSummary` matches `recorder::SessionSummary` field for
+field, including `has_manifest`. Anything else is computed at the render site.
+When that struct changes, this type changes with it.
+
+## 2026-07-27 — The session player opens muted, every time
+**Why:** it first defaulted to the mic track, on the theory that a life recorder's
+audio is the point. In practice a session can be opened by a deep link or
+restored on load, so the machine started playing its own microphone recording out
+loud with no user action — which is exactly what happened during development, out
+of the user's speakers. A recorder that plays your own room back at you
+unprompted is a privacy problem before it is an annoyance.
+**Rejected:** remembering the last chosen source (same surprise, one session
+later), autoplaying at low volume (still audible, now also hard to find).
+**Consequence:** `audioId` starts `null`, the transport's audio-source control
+shows **Muted** selected, and the engine mutes every element until the user picks
+a track. The standby element of each pair is muted unconditionally, so a swap can
+never briefly unmute a second stream.
+
+## 2026-07-27 — Two media elements per track, pre-rolled, instead of one
+**Why:** a session is hours of 60s files. With a single `<video>` per track,
+every boundary is `src = …; load()` — a network round trip plus decoder init,
+which stalls visibly and desyncs that track from the others. Holding a second
+element that has already buffered the next segment turns a boundary into an
+opacity swap plus `play()`. Measured: every boundary crossed as a swap, 0 cold
+loads, worst frame gap 64ms (one dropped frame at 30fps).
+**Rejected:** MediaSource Extensions (would need the backend to emit fragmented
+MP4 and an init segment per track — the recorder writes plain segment MP4s, and
+AV1-in-fMP4 support is a second unknown); one element with `preload` tricks (no
+way to buffer a *different* URL ahead of time).
+**Consequence:** N tracks means 2N media elements. The inactive one is
+`opacity: 0`, never `display: none` — a hidden element stops decoding.
+
+## 2026-07-27 — The session player lives in `src/ui/session/`, not inline
+**Why:** the rule "the two app files are the app" exists so nobody adds to the
+dead `src/ui/components/`. The multi-track player is ~1400 lines with a
+non-visual core (the sync engine) that must be readable on its own; folding it
+into `ViewerApp.tsx` would triple that file and bury the one algorithm that
+decides whether the feature works.
+**Rejected:** inlining into `ViewerApp.tsx` (unreadable), reviving
+`src/ui/components/` (that directory is dead and stays dead).
+**Consequence:** `src/ui/session/` is the single exception. `ViewerApp.tsx` still
+owns routing and mounts `SessionBrowser` / `SessionPlayer` as two more views.
+
+## 2026-07-27 — Playback speed is capped by decode, not by the sync engine
+**Why:** at 4x in grid layout the machine must decode 5120×2160 AV1 plus two
+3840×2160 H.264 streams at 120fps. It cannot; frames drop, tracks fall behind,
+and the inter-track spread goes from 4ms to several hundred. A stall guard that
+skips correcting a starved element was tried and rejected — it made playback
+smoother but let tracks drift a full 2.7s apart, which is exactly the thing this
+feature exists to prevent.
+**Rejected:** silently capping the speed control (hides a real capability —
+4x is fine in Focus layout, median 13ms), decode-capability probing (no
+reliable API).
+**Consequence:** all four speeds stay offered. Staying aligned outranks staying
+smooth, so the resync loop keeps hard-seeking a lagging track. 1x and 2x are
+clean in every layout; 4x is a Focus-layout speed.
+
 ## 2026-07-27 — Tailwind v4 over the inline `<style>` block in index.html
 **Why:** the previous build carried ~800 lines of hand-written CSS inside
 `index.html`, which meant no scoping, no reuse between the widget and the viewer,

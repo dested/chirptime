@@ -13,6 +13,26 @@ tokio = { version = "1", features = ["full"] }
 chrono = "0.4"
 urlencoding = "2"
 warp = "0.3"
+# Native WASAPI loopback capture (src/sysaudio.rs) — this machine has no loopback
+# device, so system audio cannot go through ffmpeg's dshow input.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    # Session recorder (src/recorder.rs): DXGI output enumeration is how
+    # ddagrab `output_idx` values are mapped to real monitors, and
+    # GetDiskFreeSpaceExW backs the disk-full guard.
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Storage_FileSystem",
+    # Per-monitor DPI awareness. Without it EVERY monitor-rect API in the
+    # process — IDXGIOutput::GetDesc included — returns DPI-virtualised
+    # coordinates, so the manifest's desktop box and monitor rects come out
+    # scaled by the display scale factor. See recorder::ensure_process_dpi_aware.
+    "Win32_UI_HiDpi",
+] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

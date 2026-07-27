@@ -299,6 +299,7 @@ dependencies = [
  "tokio",
  "urlencoding",
  "warp",
+ "windows",
 ]
 
 [[package]]

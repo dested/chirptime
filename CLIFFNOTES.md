@@ -55,12 +55,21 @@ chirptime/
 ├── src/ui/                     THE app frontend
 │   ├── main.tsx                Reads ?mode=viewer, renders CompactApp or ViewerApp
 │   ├── app.css                 Tailwind import + base resets, .dot-active, scrollbars
-│   ├── CompactApp.tsx          Widget: titlebar, status, start/stop, recents, browse
+│   ├── CompactApp.tsx          Widget: Clips | Session mode switch; clips pane
+│   │                           (interval capture) and session pane (continuous
+│   │                           recording + track health + inline settings)
 │   ├── ViewerApp.tsx           Viewer: calendar → gallery → media viewer (self-contained)
 │   ├── types.ts                All shared TS interfaces (mirror the Rust serde structs)
-│   └── hooks/
-│       ├── useApi.ts           Thin invoke() wrapper per Tauri command
-│       └── mediaUrl.ts         rel path → http://localhost:9120/files/...
+│   ├── hooks/
+│   │   ├── useApi.ts           Thin invoke() wrapper per Tauri command
+│   │   └── mediaUrl.ts         rel path → http://localhost:9120/files/...
+│   └── session/                Continuous-session browser + multi-track player
+│       ├── engine.ts           SyncEngine + TrackController — master clock, resync loop
+│       ├── SessionPlayer.tsx   Layouts (grid/focus/overlay), transport, sync panel
+│       ├── TrackSurface.tsx    One track's two <video> elements (visible + pre-roll)
+│       ├── Timeline.tsx        Session-wide scrubber: segments, gaps, markers
+│       ├── SessionBrowser.tsx  Session list (light surface)
+│       └── format.ts           Clock / elapsed / duration / bytes formatting
 │
 ├── src/ui/App.tsx              DEAD — old viewer shell, nothing imports it
 ├── src/ui/components/          DEAD — Layout/ScreenView/Timeline/DatePicker/
@@ -78,10 +87,14 @@ chirptime/
 │   ├── capabilities/default.json  Permissions — lists windows ["main","viewer"]
 │   └── src/
 │       ├── main.rs             Calls chirptime_lib::run()
-│       ├── lib.rs              Spawns the file-server thread, registers 17 commands
+│       ├── lib.rs              Spawns the file-server thread, registers 25 commands
 │       ├── state.rs            CaptureConfig / CaptureStatus / AppState + defaults
 │       ├── commands.rs         All #[tauri::command] handlers
 │       ├── capture.rs          chirp, monitor detection, FFmpeg capture cycle
+│       ├── recorder.rs         Continuous session recorder: DXGI/encoder resolution,
+│       │                       device selection, per-track supervisors, disk guard
+│       ├── session.rs          Manifest types, atomic write, ffprobe, disk rebuild
+│       ├── sysaudio.rs         WASAPI loopback capture (silence-padded)
 │       └── fileserver.rs       Warp /files/<tail> with Range + traversal guard
 │
 └── output/                     Capture archive (gitignored)
@@ -97,7 +110,10 @@ chirptime/
 | --- | --- |
 | Which UI renders | `src/ui/main.tsx` |
 | Widget UI + recording controls | `src/ui/CompactApp.tsx` |
+| Session start/stop, track health, markers, session settings | `src/ui/CompactApp.tsx` (`SessionPane` / `SessionSettings`) |
 | Calendar / gallery / media viewer | `src/ui/ViewerApp.tsx` |
+| Session list / multi-track player | `src/ui/session/` (mounted from `ViewerApp.tsx`) |
+| Playback sync, drift correction, segment swapping | `src/ui/session/engine.ts` |
 | Frontend↔backend calls | `src/ui/hooks/useApi.ts` |
 | Shared types | `src/ui/types.ts` (must match `state.rs` + `commands.rs` serde) |
 | Global CSS / animations | `src/ui/app.css` |
@@ -118,10 +134,17 @@ There is no router. The frontend branches on the query params of a single page.
 | `/?mode=viewer` (window `viewer`) | Viewer, calendar view | `ViewerApp.tsx` (`view === "calendar"`) |
 | `/?mode=viewer&date=YYYY-MM-DD` | Viewer, day gallery | `ViewerApp.tsx` (`view === "gallery"`) |
 | `/?mode=viewer&date=…&ts=HH-MM-SS` | Viewer, that clip open | `ViewerApp.tsx` (`view === "viewer"`) |
+| `/?mode=viewer&tab=sessions` | Session list | `session/SessionBrowser.tsx` |
+| `/?mode=viewer&session=<id>` | Multi-track player for that session | `session/SessionPlayer.tsx` |
+| `/?mode=viewer&session=<id>&ts=<epoch ms>` | That session, playhead at that instant | `SessionPlayer.initialEpochMs` → `engine.seekTo` |
+| `http://localhost:9120/files/sessions/<id>/session.json` | Session manifest | `fileserver.rs` |
+| `http://localhost:9120/files/sessions/<id>/<track>/<file>.mp4` | One 60s segment | `fileserver.rs` |
 | `http://localhost:9120/files/<date>/screenshots/HH-MM-SS.png` | Screenshot bytes | `fileserver.rs` |
 | `http://localhost:9120/files/<date>/video/HH-MM-SS_combined.mp4` | Video bytes (Range-capable) | `fileserver.rs` |
 
-The viewer URL is assembled by `open_viewer` in `commands.rs`.
+The viewer URL is assembled by `open_viewer` in `commands.rs`, which takes
+`date` / `timestamp` / `session` / `tab`. **`ts` is `HH-MM-SS` alongside `date`
+and epoch-ms alongside `session`** — `date` vs `session` is the discriminator.
 
 ## Architecture
 
@@ -149,6 +172,12 @@ server, which is what makes video seeking (Range requests) work.
 | `DateEntries` | `commands.rs` / `types.ts` | a day's entries (BTreeMap-sorted) + optional `*_full.mp4` |
 | `MonitorConfig` / `MonitorRegion` | `commands.rs` / `types.ts` | monitor rects **in the 3840px-wide scaled space**; `camelCase` on the wire |
 | `DetectedMonitor` | `capture.rs` | PowerShell-detected screen, pre-mapped into that scaled space |
+| `SessionManifest` / `SessionTrack` / `SessionSegment` | `types.ts` | Continuous-session manifest — the frontend/backend contract (spec §3) |
+| `SessionSummary` | `types.ts` | One row in the session list; derivable from a manifest via `summarizeSession` |
+| `SyncEngine` / `TrackDebug` | `session/engine.ts` | Master clock + per-track drift state |
+| `SessionStatus` / `TrackSummary` | `commands.rs` / `types.ts` | Live recorder health: elapsed, per-track status, segments, bytes, warnings, `disk_free_bytes` / `min_free_bytes` |
+| `SessionOptions` | `recorder.rs` / `types.ts` | What `start_session` takes. `#[serde(default)]`, read once at start; `screens` holds `screen_index` values, empty = all |
+| `DisplayOutputInfo` | `commands.rs` / `types.ts` | `list_display_outputs` row: DXGI output + the recorder's `screen_index` + a real `capturable` flag |
 
 ## Systems
 
@@ -186,6 +215,44 @@ then offset so the chosen rect centers in the container — so 1 wrapper CSS px 
 unit of `totalWidth`/`totalHeight`. Playback position survives zoom changes via
 `savedTimeRef` plus a `loadedmetadata` listener.
 
+### Multi-track playback sync — `src/ui/session/engine.ts`
+
+Implements layer 3 of the sync strategy in
+`plans/2026-07-27-continuous-recording.md` §4. One `SyncEngine` per open session
+owns a master virtual clock in **epoch-ms** and a `TrackController` per track.
+A single `requestAnimationFrame` loop advances the clock by `dt * rate`, checks
+segment boundaries and transport every frame, and runs drift correction every
+250ms:
+
+| `|drift|` | action |
+| --- | --- |
+| > 150ms | hard seek (300ms cooldown so one seek is not re-issued before the decoder answers) |
+| 30–150ms | `playbackRate = rate * (1 ∓ 0.03)` |
+| ≤ 30ms | leave alone |
+
+`drift = el.currentTime*1000 - (masterEpochMs - segment.start_epoch_ms)`. While
+paused the engine snaps instead of nudging (>20ms).
+
+`segmentAt()` binary-searches on each segment's own `start_epoch_ms` /
+`duration_ms` — **nothing anywhere computes `index * segment_seconds`**, because
+real segment durations are ragged (4s/14s/16s observed for a nominal 15s) and
+consecutive segments can overlap by seconds. A hole shorter than
+`SEAM_TOLERANCE_MS` (250ms) is treated as a keyframe artifact and rolls onto the
+next segment; only a longer hole renders as a gap. Where two segments overlap the
+search picks the later one.
+
+**Every track holds two media elements.** The visible one plays; the other
+pre-rolls the next segment from 8s before the boundary, so a crossing is an
+opacity swap plus a `play()`, not a `load()`. `segmentAt()` binary-searches a
+track's segments, returning `null` inside a gap / before the track started /
+after it ended — the surface then renders "No footage" and the controller parks
+the upcoming segment on the active element so resuming is instant.
+
+The engine exposes two subscriptions: `subscribeFrame` (60Hz, for the imperative
+playhead and clock readout) and `subscribeState` (5Hz, for React). The **inter-track
+spread** — max minus min of where each element believes it is — is the metric
+that says the burned-in timecodes agree; the Sync panel shows it live.
+
 ### File server — `fileserver.rs`
 
 Warp on 127.0.0.1:9120, on its own thread with its own tokio runtime (started in
@@ -219,7 +286,9 @@ from that window is denied.
 ## Gotchas & hard rules
 
 - **`CaptureConfig::default().output_dir` is hardcoded to `G:/code/screener/output`.**
-  Machine-specific, and nothing persists a user-chosen directory yet.
+  Machine-specific. The widget's session settings can now change it at runtime via
+  `set_output_dir` (both the clip capture and the session recorder follow it, and so
+  does the file server), but nothing persists the choice across a restart.
 - **Nothing is persisted.** Config and status live only in memory — restarting the
   app resets the interval, the output dir, and `captures_today` (which also never
   rolls over at midnight).
@@ -238,11 +307,45 @@ from that window is denied.
   `tailwind.config.js` to extend.
 - **`src/ui/App.tsx` and all of `src/ui/components/` are dead code** — edit
   `CompactApp.tsx` / `ViewerApp.tsx` instead. The `src/index.ts` + `src/viewer*`
-  Bun CLI is likewise legacy and has no npm script left.
+  Bun CLI is likewise legacy and has no npm script left. `src/ui/session/` is the
+  one live multi-file directory; it is not `components/`.
+- **`main.tsx` dynamic-imports the two apps.** `CompactApp.tsx` calls
+  `getCurrentWindow()` at module scope, which throws outside Tauri — so the
+  viewer must never evaluate that module, and the plain `bun run vite:dev`
+  browser flow depends on it.
+- **The session player never re-renders on the clock.** Playhead and clock text
+  are written imperatively from `subscribeFrame`; putting `masterEpochMs` in
+  React state re-renders four `<video>` trees at 60Hz.
+- **Three 4K/5K decoders cannot sustain 4x.** Grid layout at 4x drops frames and
+  the spread blows out to a few hundred ms; 1x and 2x are clean. Use Focus at 4x.
+- **Segments are never uniform, contiguous, or non-overlapping.** Measured on real
+  sessions: 4s/14s/16s for a nominal 15s, 0–50ms holes at most seams, and 41 seams
+  that overlap by up to 4.2s. Anything computing a position from
+  `index * segment_seconds` is wrong. `segment_seconds` is metadata only — the
+  frontend reads it nowhere.
+- **`SessionSummary` in `types.ts` must match `recorder::SessionSummary` exactly.**
+  It once carried two invented fields and rendered `undefined + NaN` against the
+  real backend.
+- **A force-killed recording leaves an unfinalized final segment on disk** (no moov
+  atom, unplayable). The manifest correctly omits it. If a rebuild ever lists one,
+  the player shows "Segment unreadable" for that track and keeps the rest in sync.
 - **Windows-only APIs everywhere** (`gdigrab`, `dshow`, `Beep`, `CREATE_NO_WINDOW`,
   PowerShell). Every subprocess must go through `silent_command()` or a console
   window flashes on screen — and lands in the capture.
 - **Port 9120 is hardcoded** in both `lib.rs` and `src/ui/hooks/mediaUrl.ts`.
+- **`SessionOptions` is read once, when `start_session` spawns the tracks.** The
+  settings panel is disabled while recording for that reason; changing anything
+  mid-session does nothing until stop → start.
+- **`ended_epoch_ms === null` does not mean "recording".** A force-killed session
+  never got one written — two of the real sessions on disk are like this. The
+  browser cross-checks `get_session_status` and shows *Interrupted* instead.
+- **The widget cannot be server-rendered or opened in a plain browser** —
+  `CompactApp.tsx` calls `getCurrentWindow()` at module scope. `SessionPane` is
+  exported so the session UI can be rendered outside the Tauri shell; the module
+  still needs `@tauri-apps/api/window` stubbed first.
+- **`list_display_outputs` refines `capturable` itself.** `enumerate_dxgi_outputs`
+  always reports `true` (enumeration cannot know which encoders exist), so never
+  read that flag straight off the recorder's own enumeration.
 
 ## Status
 
@@ -254,9 +357,14 @@ from that window is denied.
 - **Uncommitted on `master`** — the Tailwind v4 migration (the previous build carried
   ~800 lines of inline `<style>` in `index.html`), audio recording, burned-in
   timestamps, and monitor auto-detection.
-- **Not built** — a settings UI (`get/set_capture_config`, `list_devices`,
-  `set_output_dir`, `get_ffmpeg_path` are backend-only with no caller), config
+- **Not built** — a settings UI for the *interval clip* capture
+  (`get/set_capture_config`, `get_ffmpeg_path` still have no caller), config
   persistence, the `*_full.mp4` day compile (the viewer reads `full_day_video` but
-  nothing produces it), any tests, tray icon / autostart.
-- **Next** — decide the fate of the legacy Bun CLI and the dead `src/ui/components/`,
-  then add a settings surface so the hardcoded output dir stops being a gotcha.
+  nothing produces it), a frontend test runner, tray icon / autostart.
+- **Not yet verified live** — the whole continuous-recording path has only been
+  exercised against sessions already on disk. Starting a session, per-track
+  health while running, markers, and the settings panel's device pickers have
+  never been run against live hardware from the UI.
+- **Next** — a supervised live recording to verify the widget end to end, then
+  config persistence (session options and the output dir are both in-memory
+  only), then the fate of the legacy Bun CLI and the dead `src/ui/components/`.

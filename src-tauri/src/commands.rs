@@ -169,6 +169,24 @@ pub async fn get_date_entries(state: tauri::State<'_, State>, date: String) -> R
 
 #[tauri::command]
 pub async fn get_monitor_config(state: tauri::State<'_, State>) -> Result<MonitorConfig, String> {
+    // Auto-detect monitors from the system (always preferred)
+    if let Some((total_w, total_h, detected)) = capture::detect_monitors() {
+        let monitors = detected.into_iter().map(|m| MonitorRegion {
+            id: m.id,
+            label: m.label,
+            x: m.x as u32,
+            y: m.y as u32,
+            w: m.w,
+            h: m.h,
+        }).collect();
+        return Ok(MonitorConfig {
+            total_width: total_w,
+            total_height: total_h,
+            monitors,
+        });
+    }
+
+    // Fallback: try config file
     let s = state.lock().await;
     let output_dir = get_output_dir_from_state(&s.config);
     let config_path = output_dir.parent().unwrap_or(&output_dir).join("monitor-config.json");
@@ -179,15 +197,12 @@ pub async fn get_monitor_config(state: tauri::State<'_, State>) -> Result<Monito
         }
     }
 
-    // Default 4-monitor config
+    // Fallback: single monitor
     Ok(MonitorConfig {
         total_width: 3840,
-        total_height: 1296,
+        total_height: 2160,
         monitors: vec![
-            MonitorRegion { id: 1, label: "Mon 1".to_string(), x: 0, y: 0, w: 960, h: 1296 },
-            MonitorRegion { id: 2, label: "Mon 2".to_string(), x: 960, y: 0, w: 960, h: 1296 },
-            MonitorRegion { id: 3, label: "Mon 3".to_string(), x: 1920, y: 0, w: 960, h: 1296 },
-            MonitorRegion { id: 4, label: "Mon 4".to_string(), x: 2880, y: 0, w: 960, h: 1296 },
+            MonitorRegion { id: 1, label: "Display".to_string(), x: 0, y: 0, w: 3840, h: 2160 },
         ],
     })
 }
@@ -350,18 +365,342 @@ pub async fn list_devices() -> Result<DshowDevices, String> {
     Ok(DshowDevices { video, audio })
 }
 
+// ===========================================================================
+// Continuous session recording
+// ===========================================================================
+
+#[derive(Serialize)]
+pub struct TrackSummary {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub status: crate::session::TrackStatus,
+    pub codec: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub start_epoch_ms: i64,
+    pub segment_count: usize,
+    pub bytes: u64,
+    pub last_segment_end_ms: Option<i64>,
+    pub gap_count: usize,
+    pub restarts: u32,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SessionStatus {
+    pub recording: bool,
+    pub session_id: Option<String>,
+    pub session_dir: Option<String>,
+    pub started_epoch_ms: Option<i64>,
+    pub elapsed_ms: i64,
+    pub segment_seconds: u32,
+    pub tracks: Vec<TrackSummary>,
+    pub total_bytes: u64,
+    pub segment_count: usize,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+    /// Free bytes on the recording volume. `None` when it could not be read.
+    pub disk_free_bytes: Option<u64>,
+    /// The recorder stops the session cleanly below this — the UI colours
+    /// `disk_free_bytes` against the backend's own threshold, never its own.
+    pub min_free_bytes: u64,
+}
+
+impl SessionStatus {
+    fn idle() -> Self {
+        Self {
+            recording: false,
+            session_id: None,
+            session_dir: None,
+            started_epoch_ms: None,
+            elapsed_ms: 0,
+            segment_seconds: 0,
+            tracks: Vec::new(),
+            total_bytes: 0,
+            segment_count: 0,
+            warnings: Vec::new(),
+            error: None,
+            disk_free_bytes: None,
+            min_free_bytes: crate::recorder::MIN_FREE_BYTES,
+        }
+    }
+
+    fn from_recorder(rec: &crate::recorder::Recorder) -> Self {
+        let m = rec.manifest();
+        let now = crate::session::now_epoch_ms();
+        Self {
+            recording: !rec.is_stopping() && m.ended_epoch_ms.is_none(),
+            session_id: Some(m.id.clone()),
+            session_dir: Some(rec.session_dir().to_string_lossy().to_string()),
+            started_epoch_ms: Some(m.started_epoch_ms),
+            elapsed_ms: m.ended_epoch_ms.unwrap_or(now) - m.started_epoch_ms,
+            segment_seconds: m.segment_seconds,
+            tracks: m
+                .tracks
+                .iter()
+                .map(|t| TrackSummary {
+                    id: t.id.clone(),
+                    kind: t.kind.clone(),
+                    label: t.label.clone(),
+                    status: t.status,
+                    codec: t.codec.clone(),
+                    width: t.width,
+                    height: t.height,
+                    fps: t.fps,
+                    start_epoch_ms: t.start_epoch_ms,
+                    segment_count: t.segments.len(),
+                    bytes: t.total_bytes(),
+                    last_segment_end_ms: t.end_epoch_ms(),
+                    gap_count: t.gaps.len(),
+                    restarts: t.restarts,
+                    error: t.error.clone(),
+                })
+                .collect(),
+            total_bytes: m.total_bytes(),
+            segment_count: m.segment_count(),
+            warnings: rec.warnings(),
+            error: rec.fatal().or(m.error.clone()),
+            disk_free_bytes: crate::recorder::free_space_bytes(&rec.session_dir()),
+            min_free_bytes: crate::recorder::MIN_FREE_BYTES,
+        }
+    }
+}
+
+fn sessions_root_for(config: &CaptureConfig) -> PathBuf {
+    crate::recorder::sessions_root(&capture::get_output_dir(config))
+}
+
 #[tauri::command]
-pub async fn open_viewer(app: tauri::AppHandle) -> Result<(), String> {
-    // If viewer window already exists, just focus it
+pub async fn start_session(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, State>,
+    options: Option<crate::recorder::SessionOptions>,
+) -> Result<SessionStatus, String> {
+    let state_inner = state.inner().clone();
+
+    let root = {
+        let s = state_inner.lock().await;
+        if let Some(rec) = &s.recorder {
+            if !rec.is_stopping() {
+                return Err("A session is already recording".to_string());
+            }
+        }
+        sessions_root_for(&s.config)
+    };
+    std::fs::create_dir_all(&root).map_err(|e| format!("create {}: {}", root.display(), e))?;
+
+    let env = crate::recorder::RecorderEnv::from_app(&app);
+    let recorder = crate::recorder::Recorder::start(env, &root, options.unwrap_or_default())?;
+
+    let status = SessionStatus::from_recorder(&recorder);
+    state_inner.lock().await.recorder = Some(recorder);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn stop_session(state: tauri::State<'_, State>) -> Result<SessionStatus, String> {
+    let recorder = {
+        let mut s = state.lock().await;
+        s.recorder.take()
+    };
+    let Some(recorder) = recorder else {
+        return Err("No session is recording".to_string());
+    };
+
+    // `stop` joins the supervisor threads and can take several seconds waiting on
+    // graceful ffmpeg shutdowns — never block the async runtime on that.
+    let rec = recorder.clone();
+    tokio::task::spawn_blocking(move || rec.stop())
+        .await
+        .map_err(|e| format!("stop panicked: {}", e))?;
+
+    Ok(SessionStatus::from_recorder(&recorder))
+}
+
+#[tauri::command]
+pub async fn get_session_status(state: tauri::State<'_, State>) -> Result<SessionStatus, String> {
+    let s = state.lock().await;
+    Ok(match &s.recorder {
+        Some(rec) => SessionStatus::from_recorder(rec),
+        None => {
+            // Idle still reports the disk, so the user can see there is room
+            // before starting rather than after being stopped.
+            let mut idle = SessionStatus::idle();
+            idle.disk_free_bytes =
+                crate::recorder::free_space_bytes(&capture::get_output_dir(&s.config));
+            idle
+        }
+    })
+}
+
+#[tauri::command]
+pub async fn list_sessions(
+    state: tauri::State<'_, State>,
+) -> Result<Vec<crate::recorder::SessionSummary>, String> {
+    let root = {
+        let s = state.lock().await;
+        sessions_root_for(&s.config)
+    };
+    Ok(tokio::task::spawn_blocking(move || crate::recorder::list_sessions(&root))
+        .await
+        .map_err(|e| e.to_string())?)
+}
+
+/// Full manifest for one session. Reads the live in-memory manifest when the
+/// requested session is the one currently recording, so the UI never sees a
+/// manifest staler than the last flushed segment.
+#[tauri::command]
+pub async fn get_session(
+    state: tauri::State<'_, State>,
+    id: String,
+) -> Result<crate::session::SessionManifest, String> {
+    let dir = {
+        let s = state.lock().await;
+        if let Some(rec) = &s.recorder {
+            let m = rec.manifest();
+            if m.id == id {
+                return Ok(m);
+            }
+        }
+        sessions_root_for(&s.config).join(&id)
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::session::read_manifest(&dir)
+            // No manifest on disk means the app died before flushing one.
+            .or_else(|_| crate::session::rebuild_manifest_from_disk(&dir))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn add_marker(
+    state: tauri::State<'_, State>,
+    label: String,
+) -> Result<crate::session::Marker, String> {
+    let s = state.lock().await;
+    let rec = s.recorder.as_ref().ok_or("No session is recording")?;
+    rec.add_marker(label)
+}
+
+/// Reconstruct a session's manifest purely by scanning its directory and
+/// ffprobing every segment. This is the crash-recovery path: it works with no
+/// `session.json` present, and the rebuilt manifest is written back atomically.
+#[tauri::command]
+pub async fn rebuild_session(
+    state: tauri::State<'_, State>,
+    id: String,
+) -> Result<crate::session::SessionManifest, String> {
+    let dir = {
+        let s = state.lock().await;
+        if let Some(rec) = &s.recorder {
+            if rec.manifest().id == id && !rec.is_stopping() {
+                return Err("Cannot rebuild a session that is still recording".to_string());
+            }
+        }
+        sessions_root_for(&s.config).join(&id)
+    };
+    tokio::task::spawn_blocking(move || {
+        let m = crate::session::rebuild_manifest_from_disk(&dir)?;
+        crate::session::write_manifest(&dir, &m)?;
+        Ok(m)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// One row of the monitor picker: the raw DXGI output plus the recorder's own
+/// `screen_index` — the `N` in `screen-N`, and the value `SessionOptions.screens`
+/// takes. `output_idx` cannot serve that role because it repeats across adapters.
+#[derive(Serialize)]
+pub struct DisplayOutputInfo {
+    #[serde(flatten)]
+    pub output: crate::recorder::DisplayOutput,
+    /// `None` for an output with no desktop extended onto it — it gets no slot.
+    pub screen_index: Option<u32>,
+}
+
+/// The DXGI output ↔ monitor mapping the recorder will use.
+#[tauri::command]
+pub async fn list_display_outputs(app: tauri::AppHandle) -> Result<Vec<DisplayOutputInfo>, String> {
+    let _ = &app;
+    tokio::task::spawn_blocking(|| {
+        let outputs = crate::recorder::enumerate_dxgi_outputs()?;
+        // Enumeration alone cannot say whether an output is capturable — that
+        // depends on which encoders exist. Without this the picker would offer
+        // the iGPU monitor on a machine with no QSV, and the track would simply
+        // never appear.
+        let caps = capture::find_ffmpeg()
+            .map(|f| crate::recorder::detect_encoders(&f))
+            .unwrap_or_default();
+
+        let mut next_index: u32 = 0;
+        Ok(outputs
+            .into_iter()
+            .map(|mut o| {
+                let screen_index = if o.attached {
+                    let i = next_index;
+                    next_index += 1;
+                    Some(i)
+                } else {
+                    None
+                };
+                o.capturable = crate::recorder::output_is_capturable(&o, &caps);
+                DisplayOutputInfo {
+                    output: o,
+                    screen_index,
+                }
+            })
+            .collect())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn open_viewer(
+    app: tauri::AppHandle,
+    date: Option<String>,
+    timestamp: Option<String>,
+    session: Option<String>,
+    tab: Option<String>,
+) -> Result<(), String> {
+    let mut url = "/?mode=viewer".to_string();
+    if let Some(d) = &date {
+        url.push_str(&format!("&date={}", d));
+    }
+    if let Some(s) = &session {
+        url.push_str(&format!("&session={}", s));
+    }
+    if let Some(t) = &tab {
+        url.push_str(&format!("&tab={}", t));
+    }
+    // `ts` is the clip's `HH-MM-SS` for a date link and an epoch-ms instant for a
+    // session link — which one is meant is decided by `date` vs `session`.
+    if let Some(t) = &timestamp {
+        url.push_str(&format!("&ts={}", t));
+    }
+
+    let deep_link = date.is_some() || session.is_some() || tab.is_some();
+
+    // If viewer window already exists, close and reopen with new URL
     if let Some(w) = app.get_webview_window("viewer") {
-        w.set_focus().map_err(|e| e.to_string())?;
-        return Ok(());
+        if deep_link {
+            let _ = w.close();
+            // Small delay to let window close
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        } else {
+            w.set_focus().map_err(|e| e.to_string())?;
+            return Ok(());
+        }
     }
 
     tauri::WebviewWindowBuilder::new(
         &app,
         "viewer",
-        tauri::WebviewUrl::App("/?mode=viewer".into()),
+        tauri::WebviewUrl::App(url.into()),
     )
     .title("ChirpTime - Viewer")
     .inner_size(1280.0, 800.0)

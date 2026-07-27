@@ -75,6 +75,92 @@ pub fn find_ffmpeg() -> Option<String> {
     None
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DetectedMonitor {
+    pub id: u32,
+    pub label: String,
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
+/// Detect actual monitor layout from Windows, mapped to the 3840px-wide scaled output space.
+/// FFmpeg gdigrab captures the full virtual desktop and `scale=3840:-2` scales it to 3840px wide.
+pub fn detect_monitors() -> Option<(u32, u32, Vec<DetectedMonitor>)> {
+    let ps_script = r#"
+Add-Type -AssemblyName System.Windows.Forms
+$screens = [System.Windows.Forms.Screen]::AllScreens
+foreach ($s in $screens) {
+    $b = $s.Bounds
+    Write-Output "$($s.DeviceName)|$($b.X)|$($b.Y)|$($b.Width)|$($b.Height)|$($s.Primary)"
+}
+"#;
+    let output = silent_command("powershell")
+        .args(["-NoProfile", "-Command", ps_script])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut raw_monitors: Vec<(String, i32, i32, u32, u32)> = Vec::new();
+
+    for line in stdout.lines() {
+        let parts: Vec<&str> = line.trim().split('|').collect();
+        if parts.len() < 5 { continue; }
+        let name = parts[0].to_string();
+        let x: i32 = parts[1].parse().ok()?;
+        let y: i32 = parts[2].parse().ok()?;
+        let w: u32 = parts[3].parse().ok()?;
+        let h: u32 = parts[4].parse().ok()?;
+        raw_monitors.push((name, x, y, w, h));
+    }
+
+    if raw_monitors.is_empty() {
+        return None;
+    }
+
+    // Compute virtual desktop bounding box
+    let min_x = raw_monitors.iter().map(|m| m.1).min().unwrap();
+    let min_y = raw_monitors.iter().map(|m| m.2).min().unwrap();
+    let max_x = raw_monitors.iter().map(|m| m.1 + m.3 as i32).max().unwrap();
+    let max_y = raw_monitors.iter().map(|m| m.2 + m.4 as i32).max().unwrap();
+    let vd_width = (max_x - min_x) as f64;
+    let vd_height = (max_y - min_y) as f64;
+
+    // FFmpeg scales to 3840px wide, height is proportional
+    let scale = 3840.0 / vd_width;
+    let scaled_height = (vd_height * scale).round() as u32;
+    // Make height even for video codec
+    let scaled_height = if scaled_height % 2 != 0 { scaled_height + 1 } else { scaled_height };
+
+    let monitors: Vec<DetectedMonitor> = raw_monitors
+        .iter()
+        .enumerate()
+        .map(|(i, (name, x, y, w, h))| {
+            let sx = ((*x - min_x) as f64 * scale).round() as i32;
+            let sy = ((*y - min_y) as f64 * scale).round() as i32;
+            let sw = (*w as f64 * scale).round() as u32;
+            let sh = (*h as f64 * scale).round() as u32;
+            // Clean up device name: \\.\DISPLAY1 -> DISPLAY1
+            let label = name.trim_start_matches("\\\\.\\").to_string();
+            DetectedMonitor {
+                id: (i + 1) as u32,
+                label,
+                x: sx,
+                y: sy,
+                w: sw,
+                h: sh,
+            }
+        })
+        .collect();
+
+    Some((3840, scaled_height, monitors))
+}
+
 pub fn list_dshow_devices(ffmpeg: &str) -> (Vec<String>, Vec<String>) {
     let output = silent_command(ffmpeg)
         .args(["-list_devices", "true", "-f", "dshow", "-i", "dummy"])
@@ -139,76 +225,69 @@ pub async fn run_capture_cycle(
         None
     };
 
-    // Capture screenshot
-    let screenshot_path = screenshots_dir.join(format!("{}.png", timestamp));
-    let screenshot_result = silent_command(&ffmpeg)
-        .args([
-            "-f", "gdigrab",
-            "-framerate", "1",
-            "-i", "desktop",
-            "-vframes", "1",
-            "-vf", "scale=3840:-2",
-            "-y",
-        ])
-        .arg(&screenshot_path)
-        .output();
-
     let mut results = Vec::new();
-    match screenshot_result {
-        Ok(output) if output.status.success() => {
-            results.push(format!("Screenshot: {}", screenshot_path.display()));
-        }
-        Ok(output) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            results.push(format!("Screenshot failed: {}", &stderr[stderr.len().saturating_sub(200)..]));
-        }
-        Err(e) => results.push(format!("Screenshot failed: {}", e)),
-    }
 
-    // Record screen + webcam in parallel
-    if config.video_mode {
-        let screen_path = video_dir.join(format!("{}_screen.mp4", timestamp));
-        let webcam_path = video_dir.join(format!("{}_webcam.mp4", timestamp));
-
-        // Spawn screen recording thread
-        let screen_thread = {
-            let ffmpeg = ffmpeg.clone();
-            let duration = config.video_duration_seconds.to_string();
-            let framerate = config.video_framerate.to_string();
-            let preset = config.video_preset.clone();
-            let path = screen_path.clone();
-            let audio_dev = audio_device.clone();
-            std::thread::spawn(move || {
-                let mut cmd = silent_command(&ffmpeg);
-                cmd.args([
+    // Spawn ALL captures simultaneously so they're in sync
+    let screenshot_path = screenshots_dir.join(format!("{}.png", timestamp));
+    let screenshot_thread = {
+        let ffmpeg = ffmpeg.clone();
+        let path = screenshot_path.clone();
+        std::thread::spawn(move || {
+            silent_command(&ffmpeg)
+                .args([
                     "-f", "gdigrab",
-                    "-framerate", &framerate,
+                    "-framerate", "1",
                     "-i", "desktop",
-                ]);
-                // Add audio input if available
-                if let Some(ref dev) = audio_dev {
-                    cmd.args([
-                        "-f", "dshow",
-                        "-i", &format!("audio={}", dev),
-                    ]);
-                }
-                cmd.args([
-                    "-t", &duration,
-                    "-vf", &format!("scale=3840:-2,drawtext=text='%{{localtime\\:%Y-%m-%d %H\\\\\\:%M\\\\\\:%S}}':fontsize=24:fontcolor=white:borderw=2:bordercolor=black:x=10:y=10"),
-                    "-c:v", "libx264",
-                    "-preset", &preset,
-                    "-crf", "23",
-                    "-pix_fmt", "yuv420p",
-                ]);
-                if audio_dev.is_some() {
-                    cmd.args(["-c:a", "aac", "-b:a", "128k"]);
-                }
-                cmd.args(["-y"]).arg(&path).output()
-            })
-        };
+                    "-vframes", "1",
+                    "-vf", "scale=3840:-2",
+                    "-y",
+                ])
+                .arg(&path)
+                .output()
+        })
+    };
 
-        // Spawn webcam recording thread (if device available)
-        let webcam_thread = webcam_device.as_ref().map(|device| {
+    let screen_path = video_dir.join(format!("{}_screen.mp4", timestamp));
+    let webcam_path = video_dir.join(format!("{}_webcam.mp4", timestamp));
+    let screen_thread = if config.video_mode {
+        let ffmpeg = ffmpeg.clone();
+        let duration = config.video_duration_seconds.to_string();
+        let framerate = config.video_framerate.to_string();
+        let preset = config.video_preset.clone();
+        let path = screen_path.clone();
+        let audio_dev = audio_device.clone();
+        Some(std::thread::spawn(move || {
+            let mut cmd = silent_command(&ffmpeg);
+            cmd.args([
+                "-f", "gdigrab",
+                "-framerate", &framerate,
+                "-i", "desktop",
+            ]);
+            if let Some(ref dev) = audio_dev {
+                cmd.args([
+                    "-f", "dshow",
+                    "-i", &format!("audio={}", dev),
+                ]);
+            }
+            cmd.args([
+                "-t", &duration,
+                "-vf", &format!("scale=3840:-2,drawtext=text='%{{localtime\\:%Y-%m-%d %H\\\\\\:%M\\\\\\:%S}}':fontsize=24:fontcolor=white:borderw=2:bordercolor=black:x=10:y=10"),
+                "-c:v", "libx264",
+                "-preset", &preset,
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+            ]);
+            if audio_dev.is_some() {
+                cmd.args(["-c:a", "aac", "-b:a", "128k"]);
+            }
+            cmd.args(["-y"]).arg(&path).output()
+        }))
+    } else {
+        None
+    };
+
+    let webcam_thread = if config.video_mode {
+        webcam_device.as_ref().map(|device| {
             let ffmpeg = ffmpeg.clone();
             let duration = config.video_duration_seconds.to_string();
             let preset = config.video_preset.clone();
@@ -217,7 +296,6 @@ pub async fn run_capture_cycle(
             let audio_dev = audio_device.clone();
             std::thread::spawn(move || {
                 let mut cmd = silent_command(&ffmpeg);
-                // If audio device available, combine video+audio in one dshow input
                 if let Some(ref adev) = audio_dev {
                     cmd.args([
                         "-f", "dshow",
@@ -242,10 +320,27 @@ pub async fn run_capture_cycle(
                 }
                 cmd.args(["-y"]).arg(&path).output()
             })
-        });
+        })
+    } else {
+        None
+    };
 
-        // Wait for both to finish
-        let screen_ok = match screen_thread.join() {
+    // Wait for screenshot
+    match screenshot_thread.join() {
+        Ok(Ok(output)) if output.status.success() => {
+            results.push(format!("Screenshot: {}", screenshot_path.display()));
+        }
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            results.push(format!("Screenshot failed: {}", &stderr[stderr.len().saturating_sub(200)..]));
+        }
+        Ok(Err(e)) => results.push(format!("Screenshot failed: {}", e)),
+        Err(_) => results.push("Screenshot failed: thread panicked".to_string()),
+    }
+
+    // Wait for screen recording
+    if let Some(handle) = screen_thread {
+        let screen_ok = match handle.join() {
             Ok(Ok(output)) if output.status.success() => {
                 results.push(format!("Video: {}", screen_path.display()));
                 true
@@ -284,13 +379,12 @@ pub async fn run_capture_cycle(
                 .args([
                     "-i", &screen_path.to_string_lossy(),
                     "-i", &webcam_path.to_string_lossy(),
-                    "-filter_complex", "[1:v]scale=320:-2[pip];[0:v][pip]overlay=W-w-10:10",
+                    "-filter_complex", "[1:v]scale=320:-2[pip];[0:v][pip]overlay=W-w-10:10:eof_action=pass",
                     "-c:v", "libx264",
                     "-preset", &config.video_preset,
                     "-crf", "23",
                     "-pix_fmt", "yuv420p",
                     "-c:a", "copy",
-                    "-shortest",
                     "-y",
                 ])
                 .arg(&combined_path)

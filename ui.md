@@ -48,6 +48,8 @@ Anything not expressible as a utility lives in `src/ui/app.css`.
 | Destructive | `red-500` + `bg-red-50` | Delete hover only |
 | Webcam | `purple-500` / `bg-purple-50` | The "Cam" badge and webcam zoom only |
 | Video badge | `text-blue-600` / `bg-blue-50` | "Video" badge in the gallery |
+| Advisory | `amber-800` on `bg-amber-50` + `border-amber-100` | A recorder notice that is neither fine nor broken — a skipped Bluetooth mic, an uncapturable monitor, an interrupted session. Also `amber-500` for a restarting track's dot |
+| Failure | `red-700` on `bg-red-50` + `border-red-100` | A track or session that actually failed. Distinct from the recording red by weight, and it never pulses |
 
 ### Color — dark surfaces (media viewer only)
 
@@ -62,11 +64,25 @@ Anything not expressible as a utility lives in `src/ui/app.css`.
 | Text — muted | `text-white/40` | Counts, inactive segment labels |
 | Selected segment | `text-sky-500 bg-sky-500/15` | Active monitor / active mode |
 | Thumb placeholder | `#1E1E2A` | Filmstrip cells with no thumbnail |
+| Track letterbox | `#07070B` | Behind a session track's video |
+| Screen track | `sky-500/40` · `/55` | Timeline segment blocks (alternating) |
+| Webcam track | `purple-500/40` · `/55` | Timeline segment blocks; PiP ring |
+| Audio track | `white/20` · `/30` | Timeline segment blocks for mic / system-audio |
+| Gap | dashed `red-400/40` on `red-500/10` | A track missing footage mid-session |
+| Marker | `amber-400` diamond | `markers[]` from the manifest |
+| Drift — good / warn / bad | `emerald-400` / `amber-400` / `red-400` | ≤30ms / ≤150ms / above — the sync thresholds, nothing else |
+
+**Sync colors are thresholds, not decoration.** Emerald/amber/red on a drift
+number must always mean the engine's 30ms and 150ms bounds. Red here is the one
+exception to "red means recording or destruction".
 
 **Accent discipline:** sky is earned by *state* (this is selected / this is live /
 this day has captures), never used as decoration. Red is only used when recording
-is in progress or something is about to be deleted. Purple never appears outside a
-webcam affordance.
+is in progress, something is about to be deleted, or something failed. Purple
+never appears outside a webcam affordance. Amber means *advisory* — read this,
+nothing is broken — and is the same amber as the timeline's markers and the sync
+panel's warn threshold. Those three uses are the whole of amber; it is not a
+fourth accent to reach for.
 
 ### Typography
 
@@ -106,9 +122,29 @@ Weights in use: 500 / 600 / 700 only. No light weights, no italics.
 ## Layout
 
 - **Widget (320×540, undecorated):** `flex flex-col h-screen bg-white rounded-xl
-  border border-slate-200` → custom titlebar (drag region) → status chip →
-  primary + secondary buttons → stats strip (top+bottom hairline) → scrollable
-  Recent list (`flex-1 min-h-0`) → Browse footer.
+  border border-slate-200` → custom titlebar (drag region) → **Clips | Session**
+  mode switch → the chosen pane. Each pane is status chip → primary + secondary
+  buttons → stats strip (top+bottom hairline) → scrollable list (`flex-1
+  min-h-0`) → footer link, so switching modes changes the content and not the
+  shape.
+- **Widget mode switch:** the light-surface segmented control (`p-0.5
+  bg-slate-100` rail, active tab `bg-white shadow-sm`). Either tab carries a 6px
+  pulsing red dot while *that* mode is recording — both statuses are polled
+  whichever pane is showing, so a running recording can never be hidden by
+  switching tabs.
+- **Widget session pane:** status chip with the elapsed clock right-aligned →
+  Start/Stop Session → marker row (`What just happened?` field + Flag button with
+  an amber flag glyph) → Segments / Written / Disk free stats → notices → Tracks
+  list → collapsible Settings → footer link into the viewer. The whole pane
+  scrolls; only the footer is pinned.
+- **Widget track row:** status dot (sky pulsing = recording, amber = restarting,
+  red = failed, slate = starting/stopped) → label → kind badge (`Screen` sky /
+  `Cam` purple / `Mic`,`Sys` slate) → right-aligned `segments · bytes`. Restarts,
+  gaps and the error string wrap onto indented sub-lines rather than a tooltip.
+- **Widget settings:** an inline `bg-slate-50` card inside the pane — never a
+  drawer. Eyebrow-labelled groups (Monitors / Sources / Quality / Output folder),
+  `accent-sky-500` checkboxes, and full-width 12px selects. Disabled wholesale
+  while recording, with one muted line saying why.
 - **Viewer (1280×800):** one `h-screen overflow-hidden` root, exactly one of three
   views mounted at a time — `calendar` → `gallery` → `viewer`. Back always steps one
   level up; `Escape` does the same.
@@ -119,6 +155,26 @@ Weights in use: 500 / 600 / 700 only. No light weights, no italics.
   thumb + meta row.
 - **Media viewer:** toolbar → centered media (`flex-1 min-h-0`, floating circular
   prev/next) → 72×42 filmstrip rail.
+- **Session browser (light):** same header as the calendar with a Clips/Sessions
+  segmented control on the right → `Sessions` heading + count → full-width rows
+  (`rounded-[14px]` card, sky icon tile, date + id on the left, right-aligned
+  Duration / Tracks / Segments / Size stats, chevron). A row is badged **Recording**
+  (red, pulsing) only when the live recorder reports that id; a session with no
+  end time that is *not* live is badged **Interrupted** (amber) — see
+  `decisions.md`.
+- **Session player (dark):** toolbar → stage (`flex-1 min-h-0 p-2`) → transport
+  bar → timeline. All four are `shrink-0` except the stage. Three stage layouts:
+  **grid** (`repeat(ceil(sqrt(n)), minmax(0,1fr))`, gap-2), **focus** (one track
+  full-bleed + 22%-wide webcam PiP bottom-right, purple ring), **overlay**
+  (monitors absolutely positioned at their real desktop coordinates scaled into
+  the stage, webcam floating at 18%).
+- **Session player audio:** the transport's audio-source control opens on
+  **Muted** and stays there until the user picks a track. Never ship a default
+  that makes the app produce sound on load — see `decisions.md`.
+- **Timeline:** 132px label gutter | lanes. 24px ruler with wall-clock ticks and
+  amber diamond markers, then one 22px lane per track. Segments alternate two
+  opacities of the track's kind color so boundaries are visible; gaps are a
+  dashed red outline; playhead is a 1px sky line with a dot cap.
 
 ## Components
 
@@ -135,6 +191,13 @@ patterns below rather than importing from there.
 | Thumbnail card | `ViewerApp.tsx` | `loading="lazy"`, play-glyph overlay chip when a video exists |
 | Segmented control | `ViewerApp.tsx` | used for monitor zoom and playback speed |
 | Filmstrip | `ViewerApp.tsx` | active cell `border-sky-500`, inactive `opacity-50` |
+| Track surface | `session/TrackSurface.tsx` | two stacked `<video>`; label chip top-left, drift chip bottom-left, empty state centered |
+| Session row | `session/SessionBrowser.tsx` | the light-surface list row + right-aligned stat stack |
+| Notice (advisory / failure) | `CompactApp.tsx` | amber or red bordered block, 12px circle-`i` glyph, 11px `leading-snug` body |
+| Track health row | `CompactApp.tsx` | status dot + kind badge + `segments · bytes` |
+| Inline settings card | `CompactApp.tsx` | `bg-slate-50` card, eyebrow groups, native selects |
+| Timeline lane | `session/Timeline.tsx` | segment blocks, dashed gap, marker diamond, playhead |
+| Sync panel | `session/SessionPlayer.tsx` | `bg-black/85 backdrop-blur-md` overlay, 10px mono table |
 | Icons | both | Inline SVG, `viewBox="0 0 24 24"`, `stroke="currentColor"`, `strokeWidth={2}`, `strokeLinecap="round"`. No icon package. |
 
 Signature snippets:
@@ -165,8 +228,10 @@ two copies identical.
   ("No captures for this day"). No illustrations, no CTA.
 - **Busy:** buttons take `disabled` with `disabled:opacity-50
   disabled:cursor-not-allowed`; never swap the label for a spinner.
-- **Errors:** currently swallowed (`catch {}` everywhere). If you add an error
-  surface, make it an inline muted line — not a toast, not a modal.
+- **Errors:** the clips pane still swallows them (`catch {}`). The session pane
+  does not: anything the recorder says — a fatal, a failed track's message, a
+  device warning — renders as an inline Notice block, verbatim, because those
+  strings are written to be read by the user. Never a toast, never a modal.
 - **Destructive:** native `confirm()` naming the capture's `display_time`. Delete
   affordances stay invisible until row hover (`opacity-0 group-hover:opacity-100`).
 
@@ -193,8 +258,8 @@ Short, literal, sentence case. Verb-first for actions.
 - ❌ Shadows for structure on light surfaces. Use `border-slate-200`.
 - ❌ Toasts, modals, or drawers. The widget is 320px wide; everything is inline.
 - ❌ Icon libraries or CSS frameworks beyond Tailwind. Icons are hand-written SVG.
-- ❌ Adding a file to `src/ui/components/` — that directory is dead; the two app
-  files are the app.
+- ❌ Adding a file to `src/ui/components/` — that directory is dead. `src/ui/session/`
+  is the one place multi-file UI lives, and only for the session player.
 - ❌ Scrollbars wider than 4px, or a light scrollbar thumb on a dark surface (use
   the `.dark-scroll` class).
 - ❌ Sharp corners. Nothing in this app has a 0px radius.
