@@ -51,6 +51,25 @@ pub const MIN_FREE_BYTES: u64 = 1024 * 1024 * 1024;
 /// (see [`index_segment`]), so a sub-second launch offset is recorded rather than
 /// accumulated.
 const SCREEN_STAGGER_MS: u64 = 300;
+/// How long after launch we keep sampling ffmpeg's `-progress` clock to work out
+/// when a dshow capture's content actually began. See [`Anchor::FromProgress`].
+///
+/// Long enough for ~10 reports at ffmpeg's default 0.5s cadence, short enough that
+/// it is closed well before the second segment of even a 5s-segment session is
+/// indexed, so the value the first segment consumes is already final.
+const ANCHOR_WINDOW_MS: i64 = 5_000;
+/// Consecutive runs in which one half of the shared webcam+mic process produces
+/// no segments before we stop insisting the two devices be captured together.
+/// See [`supervise_track`].
+///
+/// A real tension sets this number. While the pair is failing, the *microphone*
+/// is recording nothing either, so waiting is not free — but splitting is
+/// permanent for the session, and gives up the lip-sync this whole arrangement
+/// exists for. A camera released by another app, or one still warming up, can
+/// easily need a few seconds; abandoning sync after the ~1.5s that 2 runs buys
+/// would trade the feature away for a transient. At 4, the retry backoff
+/// (500ms x n) gives the camera ~5s to appear, and the mic loses at most that.
+const PAIR_SPLIT_AFTER: u32 = 4;
 
 // ---------------------------------------------------------------------------
 // Process helpers
@@ -1054,23 +1073,195 @@ enum TrackSource {
         /// Also write a mono 16kHz WAV sidecar for later transcription.
         sidecar: bool,
     },
+    /// Webcam **and** microphone, captured by one ffmpeg process from one
+    /// DirectShow graph, writing two separately segmented outputs.
+    ///
+    /// This exists for lip-sync, and only for lip-sync. Two independent captures
+    /// cannot be aligned after the fact: each device has its own open latency (a
+    /// Logitech BRIO takes ~1.3s to hand over its first MJPEG frame, a microphone
+    /// starts in ~0.15s) and each demuxer zeroes its own first packet, so the
+    /// difference is baked in as a genuine, unrecoverable offset. Measured on this
+    /// machine, two processes put the audio **1378ms** ahead of the picture; one
+    /// process, one `-i "video=X:audio=Y"` input, measured **0.0ms** of skew
+    /// between the two streams on the shared timeline (ffprobe start_time of both
+    /// streams in a muxed reference output of the same run).
+    ///
+    /// It has to be a *single* dshow input, not two `-f dshow` inputs in one
+    /// process: two inputs are two DirectShow graphs with two independent start
+    /// instants, which reproduces the original offset exactly.
+    WebcamMic {
+        video_device: String,
+        audio_device: String,
+        encoder: String,
+        video_size: String,
+        fps: u32,
+        sidecar: bool,
+    },
     SysAudio,
 }
 
+impl TrackSource {
+    /// How the first segment of a run learns where its content really began.
+    ///
+    /// Everything dshow-based needs help here: the wall-clock instant a segment
+    /// *file* appears is not the instant its content starts, and the size of that
+    /// lag depends on the pipeline. Measured, same session, same 100ms poll: a
+    /// webcam file appeared 324ms after its first frame, a mic file **1702ms**
+    /// after its first sample, because an audio-only AAC/MP4 output buffers far
+    /// longer before its first write. Anchoring each to its own file creation is
+    /// therefore not a small error, and it is not a shared one.
+    fn anchor(&self, launched: i64, progress_t0: &Arc<AtomicI64>, sys_t0: Option<i64>) -> Anchor {
+        match self {
+            TrackSource::SysAudio => sys_t0.map(Anchor::Fixed).unwrap_or(Anchor::FileCreation),
+            TrackSource::Webcam { .. } | TrackSource::Mic { .. } | TrackSource::WebcamMic { .. } => {
+                Anchor::FromProgress(progress_t0.clone(), launched)
+            }
+            // Screens land within ~270ms of their content start (measured), and
+            // that path is verified. Left alone deliberately.
+            TrackSource::Screen { .. } => Anchor::FileCreation,
+        }
+    }
+}
+
+/// Where a run's first segment believes its content began.
+#[derive(Clone)]
+enum Anchor {
+    /// Nothing better than the file's own creation time; `decide_segment_start`
+    /// falls back to `observed`.
+    FileCreation,
+    /// Known exactly. `SysAudioCapture` pads silence from this instant, so its
+    /// content genuinely begins here — several seconds before ffmpeg creates the
+    /// file.
+    Fixed(i64),
+    /// Derived from ffmpeg's own clock. Every `-progress` block carries
+    /// `out_time_us`, the media position just muxed; at wall time `W` that implies
+    /// content started at `W - out_time`. Every sample is biased *late* by however
+    /// far the pipeline is behind, so the **minimum** over the sampling window is
+    /// the estimate — pipeline latency only ever inflates it.
+    ///
+    /// Measured against the true content start (recovered from the stop instant
+    /// minus the media produced): screen 137ms late, webcam 204–229ms late, mic
+    /// 369ms late — versus 270ms / 324ms / **1702ms** for file creation.
+    FromProgress(Arc<AtomicI64>, i64),
+}
+
+impl Anchor {
+    fn resolve(&self) -> Option<i64> {
+        match self {
+            Anchor::FileCreation => None,
+            Anchor::Fixed(t) => Some(*t),
+            Anchor::FromProgress(est, launched) => {
+                let v = est.load(Ordering::Relaxed);
+                // No usable sample, or a value outside the window in which a
+                // capture can plausibly have started. Fall back rather than
+                // publish a start time we do not believe.
+                if v == i64::MAX || v > launched + 60_000 {
+                    return None;
+                }
+                // Content cannot predate the process that captured it.
+                Some(v.max(*launched))
+            }
+        }
+    }
+}
+
+/// One manifest track fed by a supervisor's ffmpeg process.
+#[derive(Debug, Clone)]
+struct OutputSpec {
+    track_id: String,
+    dir_name: String,
+}
+
+/// One supervised ffmpeg process, and the manifest track(s) it feeds.
+///
+/// Almost every process feeds exactly one track. The webcam/mic pair is the sole
+/// exception and the reason `outputs` is a list: they must share a process to
+/// share a clock, but they remain two separate tracks and two separate files —
+/// transcription needs an isolated mic track and the player renders them
+/// independently.
 #[derive(Debug, Clone)]
 struct TrackSpec {
+    /// Supervisor id — also the key for this process's stderr ring and logs.
     id: String,
-    kind: String,
-    label: String,
-    dir_name: String,
-    monitor: Option<MonitorRef>,
-    codec: String,
-    width: u32,
-    height: u32,
-    fps: u32,
+    outputs: Vec<OutputSpec>,
     /// Delay before this track's first launch. See [`SCREEN_STAGGER_MS`].
     launch_delay_ms: u64,
     source: TrackSource,
+}
+
+impl TrackSource {
+    fn writes_mic_sidecar(&self) -> bool {
+        matches!(
+            self,
+            TrackSource::Mic { sidecar: true, .. } | TrackSource::WebcamMic { sidecar: true, .. }
+        )
+    }
+}
+
+/// A fresh manifest track, before anything has been recorded into it.
+#[allow(clippy::too_many_arguments)]
+fn new_track(
+    id: &str,
+    kind: &str,
+    label: &str,
+    monitor: Option<MonitorRef>,
+    codec: &str,
+    width: u32,
+    height: u32,
+    fps: u32,
+) -> Track {
+    Track {
+        id: id.to_string(),
+        kind: kind.to_string(),
+        label: label.to_string(),
+        monitor,
+        codec: codec.to_string(),
+        width,
+        height,
+        fps,
+        start_epoch_ms: 0,
+        dir: id.to_string(),
+        segments: Vec::new(),
+        gaps: Vec::new(),
+        status: TrackStatus::Starting,
+        error: None,
+        restarts: 0,
+    }
+}
+
+/// Whether these two device names can be expressed as one dshow input, and why
+/// not if they cannot.
+///
+/// ffmpeg spells a combined capture `video=<cam>:audio=<mic>`, so the separator
+/// is part of the *device name string*. A device whose own name contains
+/// `:audio=` would be parsed apart in the wrong place and open the wrong thing —
+/// vanishingly unlikely, but the failure would be silent, and silently recording
+/// the wrong device is worse than recording two processes.
+fn combined_dshow_unsupported(video: &str, audio: &str) -> Option<String> {
+    for (role, name) in [("webcam", video), ("microphone", audio)] {
+        if name.contains(":audio=") || name.contains(":video=") {
+            return Some(format!(
+                "the {} device name \"{}\" contains ffmpeg's own dshow separator, so \
+                 the two devices cannot be named in a single input.",
+                role, name
+            ));
+        }
+    }
+    None
+}
+
+impl TrackSpec {
+    fn solo(id: &str, source: TrackSource) -> Self {
+        Self {
+            id: id.to_string(),
+            outputs: vec![OutputSpec {
+                track_id: id.to_string(),
+                dir_name: id.to_string(),
+            }],
+            launch_delay_ms: 0,
+            source,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,6 +1325,10 @@ struct Inner {
     logs: Mutex<std::collections::HashMap<String, RingLog>>,
     warnings: Mutex<Vec<String>>,
     fatal: Mutex<Option<String>>,
+    /// Supervisors spawned *after* `start` — see [`supervise_track`], which splits
+    /// the shared webcam/mic process into two solo ones if the pair cannot run.
+    /// `stop` drains this as well, so a split session still shuts down cleanly.
+    extra_joins: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Inner {
@@ -1301,24 +1496,28 @@ impl Recorder {
                 if let Some(w) = warn {
                     warnings.push(w);
                 }
-                specs.push(TrackSpec {
-                    id: format!("screen-{}", t.screen_index),
-                    kind: "screen".into(),
-                    label: t.label.clone(),
-                    dir_name: format!("screen-{}", t.screen_index),
-                    monitor: Some(t.rect),
-                    codec,
-                    width: t.rect.w,
-                    height: t.rect.h,
-                    fps: opts.screen_fps,
-                    launch_delay_ms: screen_n * SCREEN_STAGGER_MS,
-                    source: TrackSource::Screen {
+                let id = format!("screen-{}", t.screen_index);
+                manifest.tracks.push(new_track(
+                    &id,
+                    "screen",
+                    &t.label,
+                    Some(t.rect),
+                    &codec,
+                    t.rect.w,
+                    t.rect.h,
+                    opts.screen_fps,
+                ));
+                let mut spec = TrackSpec::solo(
+                    &id,
+                    TrackSource::Screen {
                         adapter: t.adapter,
                         output_idx: t.output_idx,
                         encoder,
                         fps: opts.screen_fps,
                     },
-                });
+                );
+                spec.launch_delay_ms = screen_n * SCREEN_STAGGER_MS;
+                specs.push(spec);
                 screen_n += 1;
             }
             if specs.is_empty() {
@@ -1334,77 +1533,118 @@ impl Recorder {
             (Vec::new(), Vec::new())
         };
 
-        if opts.record_webcam {
+        let webcam_device = opts.record_webcam.then(|| {
             let picked = select_webcam_device(opts.webcam_device.as_deref(), &dshow_video);
             warnings.extend(picked.warnings);
-            match picked.device {
-                Some(device) => {
-                    let (w, h) = parse_size(&opts.webcam_size).unwrap_or((1920, 1080));
-                    let (encoder, codec, warn) = pick_video_encoder(w, &caps);
-                    if let Some(x) = warn {
-                        warnings.push(x);
-                    }
-                    specs.push(TrackSpec {
-                        id: "webcam".into(),
-                        kind: "webcam".into(),
-                        label: device.clone(),
-                        dir_name: "webcam".into(),
-                        monitor: None,
-                        codec,
-                        width: w,
-                        height: h,
-                        fps: opts.webcam_fps,
-                        launch_delay_ms: 0,
-                        source: TrackSource::Webcam {
-                            device,
-                            encoder,
+            picked.device
+        }).flatten();
+
+        let mic_device = opts.record_mic.then(|| {
+            let picked = select_mic_device(opts.mic_device.as_deref(), &dshow_audio);
+            warnings.extend(picked.warnings);
+            picked.device
+        }).flatten();
+
+        let (webcam_w, webcam_h) = parse_size(&opts.webcam_size).unwrap_or((1920, 1080));
+        let webcam_enc = webcam_device.as_ref().map(|_| {
+            let (encoder, codec, warn) = pick_video_encoder(webcam_w, &caps);
+            if let Some(x) = warn {
+                warnings.push(x);
+            }
+            (encoder, codec)
+        });
+
+        if let Some(device) = &webcam_device {
+            let (_, codec) = webcam_enc.clone().unwrap();
+            manifest.tracks.push(new_track(
+                "webcam", "webcam", device, None, &codec, webcam_w, webcam_h, opts.webcam_fps,
+            ));
+        }
+        if let Some(device) = &mic_device {
+            manifest.tracks.push(new_track("mic", "mic", device, None, "aac", 0, 0, 0));
+        }
+
+        match (&webcam_device, &mic_device) {
+            // The one case that matters: both wanted, so capture them together.
+            (Some(video_device), Some(audio_device)) => {
+                if let Some(reason) = combined_dshow_unsupported(video_device, audio_device) {
+                    warnings.push(format!(
+                        "{} The webcam and microphone are being recorded by separate \
+                         processes, so their lip-sync may be off by up to a second.",
+                        reason
+                    ));
+                    specs.push(TrackSpec::solo(
+                        "webcam",
+                        TrackSource::Webcam {
+                            device: video_device.clone(),
+                            encoder: webcam_enc.clone().unwrap().0,
                             video_size: opts.webcam_size.clone(),
                             fps: opts.webcam_fps,
                         },
+                    ));
+                    specs.push(TrackSpec::solo(
+                        "mic",
+                        TrackSource::Mic {
+                            device: audio_device.clone(),
+                            sidecar: opts.mic_sidecar_16k,
+                        },
+                    ));
+                } else {
+                    specs.push(TrackSpec {
+                        id: "webcam".into(),
+                        outputs: vec![
+                            OutputSpec {
+                                track_id: "webcam".into(),
+                                dir_name: "webcam".into(),
+                            },
+                            OutputSpec {
+                                track_id: "mic".into(),
+                                dir_name: "mic".into(),
+                            },
+                        ],
+                        launch_delay_ms: 0,
+                        source: TrackSource::WebcamMic {
+                            video_device: video_device.clone(),
+                            audio_device: audio_device.clone(),
+                            encoder: webcam_enc.clone().unwrap().0,
+                            video_size: opts.webcam_size.clone(),
+                            fps: opts.webcam_fps,
+                            sidecar: opts.mic_sidecar_16k,
+                        },
                     });
                 }
-                None => {}
             }
-        }
-
-        if opts.record_mic {
-            let picked = select_mic_device(opts.mic_device.as_deref(), &dshow_audio);
-            warnings.extend(picked.warnings);
-            match picked.device {
-                Some(device) => specs.push(TrackSpec {
-                    id: "mic".into(),
-                    kind: "mic".into(),
-                    label: device.clone(),
-                    dir_name: "mic".into(),
-                    monitor: None,
-                    codec: "aac".into(),
-                    width: 0,
-                    height: 0,
-                    fps: 0,
-                    launch_delay_ms: 0,
-                    source: TrackSource::Mic {
-                        device,
-                        sidecar: opts.mic_sidecar_16k,
-                    },
-                }),
-                None => {}
-            }
+            (Some(device), None) => specs.push(TrackSpec::solo(
+                "webcam",
+                TrackSource::Webcam {
+                    device: device.clone(),
+                    encoder: webcam_enc.clone().unwrap().0,
+                    video_size: opts.webcam_size.clone(),
+                    fps: opts.webcam_fps,
+                },
+            )),
+            (None, Some(device)) => specs.push(TrackSpec::solo(
+                "mic",
+                TrackSource::Mic {
+                    device: device.clone(),
+                    sidecar: opts.mic_sidecar_16k,
+                },
+            )),
+            (None, None) => {}
         }
 
         if opts.record_system_audio {
-            specs.push(TrackSpec {
-                id: "sysaudio".into(),
-                kind: "system-audio".into(),
-                label: "System audio (WASAPI loopback)".into(),
-                dir_name: "sysaudio".into(),
-                monitor: None,
-                codec: "aac".into(),
-                width: 0,
-                height: 0,
-                fps: 0,
-                launch_delay_ms: 0,
-                source: TrackSource::SysAudio,
-            });
+            manifest.tracks.push(new_track(
+                "sysaudio",
+                "system-audio",
+                "System audio (WASAPI loopback)",
+                None,
+                "aac",
+                0,
+                0,
+                0,
+            ));
+            specs.push(TrackSpec::solo("sysaudio", TrackSource::SysAudio));
         }
 
         if specs.is_empty() {
@@ -1412,28 +1652,13 @@ impl Recorder {
         }
 
         for s in &specs {
-            std::fs::create_dir_all(session_dir.join(&s.dir_name))
-                .map_err(|e| format!("create track dir: {}", e))?;
-            if matches!(&s.source, TrackSource::Mic { sidecar: true, .. }) {
+            for o in &s.outputs {
+                std::fs::create_dir_all(session_dir.join(&o.dir_name))
+                    .map_err(|e| format!("create track dir: {}", e))?;
+            }
+            if s.source.writes_mic_sidecar() {
                 let _ = std::fs::create_dir_all(session_dir.join("mic-16k"));
             }
-            manifest.tracks.push(Track {
-                id: s.id.clone(),
-                kind: s.kind.clone(),
-                label: s.label.clone(),
-                monitor: s.monitor,
-                codec: s.codec.clone(),
-                width: s.width,
-                height: s.height,
-                fps: s.fps,
-                start_epoch_ms: 0,
-                dir: s.dir_name.clone(),
-                segments: Vec::new(),
-                gaps: Vec::new(),
-                status: TrackStatus::Starting,
-                error: None,
-                restarts: 0,
-            });
         }
 
         let inner = Arc::new(Inner {
@@ -1446,6 +1671,7 @@ impl Recorder {
             logs: Mutex::new(Default::default()),
             warnings: Mutex::new(warnings),
             fatal: Mutex::new(None),
+            extra_joins: Mutex::new(Vec::new()),
         });
         inner.flush();
 
@@ -1488,6 +1714,18 @@ impl Recorder {
             let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.joins.lock().unwrap());
             for h in handles {
                 let _ = h.join();
+            }
+            // A supervisor may have spawned another one while shutting down, so
+            // drain until the list stays empty rather than taking it once.
+            loop {
+                let extra: Vec<JoinHandle<()>> =
+                    std::mem::take(&mut *self.inner.extra_joins.lock().unwrap());
+                if extra.is_empty() {
+                    break;
+                }
+                for h in extra {
+                    let _ = h.join();
+                }
             }
             {
                 let mut m = self.inner.manifest.lock().unwrap();
@@ -1562,21 +1800,77 @@ enum RunOutcome {
     SpawnFailed(String),
 }
 
-fn supervise_track(inner: Arc<Inner>, spec: TrackSpec) {
-    let dir = inner.session_dir.join(&spec.dir_name);
-    // Persists across restarts: a relaunched ffmpeg writes into the same directory.
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    if let Ok(rd) = std::fs::read_dir(&dir) {
-        for e in rd.flatten() {
-            seen.insert(e.file_name().to_string_lossy().to_string());
+/// One output file stream of a supervisor's ffmpeg process, and the manifest
+/// track it feeds.
+struct OutputState {
+    track_id: String,
+    dir: PathBuf,
+    /// Persists across restarts: a relaunched ffmpeg writes into the same
+    /// directory, and its existing files must not be re-indexed.
+    seen: std::collections::BTreeSet<String>,
+    /// The segment ffmpeg is currently writing, with the instant it appeared. Only
+    /// probed once the *next* file appears (or the process exits), so a file that
+    /// is still open is never ffprobed.
+    pending: Option<(String, i64)>,
+    /// Cleared by the first segment indexed in each run — only that one gets to
+    /// use the run's anchor.
+    anchor_pending: bool,
+    /// Segments indexed during the current run. Reset by [`run_track_once`].
+    produced: u32,
+    /// Consecutive completed runs in which this output produced nothing.
+    ///
+    /// Counted per output, not per process, because that is what distinguishes
+    /// "the pair cannot run" from "one half of the pair is broken". Both are
+    /// answered the same way — see [`split_pair`].
+    barren_runs: u32,
+}
+
+impl OutputState {
+    fn new(session_dir: &Path, o: &OutputSpec) -> Self {
+        let dir = session_dir.join(&o.dir_name);
+        let mut seen = std::collections::BTreeSet::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                seen.insert(e.file_name().to_string_lossy().to_string());
+            }
+        }
+        Self {
+            track_id: o.track_id.clone(),
+            dir,
+            seen,
+            pending: None,
+            anchor_pending: true,
+            produced: 0,
+            barren_runs: 0,
         }
     }
 
+    /// Where ffmpeg's segment muxer writes this output.
+    fn out_pattern(&self) -> PathBuf {
+        self.dir.join(format!("{}.mp4", session::SEGMENT_STRFTIME))
+    }
+}
+
+/// The output feeding `track_id`, for a process that writes more than one.
+fn output_for<'a>(outs: &'a [OutputState], track_id: &str) -> Option<&'a OutputState> {
+    outs.iter().find(|o| o.track_id == track_id)
+}
+
+fn supervise_track(inner: Arc<Inner>, spec: TrackSpec) {
+    let mut outs: Vec<OutputState> = spec
+        .outputs
+        .iter()
+        .map(|o| OutputState::new(&inner.session_dir, o))
+        .collect();
+
+    // The source can change under us: a shared webcam+mic process that cannot run
+    // gives up the pairing and continues as a solo capture. See `split_pair`.
+    let mut source = spec.source.clone();
     let mut restarts: u32 = 0;
 
     // Screens are launched a few hundred ms apart; see SCREEN_STAGGER_MS.
     if spec.launch_delay_ms > 0 && !sleep_unless_stopping(&inner, spec.launch_delay_ms) {
-        set_track_status(&inner, &spec.id, TrackStatus::Stopped, None);
+        set_all_status(&inner, &outs, TrackStatus::Stopped, None);
         inner.flush();
         return;
     }
@@ -1585,9 +1879,9 @@ fn supervise_track(inner: Arc<Inner>, spec: TrackSpec) {
         if inner.stopping() {
             break;
         }
-        set_track_status(&inner, &spec.id, TrackStatus::Recording, None);
+        set_all_status(&inner, &outs, TrackStatus::Recording, None);
 
-        let outcome = run_track_once(&inner, &spec, &dir, &mut seen);
+        let outcome = run_track_once(&inner, &spec, &source, &mut outs);
 
         match outcome {
             RunOutcome::Finished => break,
@@ -1604,25 +1898,60 @@ fn supervise_track(inner: Arc<Inner>, spec: TrackSpec) {
                     ));
                     break;
                 }
+
+                for o in outs.iter_mut() {
+                    o.barren_runs = if o.produced == 0 { o.barren_runs + 1 } else { 0 };
+                }
+
                 restarts += 1;
-                let gap_from = track_end_or(&inner, &spec.id, now_ms());
-                record_gap(&inner, &spec.id, gap_from, now_ms(), &reason);
+                let now = now_ms();
+                for o in &outs {
+                    let gap_from = track_end_or(&inner, &o.track_id, now);
+                    record_gap(&inner, &o.track_id, gap_from, now, &reason);
+                }
                 inner.warn(format!(
                     "track {} died ({}), restart {}/{}",
                     spec.id, reason, restarts, MAX_RESTARTS
                 ));
                 if restarts > MAX_RESTARTS {
-                    set_track_status(
+                    set_all_status(
                         &inner,
-                        &spec.id,
+                        &outs,
                         TrackStatus::Failed,
                         Some(format!("gave up after {} restarts: {}", MAX_RESTARTS, reason)),
                     );
                     inner.flush();
                     return;
                 }
-                set_track_status(&inner, &spec.id, TrackStatus::Restarting, Some(reason));
-                bump_restarts(&inner, &spec.id);
+                set_all_status(&inner, &outs, TrackStatus::Restarting, Some(reason.clone()));
+                for o in &outs {
+                    bump_restarts(&inner, &o.track_id);
+                }
+
+                // A shared process in which either half keeps producing nothing is
+                // worse than no pairing at all. Two shapes, one remedy:
+                //
+                // - Neither produces (the camera is held by another app, so the
+                //   single combined input cannot open): both tracks get nothing.
+                // - One produces and the other does not (a device unplugged
+                //   mid-session): the watchdog kills the process on the silent
+                //   output, so the healthy half is repeatedly cut short too, and
+                //   after MAX_RESTARTS it would be marked Failed alongside the
+                //   device that actually broke.
+                //
+                // Lip-sync is a luxury on top of recording; recording comes first.
+                // So give the mic its own supervisor and carry on solo — exactly
+                // the pre-existing arrangement, with its independent failure
+                // behaviour restored, after which each device can die on its own.
+                if outs.len() > 1 && outs.iter().any(|o| o.barren_runs >= PAIR_SPLIT_AFTER) {
+                    if let Some(solo) = split_pair(&inner, &source, &mut outs, &reason) {
+                        source = solo;
+                        for o in outs.iter_mut() {
+                            o.barren_runs = 0;
+                        }
+                        restarts = 0;
+                    }
+                }
                 inner.flush();
                 // Back off a little so a permanently missing device doesn't spin.
                 let backoff = (500 * restarts.min(6) as u64).max(500);
@@ -1633,8 +1962,86 @@ fn supervise_track(inner: Arc<Inner>, spec: TrackSpec) {
         }
     }
 
-    set_track_status(&inner, &spec.id, TrackStatus::Stopped, None);
+    set_all_status(&inner, &outs, TrackStatus::Stopped, None);
     inner.flush();
+}
+
+/// Give up on capturing the webcam and mic in one process, and spawn a solo
+/// supervisor for the microphone. Returns the reduced source this supervisor
+/// should carry on with, or `None` if there was no pairing to break.
+///
+/// The mic is the half that moves, because the pairing exists for the webcam's
+/// benefit and a solo mic is a complete, useful track on its own. The two are
+/// then exactly as independent as they were before this feature: either can die,
+/// restart, or fail for good without touching the other.
+fn split_pair(
+    inner: &Arc<Inner>,
+    source: &TrackSource,
+    outs: &mut Vec<OutputState>,
+    reason: &str,
+) -> Option<TrackSource> {
+    let TrackSource::WebcamMic {
+        video_device,
+        audio_device,
+        encoder,
+        video_size,
+        fps,
+        sidecar,
+    } = source
+    else {
+        return None;
+    };
+
+    inner.warn(format!(
+        "the webcam and microphone could not be captured together ({}). They are now \
+         being recorded by separate processes, which restores independent recovery \
+         but means their lip-sync may be off by up to a second.",
+        reason
+    ));
+
+    outs.retain(|o| o.track_id != "mic");
+
+    let mic_spec = TrackSpec::solo(
+        "mic",
+        TrackSource::Mic {
+            device: audio_device.clone(),
+            sidecar: *sidecar,
+        },
+    );
+    let inner2 = inner.clone();
+    match std::thread::Builder::new()
+        .name("rec-mic".into())
+        .spawn(move || supervise_track(inner2, mic_spec))
+    {
+        Ok(h) => inner.extra_joins.lock().unwrap().push(h),
+        Err(e) => {
+            inner.warn(format!("could not spawn a solo microphone supervisor: {}", e));
+            set_track_status(
+                inner,
+                "mic",
+                TrackStatus::Failed,
+                Some(format!("could not be recorded separately: {}", e)),
+            );
+        }
+    }
+
+    Some(TrackSource::Webcam {
+        device: video_device.clone(),
+        encoder: encoder.clone(),
+        video_size: video_size.clone(),
+        fps: *fps,
+    })
+}
+
+fn set_all_status(
+    inner: &Arc<Inner>,
+    outs: &[OutputState],
+    status: TrackStatus,
+    err: Option<String>,
+) {
+    for o in outs {
+        set_track_status(inner, &o.track_id, status, err.clone());
+    }
 }
 
 /// Sleep in short slices, returning `false` as soon as the session is stopping.
@@ -1652,11 +2059,16 @@ fn sleep_unless_stopping(inner: &Arc<Inner>, ms: u64) -> bool {
 fn run_track_once(
     inner: &Arc<Inner>,
     spec: &TrackSpec,
-    dir: &Path,
-    seen: &mut std::collections::BTreeSet<String>,
+    source: &TrackSource,
+    outs: &mut [OutputState],
 ) -> RunOutcome {
     inner.clear_log(&spec.id);
-    let mut cmd = build_command(inner, spec, dir);
+    // Each run has its own anchor, and each output gets one shot at using it.
+    for o in outs.iter_mut() {
+        o.anchor_pending = true;
+        o.produced = 0;
+    }
+    let mut cmd = build_command(inner, source, outs);
 
     // RULE: never leave stdout/stderr as an unread pipe. Both get a dedicated
     // draining thread below; if either were left unread the OS pipe buffer would
@@ -1665,22 +2077,43 @@ fn run_track_once(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    // Read before the spawn, so the anchor window and the "content cannot start
+    // before this" floor both bracket the process rather than trail it.
+    let launched = now_ms();
+
     let mut child: Child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return RunOutcome::SpawnFailed(format!("spawn ffmpeg: {}", e)),
     };
 
-    let last_progress = Arc::new(AtomicI64::new(now_ms()));
+    let last_progress = Arc::new(AtomicI64::new(launched));
+    // Lowest `wall - out_time` seen so far: the best estimate of when this
+    // process's content began. `i64::MAX` means "no usable sample yet".
+    let progress_t0 = Arc::new(AtomicI64::new(i64::MAX));
 
-    // stdout: `-progress pipe:1` heartbeat.
+    // stdout: `-progress pipe:1`. Doubles as the health heartbeat and, for the
+    // first few seconds, as the content-start estimator (see `Anchor`).
     let stdout_join = child.stdout.take().map(|out| {
         let hb = last_progress.clone();
+        let t0 = progress_t0.clone();
+        let deadline = launched + ANCHOR_WINDOW_MS;
         std::thread::spawn(move || {
             let reader = BufReader::new(out);
             for line in reader.lines() {
-                match line {
-                    Ok(_) => hb.store(now_ms(), Ordering::Relaxed),
-                    Err(_) => break,
+                let Ok(l) = line else { break };
+                let now = now_ms();
+                hb.store(now, Ordering::Relaxed);
+                if now > deadline {
+                    continue;
+                }
+                // `out_time_us` only. ffmpeg's sibling `out_time_ms` key has
+                // carried microseconds for years and is not worth trusting.
+                if let Some(us) = l
+                    .strip_prefix("out_time_us=")
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .filter(|us| *us > 0)
+                {
+                    t0.fetch_min(now - us / 1000, Ordering::Relaxed);
                 }
             }
         })
@@ -1710,15 +2143,12 @@ fn run_track_once(
     let mut stdin = child.stdin.take();
     let mut sysaudio: Option<crate::sysaudio::SysAudioCapture> = None;
 
-    // Overrides `observed` for the first segment of this run. Only the system
-    // audio track needs it: PCM starts flowing into the pipe the instant the
-    // capture thread starts, but ffmpeg does not create the first segment file
-    // until it emits its first packet — measured ~4s later. Anchoring that
-    // segment to the file's creation time would place the whole track that far
-    // late on the timeline.
-    let mut first_anchor: Option<i64> = None;
+    // Where this run's first segment believes its content started. Every output of
+    // this process shares it, which is what makes the webcam and mic tracks agree
+    // with each other by construction rather than by estimate.
+    let mut sys_t0: Option<i64> = None;
 
-    if matches!(spec.source, TrackSource::SysAudio) {
+    if matches!(source, TrackSource::SysAudio) {
         let sink = match stdin.take() {
             Some(s) => s,
             None => {
@@ -1730,7 +2160,7 @@ fn run_track_once(
         match crate::sysaudio::SysAudioCapture::start(Box::new(sink), t0) {
             Ok(c) => {
                 sysaudio = Some(c);
-                first_anchor = Some(t0);
+                sys_t0 = Some(t0);
             }
             Err(e) => {
                 let _ = child.kill();
@@ -1741,12 +2171,15 @@ fn run_track_once(
     }
 
     // ---- poll loop -------------------------------------------------------
-    let launched = now_ms();
-    // `pending` is the segment ffmpeg is currently writing. It is only probed
-    // once the *next* file appears (or the process exits), so we never ffprobe a
-    // file that is still open.
-    let mut pending: Option<(String, i64)> = None;
-    let mut last_new_segment = launched;
+    // Every output of this process shares one anchor, which is what makes the
+    // webcam and mic tracks agree with each other by construction rather than by
+    // per-device estimate.
+    let anchor = source.anchor(launched, &progress_t0, sys_t0);
+
+    // The watchdog is per output, not per process. A shared webcam+mic process
+    // whose camera has died still writes mic segments on schedule; watching only
+    // the process would never notice the picture had stopped.
+    let mut last_new_segment: Vec<i64> = vec![launched; outs.len()];
     let watchdog_ms = (inner.segment_seconds as i64) * 2000;
 
     // Why the run ended. Deliberately *not* a message: the message quotes ffmpeg's
@@ -1756,7 +2189,8 @@ fn run_track_once(
     enum ExitKind {
         Finished,
         Exited(std::process::ExitStatus),
-        NoSegments(i64),
+        /// Which output went quiet, and for how many seconds.
+        NoSegments(String, i64),
         ProgressStalled,
         SysAudioStopped,
         Internal(String),
@@ -1768,21 +2202,16 @@ fn run_track_once(
         std::thread::sleep(Duration::from_millis(POLL_MS));
 
         // 1. New segment files?
-        for name in scan_new(dir, seen) {
-            let observed = now_ms();
-            if let Some((prev, prev_observed)) = pending.take() {
-                index_segment(inner, spec, dir, &prev, prev_observed, &mut first_anchor);
+        for (i, o) in outs.iter_mut().enumerate() {
+            if let Some(seen_at) = poll_output(inner, o, &anchor) {
+                last_new_segment[i] = seen_at;
             }
-            last_new_segment = observed;
-            pending = Some((name, observed));
         }
 
         // 2. Did it exit on its own?
         match child.try_wait() {
             Ok(Some(status)) => {
-                if let Some((p, o)) = pending.take() {
-                    index_segment(inner, spec, dir, &p, o, &mut first_anchor);
-                }
+                flush_outputs(inner, outs, &anchor);
                 exit = if inner.stopping() {
                     ExitKind::Finished
                 } else {
@@ -1800,37 +2229,35 @@ fn run_track_once(
         // 3. Stop requested → graceful shutdown.
         if inner.stopping() {
             graceful_stop(&mut child, &mut stdin, sysaudio.take());
-            for name in scan_new(dir, seen) {
-                let observed = now_ms();
-                if let Some((prev, prev_observed)) = pending.take() {
-                    index_segment(inner, spec, dir, &prev, prev_observed, &mut first_anchor);
-                }
-                pending = Some((name, observed));
+            // `q` makes ffmpeg finalize what it had open, so re-scan before
+            // flushing: the file it was writing is now closed and complete, and on
+            // a multi-output process there is one such file per output.
+            for o in outs.iter_mut() {
+                poll_output(inner, o, &anchor);
             }
-            if let Some((p, o)) = pending.take() {
-                index_segment(inner, spec, dir, &p, o, &mut first_anchor);
-            }
+            flush_outputs(inner, outs, &anchor);
             exit = ExitKind::Finished;
             break;
         }
 
-        // 4. Watchdog: no new segment for 2× segment_seconds.
+        // 4. Watchdog: some output has gone 2× segment_seconds without a segment.
         let now = now_ms();
-        if now - last_new_segment > watchdog_ms {
+        if let Some(i) = last_new_segment
+            .iter()
+            .position(|t| now - t > watchdog_ms)
+        {
+            let silent = (now - last_new_segment[i]) / 1000;
+            let track = outs[i].track_id.clone();
             kill_and_reap(&mut child, &mut stdin);
-            if let Some((p, o)) = pending.take() {
-                index_segment(inner, spec, dir, &p, o, &mut first_anchor);
-            }
-            exit = ExitKind::NoSegments((now - last_new_segment) / 1000);
+            flush_outputs(inner, outs, &anchor);
+            exit = ExitKind::NoSegments(track, silent);
             break;
         }
 
         // 5. Heartbeat: `-progress` has gone quiet.
         if now - last_progress.load(Ordering::Relaxed) > PROGRESS_STALL_MS {
             kill_and_reap(&mut child, &mut stdin);
-            if let Some((p, o)) = pending.take() {
-                index_segment(inner, spec, dir, &p, o, &mut first_anchor);
-            }
+            flush_outputs(inner, outs, &anchor);
             exit = ExitKind::ProgressStalled;
             break;
         }
@@ -1842,9 +2269,7 @@ fn run_track_once(
                     sa.stop();
                 }
                 let _ = child.wait();
-                if let Some((p, o)) = pending.take() {
-                    index_segment(inner, spec, dir, &p, o, &mut first_anchor);
-                }
+                flush_outputs(inner, outs, &anchor);
                 exit = ExitKind::SysAudioStopped;
                 break;
             }
@@ -1873,8 +2298,9 @@ fn run_track_once(
             status,
             diagnose(&inner.track_log(&spec.id))
         )),
-        ExitKind::NoSegments(secs) => RunOutcome::Died(format!(
-            "no new segment for {}s: {}",
+        ExitKind::NoSegments(track, secs) => RunOutcome::Died(format!(
+            "no new {} segment for {}s: {}",
+            track,
             secs,
             diagnose(&inner.track_log(&spec.id))
         )),
@@ -1974,6 +2400,50 @@ fn kill_and_reap(child: &mut Child, stdin: &mut Option<std::process::ChildStdin>
 
 /// Newly appeared files in a track directory, chronologically. `-strftime`
 /// names sort lexicographically into time order.
+/// Index every segment of `o` that has closed since the last poll, and return
+/// when a new file was first seen — the watchdog's heartbeat for this output.
+///
+/// The newest file is left `pending` rather than indexed: ffmpeg still has it
+/// open, and probing a file that is still being written yields a truncated
+/// duration or no moov atom at all.
+fn poll_output(inner: &Arc<Inner>, o: &mut OutputState, anchor: &Anchor) -> Option<i64> {
+    let mut latest = None;
+    for name in scan_new(&o.dir, &mut o.seen) {
+        let observed = now_ms();
+        if let Some((prev, prev_observed)) = o.pending.take() {
+            index_output_segment(inner, o, anchor, &prev, prev_observed);
+        }
+        latest = Some(observed);
+        o.pending = Some((name, observed));
+    }
+    latest
+}
+
+/// Index whatever each output still has open. Only correct once the process has
+/// exited or been killed, at which point the file is closed for good.
+fn flush_outputs(inner: &Arc<Inner>, outs: &mut [OutputState], anchor: &Anchor) {
+    for o in outs.iter_mut() {
+        if let Some((file, observed)) = o.pending.take() {
+            index_output_segment(inner, o, anchor, &file, observed);
+        }
+    }
+}
+
+fn index_output_segment(
+    inner: &Arc<Inner>,
+    o: &mut OutputState,
+    anchor: &Anchor,
+    file: &str,
+    observed: i64,
+) {
+    // Only the first segment of a run is placed by the anchor; the rest chain off
+    // it, so a late-resolving estimate cannot shunt the track mid-run.
+    let a = if o.anchor_pending { anchor.resolve() } else { None };
+    o.anchor_pending = false;
+    o.produced += 1;
+    index_segment(inner, &o.track_id, &o.dir, file, observed, a);
+}
+
 fn scan_new(dir: &Path, seen: &mut std::collections::BTreeSet<String>) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -2077,11 +2547,11 @@ pub fn decide_segment_start(
 /// start time chosen by [`decide_segment_start`].
 fn index_segment(
     inner: &Arc<Inner>,
-    spec: &TrackSpec,
+    track_id: &str,
     dir: &Path,
     file: &str,
     observed: i64,
-    anchor: &mut Option<i64>,
+    anchor: Option<i64>,
 ) {
     let path = dir.join(file);
     let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -2089,11 +2559,11 @@ fn index_segment(
     let probe = match session::probe_segment(&inner.ffprobe, &path) {
         Ok(p) => p,
         Err(e) => {
-            inner.warn(format!("{}/{} unreadable: {}", spec.id, file, e));
+            inner.warn(format!("{}/{} unreadable: {}", track_id, file, e));
             let from = observed;
             record_gap(
                 inner,
-                &spec.id,
+                track_id,
                 from,
                 from + inner.segment_seconds as i64 * 1000,
                 &format!("unreadable segment {}", file),
@@ -2106,7 +2576,7 @@ fn index_segment(
     {
         let mut m = inner.manifest.lock().unwrap();
         let seg_secs = m.segment_seconds as i64;
-        let Some(track) = m.track_mut(&spec.id) else {
+        let Some(track) = m.track_mut(track_id) else {
             return;
         };
 
@@ -2115,7 +2585,7 @@ fn index_segment(
             .last()
             .map(|s| s.start_epoch_ms + s.duration_ms);
 
-        let decided = decide_segment_start(anchor.take(), chained, observed);
+        let decided = decide_segment_start(anchor, chained, observed);
         let start = decided.start_epoch_ms;
         if let Some(g) = decided.gap {
             track.gaps.push(g);
@@ -2217,14 +2687,46 @@ fn push_segment_args(cmd: &mut Command, seconds: u32, out_pattern: &Path) {
     .arg(out_pattern);
 }
 
-fn build_command(inner: &Arc<Inner>, spec: &TrackSpec, dir: &Path) -> Command {
+/// Cheap hook for later transcription: a mono 16kHz PCM sidecar alongside the
+/// AAC mic track, so whisper can be pointed at it with no re-encode.
+///
+/// `map` is needed only when the process has more than one stream to choose from.
+fn push_mic_sidecar_args(cmd: &mut Command, inner: &Arc<Inner>, secs: u32, map: Option<&str>) {
+    let side = inner
+        .session_dir
+        .join("mic-16k")
+        .join(format!("{}.wav", session::SEGMENT_STRFTIME));
+    if let Some(m) = map {
+        cmd.args(["-map", m]);
+    }
+    cmd.args(["-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1"]);
+    cmd.args([
+        "-f",
+        "segment",
+        "-segment_time",
+        &secs.to_string(),
+        "-segment_atclocktime",
+        "1",
+        "-reset_timestamps",
+        "1",
+        "-strftime",
+        "1",
+        "-segment_format",
+        "wav",
+    ])
+    .arg(side);
+}
+
+fn build_command(inner: &Arc<Inner>, source: &TrackSource, outs: &[OutputState]) -> Command {
     let secs = inner.segment_seconds;
-    let out = dir.join(format!("{}.mp4", session::SEGMENT_STRFTIME));
+    // Every source but the webcam/mic pair writes exactly one output, and that
+    // one is always first.
+    let out = outs[0].out_pattern();
 
     let mut cmd = silent_command(&inner.ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "warning", "-progress", "pipe:1"]);
 
-    match &spec.source {
+    match source {
         TrackSource::Screen {
             adapter,
             output_idx,
@@ -2262,9 +2764,9 @@ fn build_command(inner: &Arc<Inner>, spec: &TrackSpec, dir: &Path) -> Command {
             video_size,
             fps,
         } => {
-            // Video and audio must be separate `-f dshow` inputs; the combined
-            // `video=X:audio=Y` form throws I/O errors on this machine. The mic is
-            // its own track, so this input is video-only.
+            // Video-only. This arm runs when there is no microphone to record, or
+            // after the pair has been split (see `split_pair`); when both are
+            // wanted they share one process — see `TrackSource::WebcamMic`.
             cmd.args([
                 "-f",
                 "dshow",
@@ -2294,28 +2796,57 @@ fn build_command(inner: &Arc<Inner>, spec: &TrackSpec, dir: &Path) -> Command {
             cmd.args(["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2"]);
             push_segment_args(&mut cmd, secs, &out);
             if *sidecar {
-                // Cheap hook for later transcription: mono 16kHz PCM alongside the
-                // AAC, so whisper can be pointed at it with no re-encode.
-                let side = inner
-                    .session_dir
-                    .join("mic-16k")
-                    .join(format!("{}.wav", session::SEGMENT_STRFTIME));
-                cmd.args(["-c:a", "pcm_s16le", "-ar", "16000", "-ac", "1"]);
+                push_mic_sidecar_args(&mut cmd, inner, secs, None);
+            }
+        }
+        TrackSource::WebcamMic {
+            video_device,
+            audio_device,
+            encoder,
+            video_size,
+            fps,
+            sidecar,
+        } => {
+            // THE lip-sync fix. One `-f dshow` input naming both devices, so
+            // DirectShow builds ONE graph and both streams are stamped against one
+            // reference clock. Two inputs would be two graphs with two independent
+            // start instants and would reproduce the offset exactly; two processes
+            // did, by ~1.2s.
+            //
+            // The two streams are then demuxed back apart into two separately
+            // segmented outputs, because the manifest keeps them as two tracks:
+            // transcription needs an isolated mic file and the player renders them
+            // independently. Sharing a clock does not mean sharing a file.
+            cmd.args([
+                "-f",
+                "dshow",
+                "-rtbufsize",
+                "512M",
+                "-vcodec",
+                "mjpeg",
+                "-video_size",
+                video_size,
+                "-framerate",
+                &fps.to_string(),
+                "-i",
+                &format!("video={}:audio={}", video_device, audio_device),
+            ]);
+
+            let webcam_out = output_for(outs, "webcam")
+                .map(|o| o.out_pattern())
+                .unwrap_or_else(|| out.clone());
+            cmd.args(["-map", "0:v:0"]);
+            push_video_encoder_args(&mut cmd, encoder, 28, "12M", "24M", *fps);
+            push_segment_args(&mut cmd, secs, &webcam_out);
+
+            if let Some(mic) = output_for(outs, "mic") {
                 cmd.args([
-                    "-f",
-                    "segment",
-                    "-segment_time",
-                    &secs.to_string(),
-                    "-segment_atclocktime",
-                    "1",
-                    "-reset_timestamps",
-                    "1",
-                    "-strftime",
-                    "1",
-                    "-segment_format",
-                    "wav",
-                ])
-                .arg(side);
+                    "-map", "0:a:0", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+                ]);
+                push_segment_args(&mut cmd, secs, &mic.out_pattern());
+                if *sidecar {
+                    push_mic_sidecar_args(&mut cmd, inner, secs, Some("0:a:0"));
+                }
             }
         }
         TrackSource::SysAudio => {
@@ -2861,6 +3392,74 @@ mod tests {
         let sel = select_webcam_device(None, &[]);
         assert_eq!(sel.device, None);
         assert_eq!(sel.warnings.len(), 1);
+    }
+
+    // -- webcam/mic pairing --------------------------------------------------
+
+    #[test]
+    fn ordinary_device_names_can_share_one_dshow_input() {
+        assert_eq!(
+            combined_dshow_unsupported("Logitech BRIO", "Microphone (Logitech BRIO)"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_device_name_carrying_ffmpegs_own_separator_is_refused() {
+        // `video=X:audio=Y` puts the separator inside the device-name string, so a
+        // name containing it would be split in the wrong place and open the wrong
+        // device. Recording the wrong thing silently is worse than losing lip-sync.
+        assert!(combined_dshow_unsupported("Cam:audio=Sneaky", "Mic").is_some());
+        assert!(combined_dshow_unsupported("Cam", "Mic:video=Sneaky").is_some());
+    }
+
+    #[test]
+    fn a_progress_anchor_is_never_earlier_than_the_process_that_captured_it() {
+        let launched = 1_785_180_000_000i64;
+        // A sample implying content began before ffmpeg was spawned is impossible;
+        // it means the pipeline was still reporting a stale out_time.
+        let est = Arc::new(AtomicI64::new(launched - 5_000));
+        let a = Anchor::FromProgress(est, launched);
+        assert_eq!(a.resolve(), Some(launched));
+    }
+
+    #[test]
+    fn a_progress_anchor_with_no_sample_declines_rather_than_guessing() {
+        let est = Arc::new(AtomicI64::new(i64::MAX));
+        assert_eq!(Anchor::FromProgress(est, 1_785_180_000_000).resolve(), None);
+        // Equally, a value so far past launch that no capture could have started
+        // there is not published.
+        let wild = Arc::new(AtomicI64::new(1_785_180_000_000 + 120_000));
+        assert_eq!(Anchor::FromProgress(wild, 1_785_180_000_000).resolve(), None);
+    }
+
+    #[test]
+    fn a_plausible_progress_sample_is_used_as_is() {
+        let launched = 1_785_180_000_000i64;
+        let est = Arc::new(AtomicI64::new(launched + 1_300));
+        assert_eq!(
+            Anchor::FromProgress(est, launched).resolve(),
+            Some(launched + 1_300)
+        );
+    }
+
+    #[test]
+    fn the_webcam_and_mic_of_one_process_resolve_to_the_same_instant() {
+        // The whole point of the pairing: both outputs consult one Anchor, so they
+        // cannot disagree no matter what either device's open latency was.
+        let launched = 1_785_180_000_000i64;
+        let est = Arc::new(AtomicI64::new(launched + 1_879));
+        let src = TrackSource::WebcamMic {
+            video_device: "BRIO".into(),
+            audio_device: "Microphone (BRIO)".into(),
+            encoder: "h264_nvenc".into(),
+            video_size: "1920x1080".into(),
+            fps: 30,
+            sidecar: false,
+        };
+        let a = src.anchor(launched, &est, None);
+        assert_eq!(a.resolve(), a.resolve());
+        assert_eq!(a.resolve(), Some(launched + 1_879));
     }
 
     // -- segment start timing ------------------------------------------------

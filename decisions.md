@@ -6,6 +6,28 @@
 > Entries below dated 2026-03-xx were reconstructed from the code on 2026-07-27
 > when this file was created; the reasoning is inferred from the implementation.
 
+## 2026-07-27 — The webcam and mic share ONE ffmpeg process, via ONE dshow input
+**Why:** lip-sync. As two independent processes each device's own open latency
+(a BRIO takes ~1.3s to hand over its first MJPEG frame, a mic ~0.15s) is baked
+into its track's start time, and nothing can recover it afterwards — measured
+**+1239ms** and **+586ms** of audio-ahead-of-picture on sessions
+`2026-07-27_14-03-20` / `_14-03-54`. One DirectShow graph stamps both streams
+against one clock, so sync holds by construction. Measured after, over two real
+runs: both tracks anchored to the **same** instant (+1879/+1879, +1843/+1843),
+end-to-end divergence **+22ms** and **−11ms**, and per-segment A/V difference of
+−6.3ms / +17.0ms on the segments not clipped by run start or stop.
+**Rejected:** two `-f dshow` inputs in one process — that is two DirectShow
+graphs with two independent start instants, which reproduces the offset exactly;
+estimating and subtracting per-device latency (unstable, device-specific, and
+wrong the first time a driver warms up differently); muxing them into one file
+(transcription needs an isolated mic track and the player renders them
+independently — they stay two tracks and two files).
+**Consequence:** `TrackSource::WebcamMic`, and `TrackSpec.outputs` is a list so
+one supervised process can feed two manifest tracks. The combined input fails
+outright when another app holds the camera, so after `PAIR_SPLIT_AFTER` runs in
+which either half produces nothing, `split_pair` hands the mic to its own
+supervisor and the webcam continues solo — recording beats lip-sync.
+
 ## 2026-07-27 — Continuous recording is a second mode in the widget, not a replacement
 **Why:** the interval chirp/clip capture and the all-day session recorder answer
 different questions ("what was I doing at 3pm" vs "replay the last four hours"),

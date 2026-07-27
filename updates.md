@@ -3,6 +3,30 @@
 > Terse log of every task: what was asked → what was done. Newest first.
 > Older entries: `updates-archive.md` (created once this passes ~300 lines).
 
+## 2026-07-27 — fixed webcam/mic lip-sync in the session recorder
+"My mouth doesn't move with my audio." Webcam and mic were two independent ffmpeg
+processes, so each device's open latency was baked into its track start —
+measured +1239ms / +586ms of audio ahead of picture. Now captured by one process
+from one dshow input (`video=X:audio=Y`), still written as two separate tracks
+and files via `-map`. Measured after, two real runs: **+22ms** and **−11ms**,
+both tracks anchored to the identical instant. (The ~200ms media-length gap is
+keyframe-vs-clock-tick segment quantization, not desync — verified per segment
+with ffprobe.) `TrackSpec` grew an `outputs`
+list, segment indexing became per-output, and the watchdog is now per-output so a
+dead camera inside the pair is still noticed. If either half produces nothing for
+two runs, `split_pair` gives the mic its own supervisor (verified live with a
+nonexistent camera: mic recorded 3 segments while the camera failed alone).
+Also investigated a suspected ~110ms dropout at every segment seam (mic, sysaudio,
+and h264_qsv screen-3): **no media is lost on any track.** Seam-gap size is
+uncorrelated with loss — screen-3 has the largest gaps and exactly 0.0ms loss;
+two consecutive mic segments hold 469+468 AAC packets = 19989ms per 20000ms of
+wall clock. The gaps are label jitter from the drift filter's biased input (file
+appearance lags content by the encoder/muxer buffer). All under the player's
+250ms seam tolerance. No code change; gotcha added with the correct test method.
+Raised `PAIR_SPLIT_AFTER` 2→4 so a briefly-held camera doesn't cost lip-sync.
+Touched: src-tauri/src/recorder.rs, src-tauri/tests/live_session.rs
+Added tests: `lipsync`, `pair_split` (both `#[ignore]`d — they record), plus 6 unit tests.
+
 ## 2026-07-27 — continuous recording wired into the widget and the viewer
 The recorder and the player both existed; nothing invoked them. Added typed
 wrappers for every session command (`start/stop_session`, `get_session_status`,

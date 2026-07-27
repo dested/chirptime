@@ -296,6 +296,174 @@ fn three_minute_session() {
     assert!(ok, "audit found corrupt/zero/unindexed segments");
 }
 
+/// Lip-sync: the webcam and mic tracks must be anchored to the same instant.
+///
+/// The failure this guards against is not visible in any single track — each one
+/// looks plausible on its own. It shows up as a *disagreement*: when webcam and
+/// mic were captured by two independent ffmpeg processes, the mic's content ran
+/// past the end of the session while the webcam's stopped short, because the mic
+/// opens in ~0.15s and a BRIO takes ~1.3s but both were labelled from their own
+/// launch. Measured at +1239ms and +586ms on sessions 2026-07-27_14-03-20 and
+/// _14-03-54 — a second of audio ahead of the picture.
+///
+/// So the assertion is on the difference, and the threshold is perceptual: below
+/// about 45ms of audio-ahead, lip-sync reads as correct.
+///
+///   cargo test --release --test live_session -- --ignored --nocapture lipsync
+#[test]
+#[ignore]
+fn lipsync() {
+    let root = scratch();
+    let secs: u64 = std::env::var("RUN_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25);
+    let seg: u32 = std::env::var("SEG_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+
+    let o = SessionOptions {
+        segment_seconds: seg,
+        record_webcam: true,
+        record_mic: true,
+        record_system_audio: true,
+        // Auto-selection, which is what a user gets. `select_mic_device` refuses
+        // to auto-pick a Bluetooth headset (opening one forces hands-free mode),
+        // and that must stay true here.
+        webcam_device: None,
+        mic_device: None,
+        ..Default::default()
+    };
+
+    let rec = Recorder::start(RecorderEnv::from_dxgi(), &root, o).expect("start");
+    let dir = rec.session_dir();
+    println!("session dir: {}  (run {}s, {}s segments)", dir.display(), secs, seg);
+
+    std::thread::sleep(Duration::from_secs(secs));
+    let m = rec.stop();
+
+    println!("\nwarnings:");
+    for w in rec.warnings() {
+        println!("  - {}", w);
+    }
+
+    let t0 = m.started_epoch_ms;
+    let t1 = m.ended_epoch_ms.expect("session not finalized");
+    println!("\nsession span: {}ms", t1 - t0);
+    println!(
+        "{:<12} {:>10} {:>10} {:>6} {:>10}",
+        "track", "start_off", "media_ms", "segs", "overrun"
+    );
+
+    let mut overrun = std::collections::HashMap::new();
+    for t in &m.tracks {
+        let Some(first) = t.segments.first() else {
+            println!("{:<12} {:>10}", t.id, "(none)");
+            continue;
+        };
+        let last = t.segments.last().unwrap();
+        let media: i64 = t.segments.iter().map(|s| s.duration_ms).sum();
+        let ov = last.start_epoch_ms + last.duration_ms - t1;
+        overrun.insert(t.id.clone(), ov);
+        println!(
+            "{:<12} {:>+10} {:>10} {:>6} {:>+10}",
+            t.id,
+            first.start_epoch_ms - t0,
+            media,
+            t.segments.len(),
+            ov
+        );
+    }
+
+    let (Some(&cam), Some(&mic)) = (overrun.get("webcam"), overrun.get("mic")) else {
+        panic!("webcam and mic must both have produced segments; got {:?}", overrun.keys());
+    };
+
+    // Positive = audio ahead of picture, which is the direction that was broken.
+    let err = mic - cam;
+    println!("\nimplied A/V error (mic vs webcam): {:+}ms", err);
+    assert!(
+        err.abs() < 45,
+        "webcam and mic are {}ms apart — they were not anchored to a common clock",
+        err
+    );
+}
+
+/// Pairing the webcam and mic in one process must not let a broken camera take
+/// the microphone down with it.
+///
+/// Forces the failure with a camera that does not exist, which is the same thing
+/// the recorder sees when another app is holding the real one — the combined
+/// dshow input cannot open, so the shared process dies without producing
+/// anything for *either* track. After `PAIR_SPLIT_AFTER` such runs the mic must
+/// be handed to its own supervisor and record normally for the rest of the
+/// session, at the cost of lip-sync (which is moot when there is no picture).
+///
+///   cargo test --release --test live_session -- --ignored --nocapture pair_split
+#[test]
+#[ignore]
+fn pair_split() {
+    let root = scratch();
+    let o = SessionOptions {
+        segment_seconds: 10,
+        record_webcam: true,
+        record_mic: true,
+        record_system_audio: false,
+        webcam_device: Some("ChirpTime No Such Camera".into()),
+        mic_device: None,
+        ..Default::default()
+    };
+
+    let rec = Recorder::start(RecorderEnv::from_dxgi(), &root, o).expect("start");
+    println!("session dir: {}", rec.session_dir().display());
+    std::thread::sleep(Duration::from_secs(25));
+    let m = rec.stop();
+
+    println!("\nwarnings:");
+    for w in rec.warnings() {
+        println!("  - {}", w);
+    }
+    for t in &m.tracks {
+        println!(
+            "{:<10} {:?} segments={} restarts={} gaps={}",
+            t.id,
+            t.status,
+            t.segments.len(),
+            t.restarts,
+            t.gaps.len()
+        );
+    }
+
+    let mic = m.tracks.iter().find(|t| t.id == "mic").expect("mic track");
+    assert!(
+        !mic.segments.is_empty(),
+        "the microphone recorded nothing — a dead camera took it down with it"
+    );
+    // The mic's own interruption — the runs it lost while tied to the camera —
+    // is accounted for rather than silently dropped.
+    assert!(
+        mic.restarts > 0,
+        "the mic's shared-process failures were not recorded"
+    );
+
+    let cam = m.tracks.iter().find(|t| t.id == "webcam").expect("webcam track");
+    assert!(
+        cam.segments.is_empty(),
+        "the fake camera somehow produced video"
+    );
+    // No gap is recorded for the camera, and that is correct: a gap spans a hole
+    // *between* content, and this track never produced any. An empty segment list
+    // plus a restart count is how a track that never started is represented — the
+    // manifest claims no footage it does not have.
+    assert!(
+        cam.gaps.is_empty() && cam.restarts > 0,
+        "a track that never recorded should be empty with restarts, got {} gaps / {} restarts",
+        cam.gaps.len(),
+        cam.restarts
+    );
+}
+
 #[test]
 #[ignore]
 fn kill_test() {

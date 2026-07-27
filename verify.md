@@ -9,7 +9,7 @@
 | --- | --- | --- |
 | Frontend type-check | `bunx tsc --noEmit` | [cheap] |
 | Rust check | `cargo check --manifest-path src-tauri/Cargo.toml` | [medium] — first run compiles the whole dep tree |
-| Rust unit tests | `cargo test --lib --manifest-path src-tauri/Cargo.toml` | [medium] — 46 pure tests, no hardware, no capture |
+| Rust unit tests | `cargo test --lib --manifest-path src-tauri/Cargo.toml` | [medium] — 52 pure tests, no hardware, no capture |
 | Frontend-only build | `bun run vite:build` | [cheap] |
 | Dev app | `bun run dev` → widget window + Vite on http://localhost:5173 | [medium] — spawns a Rust build and a real window |
 | Release bundle | `bun run build` | [heavy — ask first] — full optimized Rust build + installer |
@@ -26,6 +26,21 @@ they only start when passed `-- --ignored`. Never do that while the user is at
 the machine: opening the mic can flip a Bluetooth headset into hands-free mode,
 and the capture contains whatever is on screen. `cargo test --lib` is the safe
 subset.
+
+Two of those live tests exist to protect webcam/mic lip-sync and are the only way
+to prove it — the bug is invisible in any single track, and shows only as a
+disagreement between two. Each records ~25s. [heavy — ask first]
+
+```
+cargo test --release --test live_session -- --ignored --nocapture lipsync
+cargo test --release --test live_session -- --ignored --nocapture pair_split
+```
+
+`lipsync` asserts the webcam and mic tracks land within 45ms of each other
+(measured +22ms; it was +1239ms when they were two processes). `pair_split`
+points the recorder at a camera that does not exist and asserts the microphone
+still records — i.e. that a broken camera cannot take the mic down with it. It
+never opens the real camera, so it is the cheaper of the two to run.
 
 ## Environment / data
 

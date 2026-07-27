@@ -343,6 +343,45 @@ from that window is denied.
   `CompactApp.tsx` calls `getCurrentWindow()` at module scope. `SessionPane` is
   exported so the session UI can be rendered outside the Tauri shell; the module
   still needs `@tauri-apps/api/window` stubbed first.
+- **The webcam and mic are ONE ffmpeg process and must stay that way.** They are
+  captured by a single `-f dshow -i "video=X:audio=Y"` input so both streams share
+  one DirectShow clock; splitting them into two processes — or even two `-f dshow`
+  inputs in the same process — puts the audio up to 1.2s ahead of the picture.
+  They remain two tracks and two files (`-map 0:v` / `-map 0:a`); never mux them
+  together. See `TrackSource::WebcamMic` and decisions.md.
+- **Webcam and mic media lengths differ by ~200ms and that is NOT desync.** Video
+  segments cut on keyframes (2s GOP), audio segments cut on clock ticks, so the
+  webcam's first segment runs ~2s long and its last ~1.7s short — visible in the
+  filenames (mic cuts at `…700`, webcam at `…701`). Measured per segment, the two
+  full mid-session segments differ by −6.3ms and +17.0ms with alternating sign
+  and no accumulation. Judge A/V sync by the **per-segment start labels**, never
+  by comparing total media duration: each segment carries its own
+  `start_epoch_ms`, so unequal segment lengths cost nothing at playback.
+- **Manifest holes at segment seams are label jitter, NOT lost media — verified,
+  and it is a recurring false alarm.** Seam-gap size is uncorrelated with media
+  loss. Measured across 7 tracks × 2 sessions: `screen-3` (h264_qsv) has the
+  *largest* gaps (55/109/76ms) and **exactly 0.0ms** of loss, while `screen-2`
+  (gaps 0–4ms) and every other video track are also 0.0ms. The mic loses
+  −6.0/+5.5ms per interior boundary — under half an AAC frame (21.3ms).
+  The mechanism: `decide_segment_start` pulls each label 1/DRIFT_ALPHA toward the
+  poll-scan file-appearance time, and that observation lags true content start by
+  however long the encoder/muxer buffers before its first write (QSV and AAC
+  buffer far more than NVENC). The bias lands in the *label*, never in the media.
+  Gaps can also be **negative** (measured −31, −42ms) — overlap, which loss cannot
+  produce. All observed holes stay under `SEAM_TOLERANCE_MS`, so the player rolls
+  through them and nothing renders or is audible.
+  **To test this claim, never compare seam gaps.** Compare a track's interior
+  media against the wall-clock span its `-strftime` filenames cover (those cut on
+  clock ticks, so second granularity is exact), or count packets: two consecutive
+  10s mic segments held **469 + 468** AAC packets = 19989ms for 20000ms of wall
+  clock. Dropping 110ms/boundary would need ~464 per segment.
+- **A supervisor can own more than one manifest track.** `TrackSpec.outputs` is a
+  list, and the watchdog, gap accounting, status and restart counters all iterate
+  it. Anything assuming one process == one track is wrong for the webcam/mic pair.
+- **A track that never recorded has zero segments and zero gaps.** A gap spans a
+  hole *between* content, so a device that never opened produces none — its
+  `restarts` count is the evidence instead. This is deliberate: the manifest never
+  claims footage it does not have.
 - **`list_display_outputs` refines `capturable` itself.** `enumerate_dxgi_outputs`
   always reports `true` (enumeration cannot know which encoders exist), so never
   read that flag straight off the recorder's own enumeration.
