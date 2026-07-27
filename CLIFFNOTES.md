@@ -21,7 +21,11 @@ FFmpeg for everything capture-related.
 - **Rust entry:** `src-tauri/src/main.rs` → `chirptime_lib::run()` in `lib.rs`
 - **Type-check:** `bunx tsc --noEmit` (frontend) · `cargo check` in `src-tauri/`
 - **Build:** `bun run build` (Tauri release bundle)
-- **Test:** no test runner configured
+- **Test:** `cargo test --lib` and `cargo test --test settings_persistence` —
+  **never plain `cargo test`**, which would run `tests/live_session.rs` and record.
+  No frontend test runner.
+- **Settings:** `%APPDATA%\com.chirptime.app\settings.json` — output dir, capture
+  config, session options, and the first-run flag. Missing/corrupt → defaults.
 - **Media URLs:** everything under `output/` is served at
   `http://localhost:9120/files/<relative/path>` by an in-process Warp server —
   the Tauri asset protocol is NOT used.
@@ -87,8 +91,11 @@ chirptime/
 │   ├── capabilities/default.json  Permissions — lists windows ["main","viewer"]
 │   └── src/
 │       ├── main.rs             Calls chirptime_lib::run()
-│       ├── lib.rs              Spawns the file-server thread, registers 25 commands
+│       ├── lib.rs              Loads settings, spawns the file-server thread, registers 31 commands
 │       ├── state.rs            CaptureConfig / CaptureStatus / AppState + defaults
+│       ├── settings.rs         Persisted settings (%APPDATA%\<id>\settings.json),
+│       │                       tolerant load, atomic save, legacy `output/` detection
+│       ├── nativeui.rs         IFileOpenDialog folder picker, open-in-Explorer, disk space
 │       ├── commands.rs         All #[tauri::command] handlers
 │       ├── capture.rs          chirp, monitor detection, FFmpeg capture cycle
 │       ├── recorder.rs         Continuous session recorder: DXGI/encoder resolution,
@@ -110,6 +117,10 @@ chirptime/
 | --- | --- |
 | Which UI renders | `src/ui/main.tsx` |
 | Widget UI + recording controls | `src/ui/CompactApp.tsx` |
+| First-run onboarding panel | `src/ui/CompactApp.tsx` (`Onboarding`) |
+| "Where are my recordings" (path, free space, picker, Explorer) | `src/ui/CompactApp.tsx` (`OutputFolder`) + titlebar folder button |
+| What survives a restart | `src-tauri/src/settings.rs` |
+| Folder picker / Explorer / disk space | `src-tauri/src/nativeui.rs` |
 | Session start/stop, track health, markers, session settings | `src/ui/CompactApp.tsx` (`SessionPane` / `SessionSettings`) |
 | Calendar / gallery / media viewer | `src/ui/ViewerApp.tsx` |
 | Session list / multi-track player | `src/ui/session/` (mounted from `ViewerApp.tsx`) |
@@ -178,6 +189,9 @@ server, which is what makes video seeking (Range requests) work.
 | `SessionStatus` / `TrackSummary` | `commands.rs` / `types.ts` | Live recorder health: elapsed, per-track status, segments, bytes, warnings, `disk_free_bytes` / `min_free_bytes` |
 | `SessionOptions` | `recorder.rs` / `types.ts` | What `start_session` takes. `#[serde(default)]`, read once at start; `screens` holds `screen_index` values, empty = all |
 | `DisplayOutputInfo` | `commands.rs` / `types.ts` | `list_display_outputs` row: DXGI output + the recorder's `screen_index` + a real `capturable` flag |
+| `Settings` | `settings.rs` / `types.ts` | Everything persisted: `capture`, `session` (opaque JSON), `onboarded`, `version` |
+| `EnvironmentInfo` | `commands.rs` / `types.ts` | What the first-run panel states: resolved output dir, free/total bytes, ffmpeg path, NVENC, legacy `output/`, settings path |
+| `LegacyOutput` | `settings.rs` / `types.ts` | A pre-move `output/` that still holds footage — path + day/session counts, reported only |
 
 ## Systems
 
@@ -253,6 +267,23 @@ playhead and clock readout) and `subscribeState` (5Hz, for React). The **inter-t
 spread** — max minus min of where each element believes it is — is the metric
 that says the burned-in timecodes agree; the Sync panel shows it live.
 
+### Settings + first run — `settings.rs`, `commands.rs`, `CompactApp.tsx`
+
+`run()` calls `settings::load()` **before** the state, the file server thread or
+any window exists, so the very first media request already resolves against the
+saved output dir. Every mutating command (`set_output_dir`, `set_capture_config`,
+`set_session_options`, `set_onboarded`, `pick_output_dir`) writes the whole file
+back through `commands::persist`, which logs a write failure rather than
+rejecting the user's change.
+
+The widget reads `get_settings` once at mount and renders **nothing but the
+first-run panel** until `onboarded` is true — inline, never a modal (ui.md). The
+panel states the resolved absolute path, free space and the hours of recording it
+buys, ~5–8 GB/hour, that nothing is ever auto-deleted, and whether FFmpeg and
+NVENC actually exist on this machine (`get_environment`). `pick_output_dir` opens
+`IFileOpenDialog` owned by the widget's HWND — unowned it would open *behind* the
+always-on-top window.
+
 ### File server — `fileserver.rs`
 
 Warp on 127.0.0.1:9120, on its own thread with its own tokio runtime (started in
@@ -285,13 +316,24 @@ from that window is denied.
 
 ## Gotchas & hard rules
 
-- **`CaptureConfig::default().output_dir` is hardcoded to `G:/code/screener/output`.**
-  Machine-specific. The widget's session settings can now change it at runtime via
-  `set_output_dir` (both the clip capture and the session recorder follow it, and so
-  does the file server), but nothing persists the choice across a restart.
-- **Nothing is persisted.** Config and status live only in memory — restarting the
-  app resets the interval, the output dir, and `captures_today` (which also never
-  rolls over at midnight).
+- **The default output dir is `%USERPROFILE%\Videos\ChirpTime`** (`state::default_output_dir`),
+  not the old hardcoded `G:/code/screener/output`. Anything recorded before that
+  change is still on disk and is no longer listed — `settings::find_legacy_output`
+  surfaces it in the first-run panel and in settings. **Nothing moves or deletes
+  those files; the user decides.**
+- **Config persists, status does not.** `settings.json` holds the output dir, the
+  capture config, the session options and the onboarding flag; `CaptureStatus`
+  (including `captures_today`, which still never rolls over at midnight) is
+  memory-only.
+- **Settings load can never fail.** `settings::load_from` degrades field by field:
+  bad JSON → all defaults, one bad key → that key's default and every other key
+  kept. A settings file must never keep the app from starting, and losing the
+  output dir to an unrelated bad key would send recordings somewhere unasked for.
+- **`SessionOptions` is stored as opaque JSON** (`serde_json::Value`) in both
+  `Settings` and `AppState`, because `recorder::SessionOptions` is deserialize-only
+  and the recording pipeline is not to be touched for a settings feature. The blob
+  is validated by parsing it on load and on `set_session_options`, and the frontend
+  merges it over `DEFAULT_OPTIONS` rather than trusting it whole.
 - **`start_capture` snapshots `interval_minutes` when spawning the loop.** Changing
   the interval mid-run does nothing until stop → start.
 - **Timestamp formats differ by surface:** filenames `HH-MM-SS`, `display_time`
@@ -404,14 +446,18 @@ from that window is denied.
 - **Uncommitted on `master`** — the Tailwind v4 migration (the previous build carried
   ~800 lines of inline `<style>` in `index.html`), audio recording, burned-in
   timestamps, and monitor auto-detection.
+- **Done (2026-07-27)** — config persistence, the first-run onboarding panel, the
+  native folder picker, "open my recordings" from the titlebar and settings, and
+  legacy-`output/` detection.
 - **Not built** — a settings UI for the *interval clip* capture
-  (`get/set_capture_config`, `get_ffmpeg_path` still have no caller), config
-  persistence, the `*_full.mp4` day compile (the viewer reads `full_day_video` but
-  nothing produces it), a frontend test runner, tray icon / autostart.
+  (`get/set_capture_config`, `get_ffmpeg_path` still have no caller), the
+  `*_full.mp4` day compile (the viewer reads `full_day_video` but nothing produces
+  it), a frontend test runner, tray icon / autostart.
 - **Not yet verified live** — the whole continuous-recording path has only been
   exercised against sessions already on disk. Starting a session, per-track
   health while running, markers, and the settings panel's device pickers have
   never been run against live hardware from the UI.
-- **Next** — a supervised live recording to verify the widget end to end, then
-  config persistence (session options and the output dir are both in-memory
-  only), then the fate of the legacy Bun CLI and the dead `src/ui/components/`.
+- **Next** — a supervised live recording to verify the widget end to end
+  (including the folder picker and Explorer button, which have only been
+  exercised through a mocked-IPC browser harness), then the fate of the legacy
+  Bun CLI and the dead `src/ui/components/`.

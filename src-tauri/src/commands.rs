@@ -55,10 +55,24 @@ pub async fn get_output_dir(state: tauri::State<'_, State>) -> Result<String, St
 }
 
 #[tauri::command]
-pub async fn set_output_dir(state: tauri::State<'_, State>, dir: String) -> Result<(), String> {
+pub async fn set_output_dir(state: tauri::State<'_, State>, dir: String) -> Result<String, String> {
+    let dir = dir.trim().to_string();
+    if dir.is_empty() {
+        return Err("Pick a folder first".to_string());
+    }
     let mut s = state.lock().await;
     s.config.output_dir = dir;
-    Ok(())
+    persist(&s);
+    Ok(capture::get_output_dir(&s.config).to_string_lossy().to_string())
+}
+
+/// Write the current settings to disk, reporting a failure to stderr rather
+/// than to the caller: a settings file that cannot be written is a real problem
+/// but never a reason to reject the change the user just made in the UI.
+fn persist(s: &AppState) {
+    if let Err(e) = crate::settings::save(&s.settings()) {
+        eprintln!("[chirptime] could not save settings: {e}");
+    }
 }
 
 #[tauri::command]
@@ -269,7 +283,153 @@ pub async fn get_capture_config(state: tauri::State<'_, State>) -> Result<Captur
 pub async fn set_capture_config(state: tauri::State<'_, State>, config: CaptureConfig) -> Result<(), String> {
     let mut s = state.lock().await;
     s.config = config;
+    if s.config.output_dir.trim().is_empty() {
+        s.config.output_dir = crate::state::default_output_dir();
+    }
+    persist(&s);
     Ok(())
+}
+
+// ===========================================================================
+// Settings, onboarding, and the output folder
+// ===========================================================================
+
+/// Everything about *this machine* the first-run panel has to state plainly:
+/// where recordings land, whether that volume has room, and whether the tools
+/// the recorder needs are actually installed.
+#[derive(Serialize)]
+pub struct EnvironmentInfo {
+    /// Resolved and absolute — never `%USERPROFILE%\...`. This is the path the
+    /// user is being asked to accept, so it is the path they get shown.
+    pub output_dir: String,
+    pub output_dir_exists: bool,
+    pub disk_free_bytes: Option<u64>,
+    pub disk_total_bytes: Option<u64>,
+    /// `None` when ffmpeg is not on PATH or in the two usual install dirs —
+    /// nothing records without it.
+    pub ffmpeg_path: Option<String>,
+    /// An NVENC encoder is present, i.e. the fast path is available.
+    pub nvenc: bool,
+    /// A non-empty `output/` beside the exe or repo that is *not* the configured
+    /// directory. Reported, never touched.
+    pub legacy_output: Option<crate::settings::LegacyOutput>,
+    pub settings_path: String,
+}
+
+#[tauri::command]
+pub async fn get_settings(state: tauri::State<'_, State>) -> Result<crate::settings::Settings, String> {
+    let s = state.lock().await;
+    Ok(s.settings())
+}
+
+/// Persist the session recorder's options. The blob is validated as
+/// `SessionOptions` before it is stored, so nothing unparseable ever reaches
+/// `start_session` from disk.
+#[tauri::command]
+pub async fn set_session_options(
+    state: tauri::State<'_, State>,
+    options: serde_json::Value,
+) -> Result<(), String> {
+    serde_json::from_value::<crate::recorder::SessionOptions>(options.clone())
+        .map_err(|e| format!("invalid session options: {e}"))?;
+    let mut s = state.lock().await;
+    s.session_options = options;
+    persist(&s);
+    Ok(())
+}
+
+/// Dismiss (or, for testing, re-arm) the first-run panel.
+#[tauri::command]
+pub async fn set_onboarded(state: tauri::State<'_, State>, value: bool) -> Result<(), String> {
+    let mut s = state.lock().await;
+    s.onboarded = value;
+    persist(&s);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn get_environment(state: tauri::State<'_, State>) -> Result<EnvironmentInfo, String> {
+    let dir = {
+        let s = state.lock().await;
+        capture::get_output_dir(&s.config)
+    };
+    // ffmpeg probing shells out twice; keep it off the async runtime.
+    tokio::task::spawn_blocking(move || {
+        let (free, total) = match crate::nativeui::disk_space(&dir) {
+            Some((f, t)) => (Some(f), Some(t)),
+            None => (None, None),
+        };
+        let ffmpeg_path = capture::find_ffmpeg();
+        let nvenc = ffmpeg_path
+            .as_deref()
+            .map(|f| crate::recorder::detect_encoders(f).h264_nvenc)
+            .unwrap_or(false);
+        EnvironmentInfo {
+            output_dir: crate::nativeui::display_path(&dir),
+            output_dir_exists: dir.exists(),
+            disk_free_bytes: free,
+            disk_total_bytes: total,
+            ffmpeg_path,
+            nvenc,
+            legacy_output: crate::settings::find_legacy_output(&dir),
+            settings_path: crate::nativeui::display_path(&crate::settings::settings_path()),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Native folder picker. Applies and persists the choice, and returns the
+/// resolved path — or `None` if the user cancelled, which is not an error.
+#[tauri::command]
+pub async fn pick_output_dir(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, State>,
+) -> Result<Option<String>, String> {
+    let start = {
+        let s = state.lock().await;
+        capture::get_output_dir(&s.config)
+    };
+    // Owning the dialog to the widget matters: the widget is always-on-top, so
+    // an unowned dialog opens behind it.
+    let parent = app
+        .get_webview_window("main")
+        .and_then(|w| w.hwnd().ok())
+        .map(|h| h.0 as isize);
+
+    let picked = tokio::task::spawn_blocking(move || {
+        crate::nativeui::pick_folder(Some(&start), parent)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let Some(picked) = picked else { return Ok(None) };
+
+    let mut s = state.lock().await;
+    s.config.output_dir = picked;
+    persist(&s);
+    Ok(Some(capture::get_output_dir(&s.config).to_string_lossy().to_string()))
+}
+
+/// Show a folder in Explorer. With no argument this is "where are my
+/// recordings" — the configured output dir, created first if the user has not
+/// recorded yet so the button is never a dead end.
+#[tauri::command]
+pub async fn open_folder(state: tauri::State<'_, State>, path: Option<String>) -> Result<(), String> {
+    let dir = match path {
+        Some(p) => crate::nativeui::absolute(&p),
+        None => {
+            let s = state.lock().await;
+            let dir = capture::get_output_dir(&s.config);
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| format!("create {}: {e}", dir.display()))?;
+            dir
+        }
+    };
+    if !dir.exists() {
+        return Err(format!("{} does not exist", crate::nativeui::display_path(&dir)));
+    }
+    crate::nativeui::open_in_explorer(&dir)
 }
 
 #[tauri::command]

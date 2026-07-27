@@ -6,11 +6,13 @@ import type {
   MonitorConfig,
   CaptureConfig,
   CaptureStatus,
+  EnvironmentInfo,
   SessionManifest,
   SessionMarker,
   SessionOptions,
   SessionStatus,
   SessionSummary,
+  Settings,
 } from "../types";
 import { mediaUrl } from "./mediaUrl";
 
@@ -62,8 +64,44 @@ export async function listDevices(): Promise<DshowDevices> {
   return invoke<DshowDevices>("list_devices");
 }
 
-export async function setOutputDir(dir: string): Promise<void> {
-  return invoke("set_output_dir", { dir });
+/** Point recording at `dir` and persist it. Returns the resolved absolute path. */
+export async function setOutputDir(dir: string): Promise<string> {
+  return invoke<string>("set_output_dir", { dir });
+}
+
+/* ---- settings + onboarding -------------------------------------------- */
+
+/** Everything that survives a restart. */
+export async function getSettings(): Promise<Settings> {
+  return invoke<Settings>("get_settings");
+}
+
+/** Persist the session recorder's options. Rejects if they are not valid. */
+export async function setSessionOptions(options: SessionOptions): Promise<void> {
+  return invoke("set_session_options", { options });
+}
+
+/** Dismiss the first-run panel for good. */
+export async function setOnboarded(value: boolean): Promise<void> {
+  return invoke("set_onboarded", { value });
+}
+
+/** Output path, free space, ffmpeg/NVENC presence, and any legacy `output/`. */
+export async function getEnvironment(): Promise<EnvironmentInfo> {
+  return invoke<EnvironmentInfo>("get_environment");
+}
+
+/**
+ * Native folder picker, applied and persisted by the backend. Resolves to
+ * `null` when the user cancelled — that is not an error.
+ */
+export async function pickOutputDir(): Promise<string | null> {
+  return invoke<string | null>("pick_output_dir");
+}
+
+/** Show a folder in Explorer. No argument means the configured output folder. */
+export async function openFolder(path?: string): Promise<void> {
+  return invoke("open_folder", { path: path ?? null });
 }
 
 /**

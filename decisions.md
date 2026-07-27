@@ -6,6 +6,44 @@
 > Entries below dated 2026-03-xx were reconstructed from the code on 2026-07-27
 > when this file was created; the reasoning is inferred from the implementation.
 
+## 2026-07-27 — Where recordings go is stated on first run, and never guessed at again
+**Why:** the default output dir moved off the original author's hardcoded
+`G:/code/screener/output` to `%USERPROFILE%\Videos\ChirpTime`. This app writes
+hours of somebody's life at 5–8 GB/hour and **deletes nothing, ever** (the user
+explicitly chose no retention policy), so the destination cannot be something you
+discover afterwards. The first run states the resolved absolute path, the free
+space, what it costs per hour, and that nothing is auto-deleted — and lets you
+change it right there.
+**Chosen:** an inline first-run panel that replaces the panes until dismissed
+(ui.md forbids modals/toasts/drawers at 320px wide), plus a permanent
+output-folder affordance in two places — the titlebar folder button and the
+settings card — because "where are my recordings" is asked on day 180 too.
+**Rejected:** a modal (banned by ui.md); a one-line banner (too easy to dismiss
+unread for a decision this expensive); auto-migrating the old `output/` (moving
+someone's footage without asking is not ours to do — it is reported with its
+path, and adopting it is one button).
+**Consequence:** the panel is gated on a persisted flag, so onboarding is one of
+the reasons settings persistence had to exist first.
+
+## 2026-07-27 — Settings persist to %APPDATA%, load tolerantly, and never block startup
+**Why:** nothing survived a restart, which made the settings UI decorative and
+made a first-run flag impossible. The file lives at
+`%APPDATA%\com.chirptime.app\settings.json` — the same path Tauri's
+`app_config_dir()` resolves to — but is computed **without** an `AppHandle`,
+because settings are read in `run()` before the app and the file-server thread
+exist and both need the output dir from the first request.
+**Chosen:** field-by-field tolerant loading. Bad JSON → defaults; one bad key →
+that key's default with every other key kept. Writes go through a temp file +
+rename. A failed *write* is logged, not surfaced as a rejected UI action.
+**Rejected:** `tauri-plugin-store` / a plugin dependency (needs an AppHandle,
+and this must run earlier); all-or-nothing parsing (an unrelated bad key would
+silently reset the output dir, i.e. send recordings somewhere unasked for).
+**Consequence:** `recorder::SessionOptions` is deserialize-only and the recording
+pipeline is off-limits, so session options are persisted as an opaque
+`serde_json::Value` that is validated by parsing and merged over the frontend's
+`DEFAULT_OPTIONS`. Adding `#[serde(default)]` to `CaptureConfig` is what lets an
+older file keep the keys it does have.
+
 ## 2026-07-27 — Segment-boundary choppiness is ACCEPTED, and mitigated only by longer audio segments
 **Why:** the user, told the tradeoff explicitly (~40s of audio lost per 6-hour
 day, a brief hiccup around each boundary), chose to live with it: *"it doesnt

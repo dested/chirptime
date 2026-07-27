@@ -3070,7 +3070,10 @@ pub fn list_sessions(root: &Path) -> Vec<SessionSummary> {
 mod tests {
     use super::*;
 
-    const AIRPODS: &str = "Headset (SALVATORE\u{2019}s AirPods Pro - Find My)";
+    // Real-world shape of the name matters here: Windows exposes the HFP endpoint
+    // as `Headset (…)` and the A2DP one as `Headphones (…)`, and the possessive
+    // uses a curly apostrophe. Keep both; the owner's name is a placeholder.
+    const AIRPODS: &str = "Headset (Alex\u{2019}s AirPods Pro - Find My)";
     const BRIO_MIC: &str = "Microphone (Logitech BRIO)";
 
     fn caps(h264_qsv: bool) -> EncoderCaps {

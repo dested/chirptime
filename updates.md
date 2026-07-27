@@ -3,6 +3,32 @@
 > Terse log of every task: what was asked → what was done. Newest first.
 > Older entries: `updates-archive.md` (created once this passes ~300 lines).
 
+## 2026-07-27 — config persistence + first-run onboarding
+"The default output dir just moved — make sure the user knows that!!" Added
+`settings.rs`: `%APPDATA%\com.chirptime.app\settings.json` holds the capture
+config, the session options (opaque JSON — `SessionOptions` is deserialize-only
+and recorder.rs was off-limits) and an `onboarded` flag. Loaded in `run()` before
+the state and the file server exist; loading degrades field by field so a corrupt
+or older file can never stop the app or silently reset the output dir. Every
+mutating command persists.
+New inline first-run panel in the widget (no modal — 320px): resolved absolute
+path, free space + hours of recording it buys, ~5–8 GB/hour, nothing is ever
+auto-deleted, FFmpeg/NVENC presence on this machine, and a native
+`IFileOpenDialog` folder picker owned by the widget HWND (unowned it opens behind
+the always-on-top window). Legacy `output/` beside the exe/repo is detected and
+reported with its day/session counts plus a "Use This Folder" button — nothing is
+moved, copied or deleted. Permanent "where are my recordings" affordances: a
+titlebar folder button (both tabs) and the same card in session settings, which
+replaced the free-text path field.
+Verified: `cargo check`, `cargo test --lib` (64 pass, +12 new), new
+`cargo test --test settings_persistence` (save → reload → corrupt → half-written),
+`bunx tsc --noEmit`, and the widget rendered at a real 320px in a browser via a
+temporary mocked-IPC harness (since deleted) — four states screenshotted.
+Not exercised: the actual Win32 picker and Explorer launch need a real app run.
+Touched: src-tauri/src/{settings,nativeui}.rs (new), commands.rs, lib.rs, state.rs,
+Cargo.toml (windows Win32_UI_Shell features), src/ui/{CompactApp.tsx,types.ts,hooks/useApi.ts},
+src-tauri/tests/settings_persistence.rs (new).
+
 ## 2026-07-27 — audio tracks get 10-minute segments; boundary choppiness accepted
 User accepted the segment-boundary hiccup rather than eliminating it ("it doesnt
 have to be nano second perfect"). Cheap mitigation only: `mic` and `sysaudio` now

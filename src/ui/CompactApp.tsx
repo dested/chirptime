@@ -15,13 +15,19 @@ import {
   addMarker,
   listDevices,
   listDisplayOutputs,
-  fetchOutputDir,
   setOutputDir,
+  getSettings,
+  setSessionOptions,
+  setOnboarded,
+  getEnvironment,
+  pickOutputDir,
+  openFolder,
 } from "./hooks/useApi";
 import type {
   CaptureStatus,
   CaptureEntry,
   DisplayOutputInfo,
+  EnvironmentInfo,
   SessionOptions,
   SessionStatus,
   TrackSummary,
@@ -124,6 +130,321 @@ function Notice({ tone, children }: { tone: "warn" | "error"; children: React.Re
   );
 }
 
+/**
+ * Midpoint of the 5–8 GB/hour a full session actually writes. Only ever used to
+ * turn free space into a number of hours, always hedged with "about" — it is an
+ * order-of-magnitude answer to "how long can I record", not a promise.
+ */
+const GB_PER_HOUR = 6.5;
+
+function fmtRecordingHours(freeBytes: number): string {
+  const hours = freeBytes / (GB_PER_HOUR * 1e9);
+  if (hours < 1) return "under an hour of recording";
+  return `about ${Math.round(hours)} hours of recording`;
+}
+
+/** One line of "here is what you are signing up for" on the first-run panel. */
+function Fact({ icon, title, children }: { icon: React.ReactNode; title: string; children: React.ReactNode }) {
+  return (
+    <div className="flex gap-2.5">
+      <span className="shrink-0 mt-0.5 text-slate-300">{icon}</span>
+      <div className="min-w-0">
+        <div className="text-[12px] font-semibold text-slate-900 leading-snug">{title}</div>
+        <div className="text-[11px] text-slate-400 leading-snug">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+/** One requirement, muted when satisfied and amber when it is not. */
+function Requirement({ ok, label, value }: { ok: boolean; label: string; value: string }) {
+  return (
+    <div className="flex items-center gap-2 text-[11px]">
+      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${ok ? "bg-slate-300" : "bg-amber-500"}`} />
+      <span className="text-slate-600 shrink-0">{label}</span>
+      <span
+        className={`ml-auto min-w-0 truncate font-mono ${ok ? "text-slate-400" : "text-amber-700"}`}
+        title={value}
+      >
+        {value}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * The output folder, its free space, and the two things anyone ever wants to do
+ * with it. Used by the first-run panel and by settings, because "where are my
+ * recordings" is a question that does not stop being asked after day one.
+ */
+function OutputFolder({
+  env,
+  onChanged,
+  disabled = false,
+}: {
+  env: EnvironmentInfo | null;
+  onChanged: () => void;
+  disabled?: boolean;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const choose = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      // null means the user cancelled the dialog — nothing to do.
+      if (await pickOutputDir()) onChanged();
+    } catch (e) {
+      setError(String(e));
+    }
+    setBusy(false);
+  }, [onChanged]);
+
+  const open = useCallback(async () => {
+    setError(null);
+    try {
+      await openFolder();
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="px-2.5 py-2 rounded-[10px] border border-slate-200 bg-white">
+        <div className="text-[11px] font-mono text-slate-900 break-all leading-snug">
+          {env ? env.output_dir : "Loading..."}
+        </div>
+        {env && (
+          <div
+            className={`mt-1 text-[10px] tabular-nums font-mono ${
+              // Under two hours of recording is worth reading twice — advisory,
+              // not an error: it is still a perfectly valid folder.
+              env.disk_free_bytes !== null && env.disk_free_bytes < 2 * GB_PER_HOUR * 1e9
+                ? "text-amber-700"
+                : "text-slate-400"
+            }`}
+          >
+            {env.disk_free_bytes === null
+              ? "Free space unknown"
+              : `${fmtBytes(env.disk_free_bytes)} free · ${fmtRecordingHours(env.disk_free_bytes)}`}
+          </div>
+        )}
+      </div>
+      <div className="flex gap-2">
+        <button
+          className={`${SECONDARY_BTN} flex-1 py-1.5 text-[12px]`}
+          onClick={() => void choose()}
+          disabled={busy || disabled}
+        >
+          Choose Folder
+        </button>
+        <button
+          className={`${SECONDARY_BTN} px-3 py-1.5 text-[12px]`}
+          onClick={() => void open()}
+          title="Open in Explorer"
+        >
+          Open
+        </button>
+      </div>
+      {error && <Notice tone="error">{error}</Notice>}
+    </div>
+  );
+}
+
+/**
+ * First run. The app is about to write hours of somebody's life to disk at
+ * several GB an hour and never delete any of it, so where that lands — and what
+ * it costs — is stated before the first recording, not discovered afterwards.
+ *
+ * Inline, never a modal: the window is 320px wide (see ui.md).
+ */
+function Onboarding({ onDone }: { onDone: () => void }) {
+  const [env, setEnv] = useState<EnvironmentInfo | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [legacyDismissed, setLegacyDismissed] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(() => {
+    getEnvironment()
+      .then(setEnv)
+      .catch((e) => setError(String(e)));
+  }, []);
+  useEffect(load, [load]);
+
+  const adoptLegacy = useCallback(
+    async (path: string) => {
+      setError(null);
+      try {
+        await setOutputDir(path);
+        load();
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [load],
+  );
+
+  const finish = useCallback(async () => {
+    setBusy(true);
+    try {
+      // Only dismiss once it is actually written: if settings cannot be saved,
+      // the panel would come back next launch with no explanation.
+      await setOnboarded(true);
+      onDone();
+    } catch (e) {
+      setError(String(e));
+    }
+    setBusy(false);
+  }, [onDone]);
+
+  const legacy = env?.legacy_output ?? null;
+
+  return (
+    <div className="flex-1 min-h-0 flex flex-col">
+      <div className="flex-1 min-h-0 overflow-y-auto px-4 pt-3 pb-3">
+        <Eyebrow>First run</Eyebrow>
+        <h1 className="mt-1 text-[15px] font-bold tracking-tight text-slate-900">
+          Where your recordings go
+        </h1>
+        <p className="mt-1 text-[12px] text-slate-500 leading-snug">
+          Screenshots, clips and sessions are written to this folder on this machine.
+          Nothing leaves it.
+        </p>
+
+        <div className="mt-3">
+          <Eyebrow>Saving to</Eyebrow>
+          <div className="mt-1.5">
+            <OutputFolder env={env} onChanged={load} />
+          </div>
+        </div>
+
+        {error && (
+          <div className="mt-2">
+            <Notice tone="error">{error}</Notice>
+          </div>
+        )}
+
+        {legacy && !legacyDismissed && (
+          <div className="mt-2">
+            <Notice tone="warn">
+              <span className="block">
+                Earlier recordings are still in{" "}
+                <span className="font-mono break-all">{legacy.path}</span> —{" "}
+                {legacy.day_count} {legacy.day_count === 1 ? "day" : "days"} and{" "}
+                {legacy.session_count}{" "}
+                {legacy.session_count === 1 ? "session" : "sessions"}. ChirpTime is not
+                reading that folder anymore. Nothing there has been moved or deleted.
+              </span>
+              <span className="flex gap-2 mt-1.5">
+                <button
+                  className={`${SECONDARY_BTN} flex-1 py-1 text-[11px]`}
+                  onClick={() => void adoptLegacy(legacy.path)}
+                >
+                  Use This Folder
+                </button>
+                <button
+                  className={`${SECONDARY_BTN} px-2 py-1 text-[11px]`}
+                  onClick={() => setLegacyDismissed(true)}
+                >
+                  Ignore
+                </button>
+              </span>
+            </Notice>
+          </div>
+        )}
+
+        <div className="flex flex-col gap-2.5 mt-4">
+          <Fact
+            icon={
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <ellipse cx="12" cy="6" rx="8" ry="3" />
+                <path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6" />
+                <path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" />
+              </svg>
+            }
+            title="5 to 8 GB per hour"
+          >
+            A continuous session records every screen, the webcam and audio at once. Check
+            the free space above before a long day.
+          </Fact>
+          <Fact
+            icon={
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <rect x="3" y="4" width="18" height="4" rx="1" />
+                <path d="M5 8v11a1 1 0 001 1h12a1 1 0 001-1V8" />
+                <path d="M10 12h4" />
+              </svg>
+            }
+            title="Nothing is deleted"
+          >
+            ChirpTime never removes a recording, however old. The folder grows until you
+            clear it out yourself.
+          </Fact>
+          <Fact
+            icon={
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                <rect x="3" y="4" width="18" height="12" rx="2" />
+                <path d="M8 20h8M12 16v4" />
+              </svg>
+            }
+            title="Windows only"
+          >
+            Capture runs on FFmpeg. An NVIDIA GPU gets the fast encoder path; without one
+            recording still works but costs more CPU.
+          </Fact>
+        </div>
+
+        <div className="flex flex-col gap-1.5 mt-4">
+          <Eyebrow>This machine</Eyebrow>
+          {env === null ? (
+            <div className="text-[11px] text-slate-400">Loading...</div>
+          ) : (
+            <>
+              <Requirement
+                ok={env.ffmpeg_path !== null}
+                label="FFmpeg"
+                value={env.ffmpeg_path ?? "Not found"}
+              />
+              <Requirement
+                ok={env.nvenc}
+                label="NVIDIA encoder"
+                value={env.nvenc ? "Available" : "Not available"}
+              />
+            </>
+          )}
+        </div>
+
+        {env && env.ffmpeg_path === null && (
+          <div className="mt-2">
+            <Notice tone="warn">
+              FFmpeg was not found on PATH or in the usual install folders. Nothing can be
+              captured until it is installed.
+            </Notice>
+          </div>
+        )}
+
+        {env && (
+          <div className="mt-3 text-[10px] text-slate-300 font-mono break-all leading-snug">
+            Settings: {env.settings_path}
+          </div>
+        )}
+      </div>
+
+      <div className="px-4 py-2.5 pb-3.5 border-t border-slate-100">
+        <button
+          className="flex items-center justify-center gap-2.5 w-full py-3 rounded-xl text-sm font-semibold tracking-tight cursor-pointer border-none bg-sky-500 text-white shadow-[0_1px_3px_rgba(14,165,233,0.3),0_4px_12px_rgba(14,165,233,0.15)] hover:bg-sky-600 hover:shadow-[0_2px_6px_rgba(14,165,233,0.4),0_6px_16px_rgba(14,165,233,0.2)] hover:-translate-y-px transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+          onClick={() => void finish()}
+          disabled={busy}
+        >
+          <span>Continue</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
 const KIND_BADGE: Record<string, string> = {
   screen: "bg-sky-50 text-sky-600",
   webcam: "bg-purple-50 text-purple-500",
@@ -195,12 +516,14 @@ function SessionSettings({
 }) {
   const [outputs, setOutputs] = useState<DisplayOutputInfo[] | null>(null);
   const [devices, setDevices] = useState<{ video: string[]; audio: string[] } | null>(null);
-  const [dir, setDir] = useState<string>("");
-  const [dirDraft, setDirDraft] = useState<string>("");
-  const [dirSaved, setDirSaved] = useState(false);
+  const [env, setEnv] = useState<EnvironmentInfo | null>(null);
   const [probeError, setProbeError] = useState<string | null>(null);
 
-  // Both of these shell out to ffmpeg, so they run once when the panel opens and
+  const loadEnv = useCallback(() => {
+    getEnvironment().then(setEnv).catch(() => {});
+  }, []);
+
+  // All of these shell out to ffmpeg, so they run once when the panel opens and
   // never from a render path.
   useEffect(() => {
     let live = true;
@@ -210,17 +533,11 @@ function SessionSettings({
     listDevices()
       .then((d) => live && setDevices(d))
       .catch(() => live && setDevices({ video: [], audio: [] }));
-    fetchOutputDir()
-      .then((d) => {
-        if (!live) return;
-        setDir(d);
-        setDirDraft(d);
-      })
-      .catch(() => {});
+    loadEnv();
     return () => {
       live = false;
     };
-  }, []);
+  }, [loadEnv]);
 
   const capturable = (outputs ?? []).filter((o) => o.attached && o.screen_index !== null);
   const allIndices = capturable.filter((o) => o.capturable).map((o) => o.screen_index as number);
@@ -238,17 +555,6 @@ function SessionSettings({
       ...options,
       screens: next.length === allIndices.length ? [] : next,
     });
-  };
-
-  const applyDir = async () => {
-    const trimmed = dirDraft.trim();
-    if (!trimmed || trimmed === dir) return;
-    try {
-      await setOutputDir(trimmed);
-      setDir(trimmed);
-      setDirSaved(true);
-      setTimeout(() => setDirSaved(false), 2000);
-    } catch {}
   };
 
   return (
@@ -422,26 +728,17 @@ function SessionSettings({
       {/* Output */}
       <div className="flex flex-col gap-1.5">
         <Eyebrow>Output folder</Eyebrow>
-        <input
-          className={`${FIELD} cursor-text font-mono`}
-          value={dirDraft}
-          spellCheck={false}
-          onChange={(e) => setDirDraft(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && void applyDir()}
-        />
-        <div className="flex items-center gap-2">
-          <button
-            className={`${SECONDARY_BTN} flex-1 py-1.5 text-[12px]`}
-            onClick={() => void applyDir()}
-            disabled={!dirDraft.trim() || dirDraft.trim() === dir}
-          >
-            Apply
-          </button>
-          {dirSaved && <span className="text-[11px] text-slate-400">Saved</span>}
-        </div>
+        <OutputFolder env={env} onChanged={loadEnv} disabled={disabled} />
         <div className="text-[10px] text-slate-400 leading-snug">
-          Sessions are written to this folder. It is not persisted across restarts yet.
+          Clips and sessions are written here and are never deleted automatically.
         </div>
+        {env?.legacy_output && (
+          <Notice tone="warn">
+            Older recordings are still in{" "}
+            <span className="font-mono break-all">{env.legacy_output.path}</span>. This
+            app no longer reads that folder; nothing there has been moved.
+          </Notice>
+        )}
       </div>
     </div>
   );
@@ -471,6 +768,26 @@ export function SessionPane({
   useEffect(() => {
     if (status.session_id) setLastSessionId(status.session_id);
   }, [status.session_id]);
+
+  // Options survive a restart. The stored blob is merged over the defaults
+  // rather than trusted whole, so a file written by an older build cannot leave
+  // a field undefined on the way to `start_session`.
+  useEffect(() => {
+    let live = true;
+    getSettings()
+      .then((s) => {
+        if (live && s.session) setOptions({ ...DEFAULT_OPTIONS, ...s.session });
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, []);
+
+  const updateOptions = useCallback((next: SessionOptions) => {
+    setOptions(next);
+    void setSessionOptions(next).catch(() => {});
+  }, []);
 
   const linkSessionId = status.session_id ?? lastSessionId;
 
@@ -670,7 +987,7 @@ export function SessionPane({
             </svg>
           </button>
           {showSettings && (
-            <SessionSettings options={options} onChange={setOptions} disabled={status.recording} />
+            <SessionSettings options={options} onChange={updateOptions} disabled={status.recording} />
           )}
         </div>
       </div>
@@ -941,6 +1258,17 @@ export function CompactApp() {
     captures_today: 0,
   });
   const [session, setSession] = useState<SessionStatus>(IDLE_SESSION);
+  // null until settings have been read. The first-run panel is decided by the
+  // persisted flag, so nothing else may render before it is known.
+  const [onboarded, setOnboardedLocal] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    getSettings()
+      .then((s) => setOnboardedLocal(s.onboarded))
+      // Settings are unreachable — a first-run panel that cannot be dismissed
+      // would be worse than none.
+      .catch(() => setOnboardedLocal(true));
+  }, []);
 
   // Both loops are polled from here regardless of which tab is showing, so the
   // mode switch can always say which one is live. They are independent: interval
@@ -995,6 +1323,16 @@ export function CompactApp() {
           <span className="text-[13px] font-bold text-slate-900 tracking-tight">ChirpTime</span>
         </div>
         <div className="flex gap-1">
+          {/* Always reachable, both modes: the folder holding the recordings. */}
+          <button
+            className="w-6 h-6 flex items-center justify-center bg-transparent border-none text-slate-400 rounded-md hover:bg-slate-100 hover:text-slate-600 transition-all cursor-pointer"
+            onClick={() => void openFolder().catch(() => {})}
+            title="Open recordings folder"
+          >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2z" />
+            </svg>
+          </button>
           <button
             className="w-6 h-6 flex items-center justify-center bg-transparent border-none text-slate-400 rounded-md hover:bg-slate-100 hover:text-slate-600 transition-all cursor-pointer"
             onClick={handleMinimize}
@@ -1012,25 +1350,35 @@ export function CompactApp() {
         </div>
       </div>
 
-      {/* Mode switch. The red dot follows whichever mode is actually running, so
-          switching tabs never hides that something is recording. */}
-      <div className="px-4 pt-3">
-        <div className="flex gap-0.5 p-0.5 rounded-[10px] border border-slate-200 bg-slate-100">
-          <button className={tabCls(mode === "clips")} onClick={() => setMode("clips")}>
-            <span>Clips</span>
-            {status.running && <span className="w-1.5 h-1.5 rounded-full bg-red-500 dot-active" />}
-          </button>
-          <button className={tabCls(mode === "session")} onClick={() => setMode("session")}>
-            <span>Session</span>
-            {session.recording && <span className="w-1.5 h-1.5 rounded-full bg-red-500 dot-active" />}
-          </button>
+      {onboarded === null ? (
+        <div className="flex-1 flex items-center justify-center text-slate-400 text-sm">
+          Loading...
         </div>
-      </div>
-
-      {mode === "clips" ? (
-        <ClipsPane status={status} onChanged={setStatus} />
+      ) : !onboarded ? (
+        <Onboarding onDone={() => setOnboardedLocal(true)} />
       ) : (
-        <SessionPane status={session} onChanged={setSession} />
+        <>
+          {/* Mode switch. The red dot follows whichever mode is actually running,
+              so switching tabs never hides that something is recording. */}
+          <div className="px-4 pt-3">
+            <div className="flex gap-0.5 p-0.5 rounded-[10px] border border-slate-200 bg-slate-100">
+              <button className={tabCls(mode === "clips")} onClick={() => setMode("clips")}>
+                <span>Clips</span>
+                {status.running && <span className="w-1.5 h-1.5 rounded-full bg-red-500 dot-active" />}
+              </button>
+              <button className={tabCls(mode === "session")} onClick={() => setMode("session")}>
+                <span>Session</span>
+                {session.recording && <span className="w-1.5 h-1.5 rounded-full bg-red-500 dot-active" />}
+              </button>
+            </div>
+          </div>
+
+          {mode === "clips" ? (
+            <ClipsPane status={status} onChanged={setStatus} />
+          ) : (
+            <SessionPane status={session} onChanged={setSession} />
+          )}
+        </>
       )}
     </div>
   );

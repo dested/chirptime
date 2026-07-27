@@ -1,11 +1,14 @@
 mod capture;
 mod commands;
 mod fileserver;
+mod nativeui;
+// Public so the settings round-trip can be exercised without a window system.
+pub mod settings;
 // Public so the live hardware tests in `tests/live_session.rs` can drive the
 // recorder headlessly, without a window system.
 pub mod recorder;
 pub mod session;
-mod state;
+pub mod state;
 mod sysaudio;
 
 use state::AppState;
@@ -25,7 +28,17 @@ pub fn run() {
         eprintln!("[chirptime] {}", e);
     }
 
-    let app_state = Arc::new(Mutex::new(AppState::default()));
+    // Settings are read before anything else, and never fail: a missing or
+    // corrupt file degrades to defaults. The file server thread below resolves
+    // media paths against the output dir, so it has to be the saved one from the
+    // first request, not a default that gets corrected later.
+    let saved = settings::load();
+    eprintln!(
+        "[chirptime] settings: {} · recordings: {}",
+        settings::settings_path().display(),
+        saved.capture.output_dir
+    );
+    let app_state = Arc::new(Mutex::new(AppState::from_settings(saved)));
 
     // Start file server in background
     let server_state = app_state.clone();
@@ -56,6 +69,13 @@ pub fn run() {
             commands::get_ffmpeg_path,
             commands::list_devices,
             commands::open_viewer,
+            // Settings persistence + first-run onboarding
+            commands::get_settings,
+            commands::set_session_options,
+            commands::set_onboarded,
+            commands::get_environment,
+            commands::pick_output_dir,
+            commands::open_folder,
             // Continuous session recording
             commands::start_session,
             commands::stop_session,

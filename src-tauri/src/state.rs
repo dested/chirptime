@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+/// Every field is `#[serde(default)]` so a settings file written by an older
+/// build — or one missing a key entirely — still loads the fields it does have
+/// instead of being thrown away wholesale. See `settings::load_from`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CaptureConfig {
     pub interval_minutes: u32,
     pub video_mode: bool,
@@ -12,6 +16,34 @@ pub struct CaptureConfig {
     pub pip_overlay: bool,
     pub webcam_device: Option<String>,
     pub output_dir: String,
+}
+
+/// Where recordings go when nothing has been configured: `<Videos>/ChirpTime`,
+/// falling back to `<profile>/Videos/ChirpTime` and finally a relative `output/`.
+///
+/// This used to be a hardcoded absolute path on the original author's machine,
+/// which meant the app silently wrote nowhere useful for anybody else. Because
+/// this decides where hours of somebody's life get written, the UI must show the
+/// resolved path before the first recording rather than leaving it implicit.
+pub fn default_output_dir() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        // USERPROFILE is set on every normal Windows session; the Videos folder
+        // can be relocated, but %USERPROFILE%\Videos is right in the common case
+        // and is a far better guess than a path on someone else's D drive.
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            if !profile.is_empty() {
+                return format!("{}\\Videos\\ChirpTime", profile.trim_end_matches('\\'));
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy().to_string();
+        if !home.is_empty() {
+            return format!("{}/Videos/ChirpTime", home.trim_end_matches('/'));
+        }
+    }
+    "output".to_string()
 }
 
 impl Default for CaptureConfig {
@@ -26,7 +58,7 @@ impl Default for CaptureConfig {
             audio_device: None,
             pip_overlay: true,
             webcam_device: None,
-            output_dir: "G:/code/screener/output".to_string(),
+            output_dir: default_output_dir(),
         }
     }
 }
@@ -58,4 +90,31 @@ pub struct AppState {
     /// Continuous-session recorder. Independent of the interval capture loop
     /// above — both can run at once.
     pub recorder: Option<std::sync::Arc<crate::recorder::Recorder>>,
+    /// Last-used `recorder::SessionOptions`, kept as raw JSON because that type
+    /// is deserialize-only. Written by the settings panel, read back by it, and
+    /// handed to `start_session` by the frontend. `Null` = never configured.
+    pub session_options: serde_json::Value,
+    /// The first-run panel has been dismissed.
+    pub onboarded: bool,
+}
+
+impl AppState {
+    pub fn from_settings(s: crate::settings::Settings) -> Self {
+        Self {
+            config: s.capture,
+            session_options: s.session,
+            onboarded: s.onboarded,
+            ..Default::default()
+        }
+    }
+
+    /// The persistable half of this state.
+    pub fn settings(&self) -> crate::settings::Settings {
+        crate::settings::Settings {
+            version: crate::settings::SETTINGS_VERSION,
+            capture: self.config.clone(),
+            session: self.session_options.clone(),
+            onboarded: self.onboarded,
+        }
+    }
 }

@@ -9,7 +9,8 @@
 | --- | --- | --- |
 | Frontend type-check | `bunx tsc --noEmit` | [cheap] |
 | Rust check | `cargo check --manifest-path src-tauri/Cargo.toml` | [medium] — first run compiles the whole dep tree |
-| Rust unit tests | `cargo test --lib --manifest-path src-tauri/Cargo.toml` | [medium] — 52 pure tests, no hardware, no capture |
+| Rust unit tests | `cargo test --lib --manifest-path src-tauri/Cargo.toml` | [medium] — 64 pure tests, no hardware, no capture |
+| Settings persistence | `cargo test --test settings_persistence --manifest-path src-tauri/Cargo.toml` | [cheap] — temp `%APPDATA%`, no hardware |
 | Frontend-only build | `bun run vite:build` | [cheap] |
 | Dev app | `bun run dev` → widget window + Vite on http://localhost:5173 | [medium] — spawns a Rust build and a real window |
 | Release bundle | `bun run build` | [heavy — ask first] — full optimized Rust build + installer |
@@ -49,8 +50,11 @@ never opens the real camera, so it is the cheaper of the two to run.
 - **Capture archive** lives at `output/` (gitignored) and already contains real
   days going back to 2026-02-27 — good fixture data for viewer work; no seeding
   needed. Deleting from the viewer deletes real files, permanently.
-- **Output directory** is `CaptureConfig::default().output_dir`, currently
-  hardcoded to `G:/code/screener/output` in `src-tauri/src/state.rs`.
+- **Output directory** is whatever `%APPDATA%\com.chirptime.app\settings.json`
+  says, defaulting to `%USERPROFILE%\Videos\ChirpTime`
+  (`state::default_output_dir`). The pre-2026-07-27 recordings under
+  `G:/code/screener/output` are therefore *not* what a fresh install reads —
+  the first-run panel reports that folder rather than adopting it.
 - No credentials or secrets of any kind.
 
 ## Critical flows
@@ -69,6 +73,28 @@ Touchpoints: `CompactApp.tsx`, `commands.rs` (`start_capture`/`stop_capture`/
 
 Expect **no console window to flash** at any point — if one does, a subprocess is
 bypassing `silent_command()`.
+
+### First run and settings persistence [medium]
+Touchpoints: `settings.rs`, `nativeui.rs`, `commands.rs`, `CompactApp.tsx`
+(`Onboarding` / `OutputFolder`)
+
+1. `del "%APPDATA%\com.chirptime.app\settings.json"`, then `bun run dev` → the
+   widget opens on **Where your recordings go**, not on the Clips pane. The path
+   shown is absolute and expanded (never `%USERPROFILE%\...`), with real free
+   space beside it.
+2. **Choose Folder** opens the native picker *in front of* the always-on-top
+   widget; picking a folder updates the path in place. **Open** opens it in
+   Explorer, creating it if it does not exist yet.
+3. If a non-empty `output/` exists beside the exe or repo and is not the
+   configured folder, an amber notice names it with day/session counts. **Nothing
+   there may be moved or deleted** — only `Use This Folder` repoints the config.
+4. **Continue** → the panes appear. `settings.json` now exists with
+   `"onboarded": true`. Restart → the panel does not come back and the chosen
+   folder is still in place.
+5. Corrupt the file (`echo garbage > settings.json`) and restart → the app starts
+   normally on defaults; stderr carries one line saying the settings were not
+   valid JSON.
+6. The titlebar folder button opens the recordings folder from either tab.
 
 ### Capture Now [cheap] (with the app already running)
 Touchpoints: `commands.rs::run_single_capture`, `capture.rs::run_capture_cycle`

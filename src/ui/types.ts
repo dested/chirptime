@@ -49,6 +49,45 @@ export interface CaptureStatus {
 }
 
 /* ------------------------------------------------------------------ *
+ * Persisted settings + first-run onboarding. Mirrors `settings.rs` and
+ * `commands::EnvironmentInfo`.
+ * ------------------------------------------------------------------ */
+
+/** Mirrors `settings::Settings` — the whole of what survives a restart. */
+export interface Settings {
+  version: number;
+  capture: CaptureConfig;
+  /**
+   * Last-used `SessionOptions`, stored opaquely by the backend. `null` means
+   * never configured — merge over `DEFAULT_OPTIONS` rather than trusting it to
+   * be complete.
+   */
+  session: Partial<SessionOptions> | null;
+  onboarded: boolean;
+}
+
+/** Mirrors `settings::LegacyOutput`. Reported only; nothing is ever moved. */
+export interface LegacyOutput {
+  path: string;
+  day_count: number;
+  session_count: number;
+}
+
+/** Mirrors `commands::EnvironmentInfo`. */
+export interface EnvironmentInfo {
+  /** resolved and absolute — never `%USERPROFILE%\...` */
+  output_dir: string;
+  output_dir_exists: boolean;
+  disk_free_bytes: number | null;
+  disk_total_bytes: number | null;
+  /** null when ffmpeg is not installed — nothing records without it */
+  ffmpeg_path: string | null;
+  nvenc: boolean;
+  legacy_output: LegacyOutput | null;
+  settings_path: string;
+}
+
+/* ------------------------------------------------------------------ *
  * Continuous session recording — mirrors the manifest schema in
  * plans/2026-07-27-continuous-recording.md §3. Backend writes, we read.
  * ------------------------------------------------------------------ */

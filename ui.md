@@ -141,6 +141,22 @@ Weights in use: 500 / 600 / 700 only. No light weights, no italics.
   red = failed, slate = starting/stopped) → label → kind badge (`Screen` sky /
   `Cam` purple / `Mic`,`Sys` slate) → right-aligned `segments · bytes`. Restarts,
   gaps and the error string wrap onto indented sub-lines rather than a tooltip.
+- **Widget first run:** replaces both panes (and the mode switch) until it is
+  dismissed — same shape as a pane: scrollable body + one pinned footer button
+  ("Continue"). Order: `First run` eyebrow → `Where your recordings go` →
+  one-sentence lead → **Saving to** (the output-folder card) → any legacy-folder
+  advisory → three `Fact` rows (size, nothing is deleted, requirements) → **This
+  machine** (FFmpeg / NVIDIA encoder) → the settings-file path in 10px mono
+  slate-300. Inline, never a modal; the window is 320px wide.
+- **Output-folder card:** white `rounded-[10px]` bordered block holding the
+  **resolved absolute path** in 11px mono `break-all`, then free space + hours of
+  recording in 10px mono (amber-700 under two hours, otherwise slate-400), then
+  `Choose Folder` (native picker) + `Open` (Explorer). Used identically by the
+  first-run panel and by settings — one component, because "where are my
+  recordings" outlives day one.
+- **Requirement row:** dot + label + right-aligned mono value. The dot is
+  `slate-300` when satisfied and `amber-500` when not — nothing green, and the eye
+  is only drawn to what is missing.
 - **Widget settings:** an inline `bg-slate-50` card inside the pane — never a
   drawer. Eyebrow-labelled groups (Monitors / Sources / Quality / Output folder),
   `accent-sky-500` checkboxes, and full-width 12px selects. Disabled wholesale
@@ -184,7 +200,10 @@ patterns below rather than importing from there.
 
 | Pattern | File | Notes |
 | --- | --- | --- |
-| Custom titlebar + drag | `CompactApp.tsx` | `onMouseDown` → `appWindow.startDragging()`, ignores clicks landing on a `button` |
+| Custom titlebar + drag | `CompactApp.tsx` | `onMouseDown` → `appWindow.startDragging()`, ignores clicks landing on a `button`. Buttons, left to right: open recordings folder, minimize, close |
+| First-run panel | `CompactApp.tsx` (`Onboarding`) | Scroll body + pinned sky CTA; shown only while `settings.onboarded` is false |
+| Output-folder card | `CompactApp.tsx` (`OutputFolder`) | Path + free space + `Choose Folder` / `Open`; shared by first run and settings |
+| Fact row / Requirement row | `CompactApp.tsx` | 14px outline icon + 12px title + 11px muted body / dot + label + mono value |
 | Status chip + pulsing dot | `CompactApp.tsx` | `.dot-active` keyframes live in `app.css` |
 | Primary action button | `CompactApp.tsx` | sky when idle, red when recording |
 | Calendar grid | `ViewerApp.tsx` | days without captures render as inert transparent cells |
