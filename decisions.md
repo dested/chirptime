@@ -37,12 +37,12 @@ before anything is extracted or executed, unpacks only `ffmpeg.exe` and
 elevation), runs each binary once as a smoke test, and only then renames the
 staging directory into place. The user is told the size *before* pressing the
 button; nothing downloads on its own.
-**Why essentials, not full:** 105 MB instead of 170 MB, and verified against the
+**Why essentials, not full:** 110 MB instead of 180 MB, and verified against the
 actual archive to carry everything this app asks for — `libx264`, all three
 NVENC encoders, `h264_qsv` via libvpl, `aac`, the `drawtext` filter that burns in
 the timestamps, `overlay`, `scale`, and the `gdigrab` / `ddagrab` / `dshow`
 inputs. `ffplay.exe` (another ~100 MB) is deliberately not extracted.
-**Rejected:** bundling (licensing, above, plus 105 MB on every download for the
+**Rejected:** bundling (licensing, above, plus 110 MB on every download for the
 majority who already have FFmpeg); a silent background download (spending
 someone's bandwidth unasked); trusting HTTPS alone without a hash (we download an
 executable and then *run* it — TLS says who sent it, not what it is); extracting

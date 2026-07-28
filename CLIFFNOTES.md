@@ -21,11 +21,16 @@ FFmpeg for everything capture-related.
 - **Rust entry:** `src-tauri/src/main.rs` → `chirptime_lib::run()` in `lib.rs`
 - **Type-check:** `bunx tsc --noEmit` (frontend) · `cargo check` in `src-tauri/`
 - **Build:** `bun run build` (Tauri release bundle)
-- **Test:** `cargo test --lib` and `cargo test --test settings_persistence` —
-  **never plain `cargo test`**, which would run `tests/live_session.rs` and record.
-  No frontend test runner.
+- **Test:** `cargo test --lib`, `cargo test --test settings_persistence`, and
+  `cargo test --test ffmpeg_install` — **never plain `cargo test`**, which would
+  run `tests/live_session.rs` and record. The FFmpeg install's real end-to-end
+  test is `#[ignore]`d (it pulls ~110 MB); run it with
+  `cargo test --test ffmpeg_install -- --ignored`. No frontend test runner.
 - **Settings:** `%APPDATA%\com.chirptime.app\settings.json` — output dir, capture
-  config, session options, and the first-run flag. Missing/corrupt → defaults.
+  config, session options, the first-run flag, and a hand-picked `ffmpeg_dir`.
+  Missing/corrupt → defaults.
+- **FFmpeg:** not bundled. Found on PATH / `C:\ffmpeg\bin` / a picked folder, or
+  fetched on first run into `%APPDATA%\com.chirptime.app\ffmpeg\bin`.
 - **Media URLs:** everything under `output/` is served at
   `http://localhost:9120/files/<relative/path>` by an in-process Warp server —
   the Tauri asset protocol is NOT used.
@@ -416,7 +421,7 @@ from that window is denied.
   `FFMPEG_SHA256`, `FFMPEG_ZIP_BYTES`. Bumping the version means re-deriving the
   hash; the module doc says how it was cross-checked.
 - **`tests/ffmpeg_install.rs` is `#[ignore]`d and must stay that way** — it pulls
-  ~105 MB and writes ~200 MB into `%APPDATA%`. Run it deliberately with
+  ~110 MB and writes ~200 MB into `%APPDATA%`. Run it deliberately with
   `cargo test --test ffmpeg_install -- --ignored`.
 - **`SessionOptions` is read once, when `start_session` spawns the tracks.** The
   settings panel is disabled while recording for that reason; changing anything

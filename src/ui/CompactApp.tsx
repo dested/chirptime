@@ -487,9 +487,14 @@ const PHASE_LABEL: Record<FfmpegProgress["phase"], string> = {
 function FfmpegSetupCard({
   setup,
   onResolved,
+  // The banner sits above the panes in a 540px-tall window, so it drops the
+  // install path and the long explanation. The first-run panel scrolls and has
+  // room to say the whole thing.
+  compact = false,
 }: {
   setup: FfmpegSetup;
   onResolved: () => void;
+  compact?: boolean;
 }) {
   const [progress, setProgress] = useState<FfmpegProgress | null>(null);
   const [busy, setBusy] = useState(false);
@@ -558,8 +563,9 @@ function FfmpegSetupCard({
         ? Math.min(100, Math.round((progress.downloaded_bytes / progress.total_bytes) * 100))
         : 0;
     return (
-      <div className="flex flex-col gap-1.5">
-        <div className="flex items-baseline justify-between gap-2">
+      // Spans, not divs: this renders inside `Notice`, whose body is a <span>.
+      <span className="flex flex-col gap-1.5">
+        <span className="flex items-baseline justify-between gap-2">
           <span className="text-[11px] font-semibold text-slate-900">
             {PHASE_LABEL[progress.phase]}
           </span>
@@ -568,39 +574,51 @@ function FfmpegSetupCard({
               {fmtBytes(progress.downloaded_bytes)} / {fmtBytes(progress.total_bytes)}
             </span>
           )}
-        </div>
-        <div className="h-1.5 w-full rounded-full bg-slate-100 overflow-hidden">
-          <div
-            className={`h-full rounded-full bg-sky-500 transition-[width] duration-200 ${
+        </span>
+        <span className="block h-1.5 w-full rounded-full bg-slate-100 overflow-hidden">
+          <span
+            className={`block h-full rounded-full bg-sky-500 transition-[width] duration-200 ${
               progress.phase === "downloading" ? "" : "animate-pulse"
             }`}
             style={{ width: progress.phase === "downloading" ? `${pct}%` : "100%" }}
           />
-        </div>
+        </span>
         <span className="text-[10px] text-slate-400 leading-snug">
           Leave this open. Nothing is installed until the download has been checked
           against its expected checksum.
         </span>
-      </div>
+      </span>
     );
   }
 
   return (
-    <div className="flex flex-col gap-1.5">
+    <span className="flex flex-col gap-1.5">
       <span className="text-[11px] leading-snug text-slate-600">
-        ChirpTime records through FFmpeg and cannot capture anything without it.
-        ChirpTime can fetch it for you — about {fmtBytes(setup.download_bytes)}, verified
-        against a known checksum and installed just for you, no admin needed.
+        {compact ? (
+          <>
+            Nothing can be captured without it. ChirpTime can fetch it for you —{" "}
+            {fmtBytes(setup.download_bytes)}, checksum-verified, no admin needed.
+          </>
+        ) : (
+          <>
+            ChirpTime records through FFmpeg and cannot capture anything without it.
+            ChirpTime can fetch it for you — about {fmtBytes(setup.download_bytes)},
+            verified against a known checksum and installed just for you, no admin
+            needed.
+          </>
+        )}
       </span>
-      <span className="text-[10px] text-slate-400 font-mono break-all leading-snug">
-        {setup.install_dir}
-      </span>
-
-      {error && (
-        <div className="text-[10px] leading-snug text-red-600 break-words">{error}</div>
+      {!compact && (
+        <span className="text-[10px] text-slate-400 font-mono break-all leading-snug">
+          {setup.install_dir}
+        </span>
       )}
 
-      <div className="flex flex-col gap-1.5 mt-0.5">
+      {error && (
+        <span className="block text-[10px] leading-snug text-red-600 break-words">{error}</span>
+      )}
+
+      <span className="flex flex-col gap-1.5 mt-0.5">
         <button
           className="w-full py-1.5 rounded-lg text-[11px] font-semibold cursor-pointer border-none bg-sky-500 text-white hover:bg-sky-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           onClick={() => void download()}
@@ -608,7 +626,7 @@ function FfmpegSetupCard({
         >
           {error ? "Try Again" : `Download FFmpeg (${fmtBytes(setup.download_bytes)})`}
         </button>
-        <div className="flex gap-1.5">
+        <span className="flex gap-1.5">
           <button
             className={`${SECONDARY_BTN} flex-1 py-1 text-[11px]`}
             onClick={() => void locate()}
@@ -624,8 +642,8 @@ function FfmpegSetupCard({
           >
             Re-check
           </button>
-        </div>
-      </div>
+        </span>
+      </span>
 
       <button
         className="self-start text-[10px] text-slate-400 hover:text-slate-600 bg-transparent border-none p-0 cursor-pointer underline"
@@ -633,7 +651,7 @@ function FfmpegSetupCard({
       >
         Or install it yourself
       </button>
-    </div>
+    </span>
   );
 }
 
@@ -646,7 +664,7 @@ function FfmpegBanner({ setup, onResolved }: { setup: FfmpegSetup; onResolved: (
     <div className="px-4 pt-3">
       <Notice tone="error">
         <span className="block font-semibold mb-1">FFmpeg is not installed</span>
-        <FfmpegSetupCard setup={setup} onResolved={onResolved} />
+        <FfmpegSetupCard setup={setup} onResolved={onResolved} compact />
       </Notice>
     </div>
   );

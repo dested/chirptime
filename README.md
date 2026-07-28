@@ -20,9 +20,9 @@ Nothing is uploaded anywhere, and nothing is ever deleted for you.
 Grab the latest Windows installer from the
 [releases page](https://github.com/dested/chirptime/releases/latest):
 
-- **`ChirpTime_x.y.z_x64-setup.exe`** — the usual choice.
-- **`ChirpTime_x.y.z_x64.msi`** — same app, MSI installer.
-- **`ChirpTime_x.y.z_x64-portable.zip`** — just the executable, no installer.
+- **`ChirpTime_1.0.0_x64-setup.exe`** — the usual choice.
+- **`ChirpTime_1.0.0_x64.msi`** — same app, MSI installer.
+- **`ChirpTime_1.0.0_x64-portable.zip`** — just the executable, no installer.
 
 ### About that SmartScreen warning
 
@@ -46,7 +46,7 @@ Mac or Linux build.
 **FFmpeg.** ChirpTime records by driving FFmpeg, so without it nothing captures
 at all — but you don't have to go and get it yourself. On first run, if FFmpeg
 isn't already on your machine, ChirpTime offers to fetch it: it tells you the
-size (about 105 MB) up front and waits for you to press the button. Nothing is
+size (about 110 MB) up front and waits for you to press the button. Nothing is
 downloaded unless you say so.
 
 What it does when you do say so: downloads a known, pinned

@@ -55,8 +55,11 @@ jobs:
           New-Item -ItemType Directory -Force dist-release | Out-Null
           $version = "${{ github.ref_name }}" -replace '^v', ''
 
-          $msi = Get-ChildItem src-tauri/target/release/bundle/msi/*.msi | Select-Object -First 1
-          $nsis = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          # Matched on the tag's version rather than a bare *.msi: the Rust cache
+          # can carry a previous run's bundle directory forward, and picking the
+          # wrong one would publish a stale build under a new tag.
+          $msi = Get-ChildItem "src-tauri/target/release/bundle/msi/*_${version}_*.msi" | Select-Object -First 1
+          $nsis = Get-ChildItem "src-tauri/target/release/bundle/nsis/*_${version}_*-setup.exe" | Select-Object -First 1
           # Cargo names the binary after the crate (`chirptime`), not after
           # productName — verified against a local `tauri build`.
           $exe = Get-Item src-tauri/target/release/chirptime.exe
@@ -87,7 +90,7 @@ jobs:
 
           - Windows 10 or 11.
           - **FFmpeg.** You do not need to install it yourself. On first run, if it is
-            not already on your machine, ChirpTime tells you the size (~105 MB) and
+            not already on your machine, ChirpTime tells you the size (~110 MB) and
             offers to fetch it — nothing downloads until you press the button. The
             archive is verified against a SHA-256 hash built into the app before
             anything is unpacked or run, and it installs per-user with no admin

@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 // ---------------------------------------------------------------------------
 
 /// gyan.dev's **essentials** build, mirrored as an immutable GitHub release
-/// asset. Essentials rather than "full" because it is 105 MB instead of 170 MB
+/// asset. Essentials rather than "full" because it is 110 MB instead of 180 MB
 /// and — verified against this exact archive on 2026-07-27 — still carries
 /// every encoder, filter and input device ChirpTime asks for: `libx264`,
 /// `h264_nvenc` / `av1_nvenc` / `hevc_nvenc`, `h264_qsv` (via libvpl), `aac`,
@@ -122,7 +122,7 @@ pub struct Progress {
 }
 
 /// One progress event per megabyte. Often enough that a stalled download is
-/// visibly stalled, rare enough that a 105 MB transfer is ~105 IPC messages.
+/// visibly stalled, rare enough that a 110 MB transfer is ~110 IPC messages.
 const PROGRESS_STEP_BYTES: u64 = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -159,7 +159,7 @@ pub fn install(mut on_progress: impl FnMut(Progress)) -> Result<PathBuf, String>
             .map_err(|e| format!("Could not create {}: {e}", staging.display()))?;
         extract_binaries(&part, &staging)?;
 
-        // The zip is ~105 MB and we keep ~200 MB of binaries; dropping it here
+        // The zip is ~110 MB and we keep ~200 MB of binaries; dropping it here
         // rather than at the end halves the peak disk requirement.
         let _ = std::fs::remove_file(&part);
 
@@ -199,7 +199,7 @@ pub fn install(mut on_progress: impl FnMut(Progress)) -> Result<PathBuf, String>
 
 /// Stream `url` to `dest`, hashing as it goes, and delete it unless the hash
 /// matches `expected`. The file is hashed *while* being written rather than
-/// re-read afterwards, so a 105 MB download is not read twice and there is no
+/// re-read afterwards, so a 110 MB download is not read twice and there is no
 /// window in which an unverified file sits complete on disk under a name
 /// anything would use.
 ///
