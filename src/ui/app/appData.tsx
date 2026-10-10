@@ -12,6 +12,7 @@ import type { ReactNode } from "react";
 import type { EnvironmentInfo, SessionManifest, SessionStatus, SessionSummary, SessionTrashReceipt } from "../types";
 import { listen } from "@tauri-apps/api/event";
 import { countExports, fetchSession, getEnvironment, getSessionStatus, listSessions, undoDeleteSession } from "../hooks/useApi";
+import { EXPORTS_CHANGED } from "../export/api";
 import { getRecorderControl, resumeSession, startRecording, stopRecording, type RecorderControl } from "../recorder/api";
 
 export function errorText(e: unknown): string {
@@ -174,7 +175,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   }, [sessions]);
 
   // The Exports count: read at start, whenever an export finishes, and when the
-  // window comes back into focus (an export deleted on the Exports page).
+  // window comes back into focus, and when the Exports page adds or deletes one.
   const [exportCount, setExportCount] = useState<number | null>(null);
   useEffect(() => {
     let alive = true;
@@ -186,6 +187,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     const onHash = () => void read();
     window.addEventListener("hashchange", onHash);
     window.addEventListener("focus", onHash);
+    window.addEventListener(EXPORTS_CHANGED, onHash);
     const off = listen<{ state?: unknown }>("export-progress", (e) => {
       if (e.payload.state === "done") void read();
     });
@@ -193,6 +195,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       alive = false;
       window.removeEventListener("hashchange", onHash);
       window.removeEventListener("focus", onHash);
+      window.removeEventListener(EXPORTS_CHANGED, onHash);
       void off.then((f) => f()).catch(() => {});
     };
   }, []);
