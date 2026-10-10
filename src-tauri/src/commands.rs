@@ -860,7 +860,9 @@ pub async fn list_sessions(
         let s = state.lock().await;
         sessions_root_for(&s.config)
     };
-    Ok(tokio::task::spawn_blocking(move || crate::recorder::list_sessions(&root))
+    // `edit::visible_sessions` is `recorder::list_sessions` minus the `.trash`
+    // folder whole-session deletes park in.
+    Ok(tokio::task::spawn_blocking(move || crate::edit::visible_sessions(&root))
         .await
         .map_err(|e| e.to_string())?)
 }
@@ -926,6 +928,104 @@ pub async fn rebuild_session(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------------
+// Deleting time (see edit.rs)
+// ---------------------------------------------------------------------------
+
+/// The sessions root, and `id`'s directory under it, refusing the session that
+/// is recording.
+async fn editable_session(state: &State, id: &str) -> Result<(PathBuf, PathBuf), String> {
+    crate::edit::check_id(id)?;
+    let s = state.lock().await;
+    if let Some(rec) = &s.recorder {
+        if rec.manifest().id == id {
+            return Err(crate::edit::LIVE_SESSION_ERR.to_string());
+        }
+    }
+    let root = sessions_root_for(&s.config);
+    let dir = root.join(id);
+    Ok((root, dir))
+}
+
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(f).await.map_err(|e| e.to_string())?
+}
+
+/// After the undo window, finalize whatever cuts in `dir` are due.
+fn schedule_finalize(dir: PathBuf) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(crate::edit::FINALIZE_AFTER_MS)).await;
+        if let Err(e) = blocking(move || crate::edit::finalize_due_cuts(&dir)).await {
+            eprintln!("[chirptime] edit: finalize failed: {}", e);
+        }
+    });
+}
+
+/// Delete `[from_epoch_ms, to_epoch_ms)` from a session, on every track or only
+/// on `tracks`. Disk is freed after a 10s undo window.
+#[tauri::command]
+pub async fn delete_range(
+    state: tauri::State<'_, State>,
+    id: String,
+    from_epoch_ms: i64,
+    to_epoch_ms: i64,
+    tracks: Option<Vec<String>>,
+) -> Result<crate::edit::CutReceipt, String> {
+    let (_, dir) = editable_session(state.inner(), &id).await?;
+    let d = dir.clone();
+    let receipt =
+        blocking(move || crate::edit::delete_range(&d, from_epoch_ms, to_epoch_ms, tracks)).await?;
+    schedule_finalize(dir);
+    Ok(receipt)
+}
+
+#[tauri::command]
+pub async fn undo_cut(
+    state: tauri::State<'_, State>,
+    id: String,
+    cut_id: String,
+) -> Result<crate::session::SessionManifest, String> {
+    let (_, dir) = editable_session(state.inner(), &id).await?;
+    blocking(move || crate::edit::undo_cut(&dir, &cut_id)).await
+}
+
+/// Finalize every pending cut in a session now, without waiting out the undo window.
+#[tauri::command]
+pub async fn finalize_cuts(
+    state: tauri::State<'_, State>,
+    id: String,
+) -> Result<crate::session::SessionManifest, String> {
+    let (_, dir) = editable_session(state.inner(), &id).await?;
+    blocking(move || crate::edit::finalize_cuts(&dir)).await
+}
+
+/// Delete a whole session: instant, undoable for 10s, then purged.
+#[tauri::command]
+pub async fn delete_session(
+    state: tauri::State<'_, State>,
+    id: String,
+) -> Result<crate::edit::SessionTrashReceipt, String> {
+    let (root, _) = editable_session(state.inner(), &id).await?;
+    let (r, i) = (root.clone(), id.clone());
+    let receipt = blocking(move || crate::edit::delete_session(&r, &i)).await?;
+    let token = receipt.undo_until_epoch_ms;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(crate::edit::FINALIZE_AFTER_MS)).await;
+        if let Err(e) = blocking(move || crate::edit::purge_session(&root, &id, token)).await {
+            eprintln!("[chirptime] edit: purge failed: {}", e);
+        }
+    });
+    Ok(receipt)
+}
+
+#[tauri::command]
+pub async fn undo_delete_session(state: tauri::State<'_, State>, id: String) -> Result<(), String> {
+    let (root, _) = editable_session(state.inner(), &id).await?;
+    blocking(move || crate::edit::undo_delete_session(&root, &id)).await
 }
 
 /// One row of the monitor picker: the raw DXGI output plus the recorder's own

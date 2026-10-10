@@ -196,6 +196,40 @@ export interface SessionManifest {
   error?: string | null;
   /** true when this manifest was reconstructed by scanning the directory */
   rebuilt: boolean;
+  /** deleted ranges, pending or final (never undone) — holes playback skips */
+  cuts: Cut[];
+}
+
+/** `session::CutState`, serialized kebab-case. */
+export type CutState = "pending" | "final" | "undone";
+
+/** Mirrors `session::Cut`: a deleted block of time, remembered forever. */
+export interface Cut {
+  /** `cut-<epoch_ms of creation>` */
+  id: string;
+  from_epoch_ms: number;
+  to_epoch_ms: number;
+  /** omitted by serde when the cut covers every track */
+  tracks?: string[] | null;
+  created_epoch_ms: number;
+  /** pending = still undoable, files parked; final = disk freed */
+  state: CutState;
+  freed_bytes: number;
+}
+
+/** Mirrors `edit::CutReceipt`, returned by `delete_range`. */
+export interface CutReceipt {
+  cut: Cut;
+  freed_bytes_estimate: number;
+  /** after this, `undoCut` rejects */
+  undo_until_epoch_ms: number;
+}
+
+/** Mirrors `edit::SessionTrashReceipt`, returned by `delete_session`. */
+export interface SessionTrashReceipt {
+  id: string;
+  bytes: number;
+  undo_until_epoch_ms: number;
 }
 
 /**

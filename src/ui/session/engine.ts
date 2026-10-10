@@ -16,6 +16,8 @@
  */
 import type { SessionManifest, SessionTrack } from "../types";
 import { mediaUrl } from "../hooks/mediaUrl";
+import { holeAt, nextHole, sessionHoles, skipHoles, trackHoles } from "./cuts";
+import type { Hole } from "./cuts";
 
 export const RESYNC_INTERVAL_MS = 250;
 /** |drift| above this → hard seek */
@@ -102,14 +104,22 @@ export const SEAM_TOLERANCE_MS = 250;
  * Last segment whose [start, start+duration) contains epochMs, tolerating short
  * seams. Binary search, so it stays cheap over a 6-hour session.
  *
+ * Inside one of `holes` (deleted time, see cuts.ts) there is nothing to play,
+ * even where a keyframe-snapped segment still physically covers it.
+ *
  * Everything is derived from each segment's own `start_epoch_ms` and
  * `duration_ms`. Nothing here assumes segments are uniform, contiguous, or
  * ordered-without-overlap in time — real durations are ragged (4s/14s/16s for a
  * nominal 15s) and consecutive segments can overlap.
  */
-export function segmentAt(track: SessionTrack, epochMs: number): SegmentHit | null {
+export function segmentAt(
+  track: SessionTrack,
+  epochMs: number,
+  holes: readonly Hole[] = [],
+): SegmentHit | null {
   const segs = track.segments;
   if (!segs.length) return null;
+  if (holeAt(holes, epochMs)) return null;
 
   let lo = 0;
   let hi = segs.length - 1;
@@ -196,10 +206,13 @@ class TrackController {
   private endEpoch: number;
   private startEpoch: number;
   private lastHardSeekAt = 0;
+  /** deleted time on this track, whole-session cuts included */
+  private holes: Hole[];
 
-  constructor(sessionId: string, track: SessionTrack) {
+  constructor(sessionId: string, track: SessionTrack, holes: Hole[]) {
     this.sessionId = sessionId;
     this.track = track;
+    this.holes = holes;
     this.debug = emptyDebug(track.id);
     this.endEpoch = trackEndEpochMs(track);
     this.startEpoch = trackStartEpochMs(track);
@@ -296,7 +309,7 @@ class TrackController {
     const d = this.debug;
     if (!els) return;
 
-    const hit = segmentAt(this.track, master);
+    const hit = segmentAt(this.track, master, this.holes);
 
     if (!hit) {
       d.state = master >= this.endEpoch ? "ended" : master < this.startEpoch ? "pending" : "gap";
@@ -305,12 +318,14 @@ class TrackController {
       d.displayedEpochMs = null;
       for (const el of els) if (!el.paused) el.pause();
       // Park the upcoming segment on the active element so resuming from a gap
-      // (or from before the track started) is instant.
-      const upcoming = nextSegmentIndex(this.track, master);
+      // (or from before the track started) is instant. Inside a cut, "upcoming"
+      // is wherever the cut ends — never the deleted footage it still overlaps.
+      const resume = skipHoles(this.holes, master);
+      const upcoming = nextSegmentIndex(this.track, resume);
       if (upcoming >= 0 && this.elSeg[this.activeIdx] !== upcoming) {
         this.loadInto(this.activeIdx, upcoming);
         this.activeSeg = -1;
-        this.seek(els[this.activeIdx], 0);
+        this.seek(els[this.activeIdx], Math.max(0, resume - this.track.segments[upcoming].start_epoch_ms) / 1000);
       }
       d.readyState = els[this.activeIdx].readyState;
       return;
@@ -410,9 +425,20 @@ class TrackController {
     if (!standby.paused) standby.pause();
 
     /* ---- pre-roll the next segment ---- */
-    if (playing && hit.index + 1 < this.track.segments.length) {
-      const seg = this.track.segments[hit.index];
-      const remaining = seg.start_epoch_ms + seg.duration_ms - master;
+    const seg = this.track.segments[hit.index];
+    const segEnd = seg.start_epoch_ms + seg.duration_ms;
+    const hole = nextHole(this.holes, master);
+    if (playing && hole && hole.from < segEnd && hole.from - master <= PRELOAD_LEAD_MS) {
+      // A cut is coming before this segment ends: what plays next is wherever
+      // the cut ends, part-way into some later segment.
+      const after = segmentAt(this.track, hole.to, this.holes);
+      const other = (this.activeIdx ^ 1) as 0 | 1;
+      if (after && after.index !== hit.index && this.elSeg[other] !== after.index) {
+        this.loadInto(other, after.index);
+        this.seek(els[other], after.offsetMs / 1000);
+      }
+    } else if (playing && hit.index + 1 < this.track.segments.length) {
+      const remaining = segEnd - master;
       if (remaining <= PRELOAD_LEAD_MS) {
         const other = (this.activeIdx ^ 1) as 0 | 1;
         if (this.elSeg[other] !== hit.index + 1) {
@@ -430,6 +456,8 @@ export class SyncEngine {
   readonly manifest: SessionManifest;
   readonly start: number;
   readonly end: number;
+  /** time deleted from the whole session; the clock never rests inside one */
+  readonly holes: Hole[];
 
   masterEpochMs: number;
   playing = false;
@@ -457,9 +485,10 @@ export class SyncEngine {
     const b = sessionBounds(manifest);
     this.start = b.start;
     this.end = b.end;
-    this.masterEpochMs = b.start;
+    this.holes = sessionHoles(manifest);
+    this.masterEpochMs = this.skipCuts(b.start);
     for (const t of manifest.tracks) {
-      this.controllers.set(t.id, new TrackController(manifest.id, t));
+      this.controllers.set(t.id, new TrackController(manifest.id, t, trackHoles(manifest, t.id)));
     }
   }
 
@@ -499,8 +528,13 @@ export class SyncEngine {
 
   /* ---- transport ---- */
 
+  /** Where the clock may rest: out of any whole-session cut, within bounds. */
+  private skipCuts(epochMs: number): number {
+    return Math.min(this.end, skipHoles(this.holes, epochMs));
+  }
+
   setPlaying(v: boolean) {
-    if (v && this.masterEpochMs >= this.end - 20) this.masterEpochMs = this.start;
+    if (v && this.masterEpochMs >= this.end - 20) this.masterEpochMs = this.skipCuts(this.start);
     this.playing = v;
     this.lastPerf = performance.now();
     this.tickAll(true);
@@ -518,7 +552,7 @@ export class SyncEngine {
   }
 
   seekTo(epochMs: number) {
-    this.masterEpochMs = Math.min(this.end, Math.max(this.start, epochMs));
+    this.masterEpochMs = this.skipCuts(Math.min(this.end, Math.max(this.start, epochMs)));
     this.lastPerf = performance.now();
     for (const c of this.controllers.values()) c.clearSeekCooldown();
     this.tickAll(true);
@@ -585,8 +619,19 @@ export class SyncEngine {
     const dt = now - this.lastPerf;
     this.lastPerf = now;
 
+    let jumped = false;
     if (this.playing) {
       this.masterEpochMs += dt * this.rate;
+      /* Entering a cut that covers every track: jump straight to its end, on
+       * the same per-frame path as a segment boundary. The jump is deliberate,
+       * so every element may hard-seek this very tick — playing even one
+       * resync interval of the deleted footage is not acceptable. */
+      const skipped = skipHoles(this.holes, this.masterEpochMs);
+      if (skipped !== this.masterEpochMs) {
+        this.masterEpochMs = skipped;
+        jumped = true;
+        for (const c of this.controllers.values()) c.clearSeekCooldown();
+      }
       if (this.masterEpochMs >= this.end) {
         this.masterEpochMs = this.end;
         this.playing = false;
@@ -597,7 +642,7 @@ export class SyncEngine {
       }
     }
 
-    const resync = now - this.lastResync >= RESYNC_INTERVAL_MS;
+    const resync = jumped || now - this.lastResync >= RESYNC_INTERVAL_MS;
     if (resync) this.lastResync = now;
     this.tickAll(resync);
 

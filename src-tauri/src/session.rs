@@ -12,6 +12,9 @@ use std::path::Path;
 pub const MANIFEST_VERSION: u32 = 1;
 pub const MANIFEST_FILE: &str = "session.json";
 pub const MARKERS_FILE: &str = "markers.jsonl";
+/// Durable record of every time-range delete (see `edit.rs`). One JSON `Cut` per
+/// line, appended on every state change; the last line per id wins.
+pub const CUTS_FILE: &str = "cuts.jsonl";
 
 /// Filename pattern handed to ffmpeg's `-strftime 1` segment muxer.
 pub const SEGMENT_STRFTIME: &str = "%Y%m%d-%H%M%S";
@@ -38,7 +41,7 @@ pub struct MonitorRef {
     pub h: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Segment {
     pub file: String,
     pub start_epoch_ms: i64,
@@ -53,10 +56,37 @@ pub struct Gap {
     pub reason: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Marker {
     pub epoch_ms: i64,
     pub label: String,
+}
+
+/// A deleted block of time. The session keeps its id and the cut is remembered
+/// forever, so playback and the timeline can collapse the hole — and so the up to
+/// one GOP of footage that survives at each keyframe-snapped edge stays masked.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Cut {
+    /// `cut-<epoch_ms of creation>`
+    pub id: String,
+    pub from_epoch_ms: i64,
+    pub to_epoch_ms: i64,
+    /// None = every track.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracks: Option<Vec<String>>,
+    pub created_epoch_ms: i64,
+    /// Pending = inside the undo window, files parked in .trash. Final = files gone.
+    pub state: CutState,
+    #[serde(default)]
+    pub freed_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CutState {
+    Pending,
+    Final,
+    Undone,
 }
 
 /// Lifecycle of one track. Additive to the §3 schema so the UI can distinguish
@@ -139,6 +169,10 @@ pub struct SessionManifest {
     /// True when this manifest was reconstructed by scanning the directory.
     #[serde(default)]
     pub rebuilt: bool,
+    /// Deleted ranges, `Pending` or `Final` (never `Undone`). `cuts.jsonl` is the
+    /// durable copy; `read_manifest` and the rebuild repopulate this from it.
+    #[serde(default)]
+    pub cuts: Vec<Cut>,
 }
 
 impl SessionManifest {
@@ -154,6 +188,7 @@ impl SessionManifest {
             markers: Vec::new(),
             error: None,
             rebuilt: false,
+            cuts: Vec::new(),
         }
     }
 
@@ -229,7 +264,13 @@ pub fn write_manifest(session_dir: &Path, manifest: &SessionManifest) -> Result<
 pub fn read_manifest(session_dir: &Path) -> Result<SessionManifest, String> {
     let path = session_dir.join(MANIFEST_FILE);
     let data = std::fs::read_to_string(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
-    serde_json::from_str(&data).map_err(|e| format!("{}: {}", path.display(), e))
+    let mut m: SessionManifest =
+        serde_json::from_str(&data).map_err(|e| format!("{}: {}", path.display(), e))?;
+    // The sidecar outranks whatever the manifest last carried.
+    if session_dir.join(CUTS_FILE).is_file() {
+        m.cuts = active_cuts(session_dir);
+    }
+    Ok(m)
 }
 
 pub fn append_marker(session_dir: &Path, marker: &Marker) -> Result<(), String> {
@@ -252,6 +293,49 @@ pub fn read_markers(session_dir: &Path) -> Vec<Marker> {
     data.lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<Marker>(l).ok())
+        .collect()
+}
+
+pub fn append_cut(session_dir: &Path, cut: &Cut) -> Result<(), String> {
+    use std::io::Write;
+    let path = session_dir.join(CUTS_FILE);
+    let line = serde_json::to_string(cut).map_err(|e| e.to_string())?;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| format!("{}: {}", path.display(), e))?;
+    writeln!(f, "{}", line).map_err(|e| e.to_string())?;
+    f.sync_all().map_err(|e| e.to_string())
+}
+
+/// Every cut ever made in this session, in creation order, each in its latest
+/// state (the last line per id wins). Includes `Undone` ones.
+pub fn read_cuts(session_dir: &Path) -> Vec<Cut> {
+    let path = session_dir.join(CUTS_FILE);
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Cut> = Vec::new();
+    for c in data
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str::<Cut>(l).ok())
+    {
+        match out.iter_mut().find(|o| o.id == c.id) {
+            Some(o) => *o = c,
+            None => out.push(c),
+        }
+    }
+    out.sort_by_key(|c| (c.created_epoch_ms, c.id.clone()));
+    out
+}
+
+/// The cuts a manifest carries: everything but `Undone`.
+pub fn active_cuts(session_dir: &Path) -> Vec<Cut> {
+    read_cuts(session_dir)
+        .into_iter()
+        .filter(|c| c.state != CutState::Undone)
         .collect()
 }
 
@@ -434,18 +518,31 @@ pub fn rebuild_manifest_from_disk(session_dir: &Path) -> Result<SessionManifest,
         prior.as_ref().map(|p| p.desktop).unwrap_or_default(),
     );
     manifest.rebuilt = true;
+    manifest.cuts = if session_dir.join(CUTS_FILE).is_file() {
+        active_cuts(session_dir)
+    } else {
+        prior.as_ref().map(|p| p.cuts.clone()).unwrap_or_default()
+    };
     manifest.markers = read_markers(session_dir);
     if manifest.markers.is_empty() {
         if let Some(p) = &prior {
             manifest.markers = p.markers.clone();
         }
     }
+    // markers.jsonl is append-only, so a marker inside a deleted range is still
+    // in it. The cut is what says it is gone.
+    let cuts = manifest.cuts.clone();
+    manifest
+        .markers
+        .retain(|mk| !cuts.iter().any(|c| mk.epoch_ms >= c.from_epoch_ms && mk.epoch_ms < c.to_epoch_ms));
 
     let mut track_dirs: Vec<String> = std::fs::read_dir(session_dir)
         .map_err(|e| e.to_string())?
         .flatten()
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|e| e.file_name().to_string_lossy().to_string())
+        // `.trash` holds files parked by a pending delete; they are not footage.
+        .filter(|n| !n.starts_with('.'))
         .collect();
     track_dirs.sort();
 

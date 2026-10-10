@@ -1,5 +1,8 @@
 mod capture;
 mod commands;
+// Public so the cut / undo / finalize paths can be exercised on synthetic
+// sessions in `tests/edit_cuts.rs`.
+pub mod edit;
 // Public so the pin (URL + SHA-256) and the install layout can be asserted
 // without a window system.
 pub mod ffmpeg_install;
@@ -41,6 +44,11 @@ pub fn run() {
         settings::settings_path().display(),
         saved.capture.output_dir
     );
+    // Finish deletes a previous run left half done (crash recovery for
+    // `edit.rs`). Nothing can be recording yet, and it never blocks startup.
+    let recovery_root = recorder::sessions_root(&capture::get_output_dir(&saved.capture));
+    std::thread::spawn(move || edit::recover_sessions(&recovery_root));
+
     let app_state = Arc::new(Mutex::new(AppState::from_settings(saved)));
 
     // Start file server in background
@@ -93,6 +101,12 @@ pub fn run() {
             commands::add_marker,
             commands::rebuild_session,
             commands::list_display_outputs,
+            // Deleting time
+            commands::delete_range,
+            commands::undo_cut,
+            commands::finalize_cuts,
+            commands::delete_session,
+            commands::undo_delete_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

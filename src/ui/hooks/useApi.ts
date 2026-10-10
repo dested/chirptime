@@ -6,6 +6,7 @@ import type {
   MonitorConfig,
   CaptureConfig,
   CaptureStatus,
+  CutReceipt,
   EnvironmentInfo,
   FfmpegSetup,
   SessionManifest,
@@ -13,6 +14,7 @@ import type {
   SessionOptions,
   SessionStatus,
   SessionSummary,
+  SessionTrashReceipt,
   Settings,
 } from "../types";
 import { mediaUrl } from "./mediaUrl";
@@ -201,7 +203,9 @@ export async function fetchSession(id: string): Promise<SessionManifest> {
   try {
     return await invoke<SessionManifest>("get_session", { id });
   } catch {
-    return fetchJson<SessionManifest>(`sessions/${id}/session.json`);
+    const m = await fetchJson<SessionManifest>(`sessions/${id}/session.json`);
+    // A manifest written before cuts existed has no `cuts` key.
+    return { ...m, cuts: m.cuts ?? [] };
   }
 }
 
@@ -230,6 +234,46 @@ export async function addMarker(label: string): Promise<SessionMarker> {
 /** Reconstruct a manifest by scanning the session directory and probing every segment. */
 export async function rebuildSession(id: string): Promise<SessionManifest> {
   return invoke<SessionManifest>("rebuild_session", { id });
+}
+
+/* ---- deleting time ------------------------------------------------------ *
+ * Every delete is instant and undoable until `undo_until_epoch_ms` (10s); the
+ * backend frees the disk ~12s after. All of these reject with a message meant
+ * for the user, e.g. "Stop recording before deleting from this session".
+ * ---------------------------------------------------------------------- */
+
+/** Delete `[fromEpochMs, toEpochMs)` from a session; `tracks` limits it (default: all). */
+export async function deleteRange(
+  id: string,
+  fromEpochMs: number,
+  toEpochMs: number,
+  tracks?: string[],
+): Promise<CutReceipt> {
+  return invoke<CutReceipt>("delete_range", {
+    id,
+    fromEpochMs,
+    toEpochMs,
+    tracks: tracks ?? null,
+  });
+}
+
+/** Put a pending delete back. Resolves to the restored manifest. */
+export async function undoCut(id: string, cutId: string): Promise<SessionManifest> {
+  return invoke<SessionManifest>("undo_cut", { id, cutId });
+}
+
+/** Free the disk for every pending delete in a session now, giving up undo. */
+export async function finalizeCuts(id: string): Promise<SessionManifest> {
+  return invoke<SessionManifest>("finalize_cuts", { id });
+}
+
+/** Delete a whole session; it drops out of `listSessions` at once. */
+export async function deleteSession(id: string): Promise<SessionTrashReceipt> {
+  return invoke<SessionTrashReceipt>("delete_session", { id });
+}
+
+export async function undoDeleteSession(id: string): Promise<void> {
+  return invoke("undo_delete_session", { id });
 }
 
 /** DXGI outputs with the recorder's own `screen_index` and a real capturable flag. */
