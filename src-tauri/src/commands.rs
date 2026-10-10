@@ -1161,8 +1161,10 @@ pub async fn open_viewer(
         "viewer",
         tauri::WebviewUrl::App(url.into()),
     )
-    .title("ChirpTime - Viewer")
+    .title("ChirpTime")
     .inner_size(1280.0, 800.0)
+    .min_inner_size(1024.0, 700.0)
+    .resizable(true)
     .build()
     .map_err(|e| e.to_string())?;
 

@@ -7,7 +7,7 @@
 //! crash, when no `session.json` was ever flushed.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const MANIFEST_VERSION: u32 = 1;
 pub const MANIFEST_FILE: &str = "session.json";
@@ -18,6 +18,9 @@ pub const CUTS_FILE: &str = "cuts.jsonl";
 
 /// Filename pattern handed to ffmpeg's `-strftime 1` segment muxer.
 pub const SEGMENT_STRFTIME: &str = "%Y%m%d-%H%M%S";
+/// Cached thumbnails, `<session>/thumbs/<track_id>/<width>/<epoch_ms>.jpg`. Not
+/// footage: the rebuild never indexes it, and `edit.rs` purges it under cuts.
+pub const THUMBS_DIR: &str = "thumbs";
 
 // ---------------------------------------------------------------------------
 // Types (contract with the frontend — see plans/2026-07-27-continuous-recording.md §3)
@@ -551,8 +554,9 @@ pub fn rebuild_manifest_from_disk(session_dir: &Path) -> Result<SessionManifest,
         .flatten()
         .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
         .map(|e| e.file_name().to_string_lossy().to_string())
-        // `.trash` holds files parked by a pending delete; they are not footage.
-        .filter(|n| !n.starts_with('.'))
+        // `.trash` holds files parked by a pending delete, `thumbs` cached
+        // JPEGs; neither is footage.
+        .filter(|n| !n.starts_with('.') && n != THUMBS_DIR)
         .collect();
     track_dirs.sort();
 
@@ -671,4 +675,205 @@ pub fn rebuild_manifest_from_disk(session_dir: &Path) -> Result<SessionManifest,
 
     manifest.ended_epoch_ms = Some(latest_end);
     Ok(manifest)
+}
+
+// ---------------------------------------------------------------------------
+// Thumbnails (the file server's `/thumb` route)
+// ---------------------------------------------------------------------------
+
+pub const THUMB_MIN_W: u32 = 64;
+pub const THUMB_MAX_W: u32 = 960;
+/// Width when the request names none.
+pub const THUMB_DEFAULT_W: u32 = 320;
+/// The seek never lands closer than this to a segment's end: past the last
+/// frame ffmpeg writes nothing and fails.
+const THUMB_END_MARGIN_MS: i64 = 500;
+
+static THUMB_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Why there is no thumbnail. Every one of these is a 404.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbMiss {
+    /// No readable manifest.
+    NoSession,
+    /// No such track, or one with no picture (mic, system audio).
+    NoTrack,
+    /// The instant was deleted.
+    Cut,
+    /// No segment of the track covers the instant.
+    Gap,
+    /// The segment is still being written (no moov yet) or has gone.
+    NotReady,
+    /// ffmpeg decoded no frame at that offset.
+    NoFrame,
+}
+
+/// The segment frame that shows one instant of one track.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThumbFrame {
+    pub dir: String,
+    pub file: String,
+    /// Seek offset into `file`.
+    pub offset_ms: i64,
+}
+
+/// A thumbnail that has to be extracted: `render_thumb`'s input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThumbJob {
+    pub track_id: String,
+    pub epoch_ms: i64,
+    pub width: u32,
+    pub src: PathBuf,
+    pub offset_ms: i64,
+    pub dest: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThumbLookup {
+    /// Already in the cache.
+    Cached(PathBuf),
+    Render(ThumbJob),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Thumb {
+    Ready(PathBuf),
+    Missing(ThumbMiss),
+}
+
+pub fn clamp_thumb_width(w: Option<u32>) -> u32 {
+    w.unwrap_or(THUMB_DEFAULT_W).clamp(THUMB_MIN_W, THUMB_MAX_W)
+}
+
+/// `<session>/thumbs/<track_id>/<width>/<epoch_ms>.jpg`
+pub fn thumb_path(session_dir: &Path, track_id: &str, width: u32, epoch_ms: i64) -> PathBuf {
+    session_dir
+        .join(THUMBS_DIR)
+        .join(track_id)
+        .join(width.to_string())
+        .join(format!("{}.jpg", epoch_ms))
+}
+
+/// Does `c` hide `epoch_ms` on `track_id`?
+pub fn cut_hides(c: &Cut, track_id: &str, epoch_ms: i64) -> bool {
+    c.state != CutState::Undone
+        && c.tracks.as_ref().map_or(true, |ts| ts.iter().any(|t| t == track_id))
+        && epoch_ms >= c.from_epoch_ms
+        && epoch_ms < c.to_epoch_ms
+}
+
+/// Which segment frame shows `epoch_ms` on `track_id`. Pure. Segments are
+/// ragged and can overlap; where two cover the instant, the later one wins.
+pub fn resolve_thumb(
+    m: &SessionManifest,
+    track_id: &str,
+    epoch_ms: i64,
+) -> Result<ThumbFrame, ThumbMiss> {
+    let track = m
+        .tracks
+        .iter()
+        .find(|t| t.id == track_id)
+        .filter(|t| t.kind == "screen" || t.kind == "webcam")
+        .ok_or(ThumbMiss::NoTrack)?;
+    if m.cuts.iter().any(|c| cut_hides(c, track_id, epoch_ms)) {
+        return Err(ThumbMiss::Cut);
+    }
+    let seg = track
+        .segments
+        .iter()
+        .filter(|s| s.start_epoch_ms <= epoch_ms && epoch_ms < s.start_epoch_ms + s.duration_ms)
+        .max_by_key(|s| s.start_epoch_ms)
+        .ok_or(ThumbMiss::Gap)?;
+    let offset_ms = (epoch_ms - seg.start_epoch_ms)
+        .min(seg.duration_ms - THUMB_END_MARGIN_MS)
+        .max(0);
+    Ok(ThumbFrame {
+        dir: track.dir.clone(),
+        file: seg.file.clone(),
+        offset_ms,
+    })
+}
+
+/// Resolve a `/thumb` request against the manifest on disk (for the live
+/// session too: its last flush is recent enough) with the cuts sidecar applied.
+/// The cache is only consulted once the instant is known not to be cut.
+pub fn thumb_lookup(
+    session_dir: &Path,
+    track_id: &str,
+    epoch_ms: i64,
+    width: u32,
+) -> Result<ThumbLookup, ThumbMiss> {
+    let m = read_manifest(session_dir).map_err(|_| ThumbMiss::NoSession)?;
+    let frame = resolve_thumb(&m, track_id, epoch_ms)?;
+    let dest = thumb_path(session_dir, track_id, width, epoch_ms);
+    if dest.is_file() {
+        return Ok(ThumbLookup::Cached(dest));
+    }
+    let src = session_dir.join(&frame.dir).join(&frame.file);
+    if !src.is_file() {
+        return Err(ThumbMiss::NotReady);
+    }
+    Ok(ThumbLookup::Render(ThumbJob {
+        track_id: track_id.to_string(),
+        epoch_ms,
+        width,
+        src,
+        offset_ms: frame.offset_ms,
+        dest,
+    }))
+}
+
+/// Extract one frame into the cache: a temp name, then a rename, so a reader
+/// never sees half a JPEG. A cut made while ffmpeg ran wins: the thumbnail is
+/// checked against `cuts.jsonl` after it lands, and `edit.rs` purges after it
+/// appends the cut, so one of the two always removes it.
+pub fn render_thumb(ffmpeg: &str, session_dir: &Path, job: &ThumbJob) -> Result<Thumb, String> {
+    // Another request may have rendered it while this one waited for a slot.
+    if job.dest.is_file() {
+        return Ok(Thumb::Ready(job.dest.clone()));
+    }
+    let dir = job.dest.parent().ok_or("thumbnail path has no parent")?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    let seq = THUMB_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!("{}.jpg.{}-{}.tmp", job.epoch_ms, std::process::id(), seq));
+
+    let out = crate::recorder::silent_command(ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-ss"])
+        .arg(format!("{:.3}", job.offset_ms as f64 / 1000.0))
+        .arg("-i")
+        .arg(&job.src)
+        .args(["-frames:v", "1", "-vf"])
+        .arg(format!("scale={}:-2", job.width))
+        .args(["-q:v", "6", "-f", "mjpeg"])
+        .arg(&tmp)
+        .output()
+        .map_err(|e| format!("ffmpeg spawn failed: {}", e))?;
+    let written = std::fs::metadata(&tmp).map(|m| m.len() > 0).unwrap_or(false);
+    if !out.status.success() || !written {
+        let _ = std::fs::remove_file(&tmp);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("moov atom not found") || !job.src.is_file() {
+            return Ok(Thumb::Missing(ThumbMiss::NotReady));
+        }
+        if out.status.success() || stderr.contains("Nothing was written") {
+            return Ok(Thumb::Missing(ThumbMiss::NoFrame));
+        }
+        return Err(format!("ffmpeg failed: {}", tail(&stderr, 300)));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &job.dest) {
+        let _ = std::fs::remove_file(&tmp);
+        // A reader holding the one a racing request wrote blocks the replace;
+        // that one is just as good.
+        if !job.dest.is_file() {
+            return Err(format!("rename -> {}: {}", job.dest.display(), e));
+        }
+    }
+    if active_cuts(session_dir)
+        .iter()
+        .any(|c| cut_hides(c, &job.track_id, job.epoch_ms))
+    {
+        let _ = std::fs::remove_file(&job.dest);
+        return Ok(Thumb::Missing(ThumbMiss::Cut));
+    }
+    Ok(Thumb::Ready(job.dest.clone()))
 }

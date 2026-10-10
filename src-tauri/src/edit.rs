@@ -545,6 +545,10 @@ pub fn delete_range(
         rollback(&moved);
         return Err(e);
     }
+    // After the cut line, never before: a thumbnail rendered meanwhile checks
+    // cuts.jsonl once it lands, so one of the two always removes it. They
+    // regenerate if the cut is undone.
+    purge_thumbs(session_dir, &cut);
 
     let freed_bytes_estimate = plan
         .tracks
@@ -888,6 +892,8 @@ fn apply_journal(session_dir: &Path, cut: &Cut, j: &Journal) -> Result<(), Strin
     // Final before the trash goes: a crash in between leaves a Final cut with a
     // trash dir, which recovery just removes.
     session::append_cut(session_dir, &fin)?;
+    // Delete time purged them already; this catches any a racing render left.
+    purge_thumbs(session_dir, &fin);
     let trash = trash_dir(session_dir, &cut.id);
     crash_point(&trash, "before-trash-removal")?;
     if trash.exists() {
@@ -1138,6 +1144,53 @@ fn cut_pieces(
 }
 
 // ---------------------------------------------------------------------------
+// Cached thumbnails
+// ---------------------------------------------------------------------------
+
+/// Delete every cached thumbnail (and any half-written one) inside `cut`'s
+/// range on the tracks it covers, at every width. Deleted footage must not
+/// survive as JPEGs. Returns how many files went.
+pub fn purge_thumbs(session_dir: &Path, cut: &Cut) -> usize {
+    let root = session_dir.join(session::THUMBS_DIR);
+    let Ok(tracks) = std::fs::read_dir(&root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for t in tracks.flatten() {
+        let track_id = t.file_name().to_string_lossy().to_string();
+        if !covers(cut.tracks.as_deref(), &track_id) {
+            continue;
+        }
+        let Ok(widths) = std::fs::read_dir(t.path()) else {
+            continue;
+        };
+        for w in widths.flatten() {
+            let Ok(files) = std::fs::read_dir(w.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                // `<epoch_ms>.jpg`, or `<epoch_ms>.jpg.<n>.tmp` mid-render.
+                let name = f.file_name().to_string_lossy().to_string();
+                let Some(epoch_ms) = name.split('.').next().and_then(|e| e.parse::<i64>().ok()) else {
+                    continue;
+                };
+                if !in_range(epoch_ms, cut.from_epoch_ms, cut.to_epoch_ms) {
+                    continue;
+                }
+                match std::fs::remove_file(f.path()) {
+                    Ok(()) => removed += 1,
+                    Err(e) => log_edit(
+                        session_dir,
+                        &format!("{}: could not delete thumbnail {}: {}", cut.id, f.path().display(), e),
+                    ),
+                }
+            }
+        }
+    }
+    removed
+}
+
+// ---------------------------------------------------------------------------
 // Whole sessions
 // ---------------------------------------------------------------------------
 
@@ -1284,7 +1337,7 @@ fn recover_session(session_dir: &Path) -> Result<bool, String> {
                     let _ = std::fs::remove_dir_all(&trash);
                     log_edit(session_dir, &format!("{}: rolled back an uncommitted delete", cut_id));
                 }
-                Some(c) if c.state == CutState::Final => clear_final_trash(session_dir, &trash)?,
+                Some(c) if c.state == CutState::Final => clear_final_trash(session_dir, c, &trash)?,
                 // Undo moves everything back before it appends Undone.
                 Some(c) if c.state == CutState::Undone => {
                     let _ = std::fs::remove_dir_all(&trash);
@@ -1315,7 +1368,8 @@ fn recover_session(session_dir: &Path) -> Result<bool, String> {
 /// was already written, so the manifest is never touched here: only originals
 /// the journal replaced (and files it deleted) that the manifest no longer
 /// references are removed, then the folder.
-fn clear_final_trash(session_dir: &Path, trash: &Path) -> Result<(), String> {
+fn clear_final_trash(session_dir: &Path, cut: &Cut, trash: &Path) -> Result<(), String> {
+    purge_thumbs(session_dir, cut);
     if let Some(j) = read_json::<Journal>(&trash.join(JOURNAL_FILE)) {
         let m = load_manifest(session_dir)?;
         for r in &j.replace {
@@ -1342,7 +1396,10 @@ fn sweep_tmp(session_dir: &Path) {
     };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if name.starts_with('.')
+            || name == session::THUMBS_DIR
+            || !e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+        {
             continue;
         }
         let Ok(files) = std::fs::read_dir(e.path()) else {
