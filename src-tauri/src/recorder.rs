@@ -33,9 +33,10 @@ const POLL_MS: u64 = 100;
 /// Keep the last N stderr lines per track. Bounded — a 6h session must not grow.
 const LOG_LINES: usize = 200;
 /// Give up on a track after this many *consecutive* restarts that fail for a
-/// reason we cannot name. A run that records resets the count, and a screen that
-/// is waiting out a display outage never counts toward it — see
-/// [`classify_screen_failure`] for which failures are which.
+/// reason we cannot name. A run that records resets the count. A screen waiting
+/// out a display outage counts toward it only until the track has recorded
+/// something this session: an encoder that can never open must still fail, not
+/// wait forever under an outage's name. See [`Supervision::failed`].
 const MAX_RESTARTS: u32 = 20;
 /// Longest wait between attempts while a screen waits out an outage. The wait
 /// doubles from 1s up to this and then holds, for as long as the session runs.
@@ -57,7 +58,27 @@ const SCREEN_FIRST_FRAME_ACTIVE_MS: i64 = 15_000;
 /// desktop presents a frame, and with the display off that never happens: it
 /// polls `AcquireNextFrame` with a zero timeout, spinning a core and printing
 /// nothing. This bounds what each attempt during a dark display costs.
+///
+/// A lit but unchanging desktop is not at risk. A fresh duplication hands over
+/// the whole current image on its first acquire, change or no change: in all 28
+/// sessions on disk every screen's first segment landed 0.4s after its staggered
+/// launch (0.40 / 0.70 / 1.00 / 1.40s), on four monitors and two adapters, which
+/// waiting on desktop activity could not produce. And every silent no-frame run
+/// in the logs (60, all 2026-08-01 14:02–14:13) falls inside a display-off window.
 const SCREEN_FIRST_FRAME_IDLE_MS: i64 = 5_000;
+/// No input for this long, and a screen waiting out an outage is retried only
+/// every [`AWAY_RETRY_MS`] once its backoff has reached the cap. The wake
+/// shortcut ([`wait_for_retry`]) still retries 3s after the user comes back.
+const AWAY_IDLE_MS: i64 = 60_000;
+/// The spacing of outage attempts while the user is away. See [`outage_delay_ms`].
+const AWAY_RETRY_MS: u64 = 120_000;
+/// After this many consecutive relaunches that found no monitor, try one launch
+/// at the screen's session-start output index anyway, in case matching is what
+/// failed (a monitor back under a new name *and* a new rectangle).
+const MISSING_PROBE_EVERY: u32 = 10;
+/// A monitor must show up on another adapter in this many consecutive
+/// enumerations before its track gives up; one look mid-reconnect is not proof.
+const MOVED_ADAPTER_CONFIRMATIONS: u32 = 3;
 /// The reason on every gap left by inactivity trimming.
 const IDLE_GAP_REASON: &str = "idle — no keyboard or mouse activity";
 /// Wait this long for a graceful `q` shutdown before killing.
@@ -490,32 +511,51 @@ pub enum Relocation {
 /// Find a screen's monitor in a fresh DXGI enumeration. Pure, so the matching
 /// rules can be tested against real layouts.
 ///
+/// `identity` is the screen as it was at session start, never updated, and
+/// `others` is every screen of the session the same way (it may include
+/// `identity` itself). Matching against a moving identity is how one monitor
+/// ends up recorded twice: two same-size monitors that trade `\\.\DISPLAYn`
+/// names while the layout settles on wake would each take the other's place for
+/// good.
+///
 /// On the track's own adapter, in order: the same name *and* rectangle; the same
 /// rectangle under a new name (Windows reassigns `\\.\DISPLAYn` on reconnect);
-/// the same name with a new rectangle (a resolution or layout change). Only an
-/// exact name-and-rectangle match counts as having moved to another adapter, so
-/// a stranger that happens to land on the old rectangle there cannot end the
-/// track. Detached outputs never match.
+/// the same name with a new rectangle (a resolution or layout change), unless it
+/// sits on another screen's rectangle, where it is that screen's monitor under
+/// our old name. An output that is exactly another screen's identity is never a
+/// candidate. Within a rule, `home_idx` (the session-start output index) wins a
+/// tie. Only an exact name-and-rectangle match counts as having moved to another
+/// adapter, so a stranger that happens to land on the old rectangle there cannot
+/// end the track. Detached outputs never match.
 pub fn relocate_screen(
     identity: &ScreenIdentity,
     adapter: u32,
+    home_idx: u32,
+    others: &[ScreenIdentity],
     outputs: &[DisplayOutput],
 ) -> Relocation {
-    let same_rect = |o: &DisplayOutput| {
-        (o.x, o.y, o.w, o.h) == (identity.x, identity.y, identity.w, identity.h)
-    };
+    let rect = |o: &DisplayOutput| (o.x, o.y, o.w, o.h);
+    let same_rect = |o: &DisplayOutput| rect(o) == identity.rect();
     let same_name = |o: &DisplayOutput| o.device_name == identity.device_name;
+    let others: Vec<&ScreenIdentity> = others.iter().filter(|i| *i != identity).collect();
+    let on_anothers_rect = |o: &DisplayOutput| others.iter().any(|i| i.rect() == rect(o));
     let here: Vec<&DisplayOutput> = outputs
         .iter()
         .filter(|o| o.attached && o.adapter == adapter)
+        .filter(|o| !others.iter().any(|i| i.is(o)))
         .collect();
-    let found = here
-        .iter()
-        .find(|o| same_name(o) && same_rect(o))
-        .or_else(|| here.iter().find(|o| same_rect(o)))
-        .or_else(|| here.iter().find(|o| same_name(o)));
-    if let Some(o) = found {
-        return Relocation::Found(o.output_idx);
+    let pick = |matches: &dyn Fn(&DisplayOutput) -> bool| {
+        let hits: Vec<&DisplayOutput> = here.iter().copied().filter(|o| matches(o)).collect();
+        hits.iter()
+            .find(|o| o.output_idx == home_idx)
+            .or(hits.first())
+            .map(|o| o.output_idx)
+    };
+    let found = pick(&|o| same_name(o) && same_rect(o))
+        .or_else(|| pick(&|o| same_rect(o)))
+        .or_else(|| pick(&|o| same_name(o) && !on_anothers_rect(o)));
+    if let Some(idx) = found {
+        return Relocation::Found(idx);
     }
     match outputs
         .iter()
@@ -524,6 +564,39 @@ pub fn relocate_screen(
         Some(o) => Relocation::OtherAdapter(o.adapter),
         None => Relocation::Missing,
     }
+}
+
+impl ScreenIdentity {
+    fn rect(&self) -> (i32, i32, u32, u32) {
+        (self.x, self.y, self.w, self.h)
+    }
+
+    /// Exactly this name on exactly this rectangle.
+    fn is(&self, o: &DisplayOutput) -> bool {
+        o.device_name == self.device_name && (o.x, o.y, o.w, o.h) == self.rect()
+    }
+}
+
+/// Whether the attached output at a screen's session-start index is plainly
+/// another screen's monitor: it sits on another screen's rectangle, under any
+/// name. A launch there would record that monitor twice. See
+/// [`MISSING_PROBE_EVERY`].
+pub fn home_is_anothers(
+    identity: &ScreenIdentity,
+    adapter: u32,
+    home_idx: u32,
+    others: &[ScreenIdentity],
+    outputs: &[DisplayOutput],
+) -> bool {
+    outputs
+        .iter()
+        .filter(|o| o.attached && o.adapter == adapter && o.output_idx == home_idx)
+        .any(|o| {
+            others
+                .iter()
+                .filter(|i| *i != identity)
+                .any(|i| i.rect() == (o.x, o.y, o.w, o.h))
+        })
 }
 
 /// The ffmpeg arguments that put `ddagrab` on a specific DXGI adapter.
@@ -1245,6 +1318,10 @@ enum TrackSource {
         adapter: u32,
         /// Re-resolved before every relaunch; see [`relocate_screen`].
         output_idx: u32,
+        /// The output index at session start. Never changes.
+        home_idx: u32,
+        /// The monitor as it was at session start. Never changes: every
+        /// relocation matches against this, not against the last match.
         identity: ScreenIdentity,
         encoder: String,
         fps: u32,
@@ -1547,6 +1624,10 @@ struct Inner {
     /// Live recovery state per manifest track, for the widget. Absent while a
     /// track records. See [`TrackHealth`].
     health: Mutex<std::collections::HashMap<String, TrackHealth>>,
+    /// Every capturable screen as it was at session start, recorded or not. A
+    /// screen relocating its monitor never takes one of these. See
+    /// [`relocate_screen`].
+    screen_identities: Vec<ScreenIdentity>,
 }
 
 impl Inner {
@@ -1724,6 +1805,8 @@ impl Recorder {
         // tracks override it via `segment_seconds_for`, so the manifest's value is
         // the video length, not a promise about every track.
         let seg_secs = opts.segment_seconds.max(5);
+        let screen_identities: Vec<ScreenIdentity> =
+            screens.iter().map(|t| t.identity.clone()).collect();
         let mut manifest =
             SessionManifest::new(id.clone(), now.timestamp_millis(), seg_secs, desktop);
 
@@ -1756,6 +1839,7 @@ impl Recorder {
                     TrackSource::Screen {
                         adapter: t.adapter,
                         output_idx: t.output_idx,
+                        home_idx: t.output_idx,
                         identity: t.identity.clone(),
                         encoder,
                         fps: opts.screen_fps,
@@ -1943,6 +2027,7 @@ impl Recorder {
             last_input_ms: AtomicI64::new(seed_input_ms),
             drop_idle_after_ms,
             health: Mutex::new(Default::default()),
+            screen_identities,
         });
         inner.flush();
 
@@ -2261,6 +2346,21 @@ pub fn outage_backoff_ms(attempt: u32) -> u64 {
     (1_000u64 << doublings).min(OUTAGE_BACKOFF_CAP_MS)
 }
 
+/// The wait before the next outage attempt, given how long the user has been
+/// idle (`None` when it cannot be read). [`outage_backoff_ms`], except that once
+/// it has reached its cap and nobody has touched the machine for
+/// [`AWAY_IDLE_MS`], attempts drop to one per [`AWAY_RETRY_MS`]: a dark display
+/// stays dark until someone comes back, and coming back cuts the wait short
+/// anyway. The first ~30s keep the fast ramp, because a mode change during a
+/// film nobody is touching the mouse for is also an outage, and a short one.
+pub fn outage_delay_ms(attempt: u32, idle_ms: Option<i64>) -> u64 {
+    let backoff = outage_backoff_ms(attempt);
+    match idle_ms {
+        Some(idle) if idle >= AWAY_IDLE_MS && backoff >= OUTAGE_BACKOFF_CAP_MS => AWAY_RETRY_MS,
+        _ => backoff,
+    }
+}
+
 /// Whether input just ended a stretch of the user being away. One-shot per
 /// return: `away` latches once there has been no input for [`WAKE_IDLE_MS`] and
 /// is cleared by the input that ends it, so someone typing through an outage
@@ -2323,6 +2423,167 @@ impl Outage {
             self.fault = fault;
         }
         self.attempts += 1;
+    }
+}
+
+/// What a supervisor does after a failed run. See [`Supervision::failed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// Stop the track for good, now.
+    Fatal(FatalFault),
+    /// Wait out [`Supervision::outage`]; `began` when this failure started it.
+    Wait { began: bool },
+    /// Relaunch after a short backoff. The restart has been counted.
+    Restart,
+    /// Out of restarts: stop the track with its raw error.
+    GiveUp,
+}
+
+/// What to do before relaunching a screen. See [`Supervision::plan_relaunch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelaunchPlan {
+    /// Launch at this output index, or wherever it was last (`None`).
+    Launch(Option<u32>),
+    /// Nothing matched for [`MISSING_PROBE_EVERY`] relaunches: try one launch
+    /// at the session-start index anyway.
+    Probe(u32),
+    /// Launch nothing and wait. `Some(adapter)` while the monitor shows up on
+    /// another adapter, not yet [`MOVED_ADAPTER_CONFIRMATIONS`] times running.
+    Wait(Option<u32>),
+    /// The monitor is settled on this other adapter. Stop for good.
+    MovedAdapter(u32),
+}
+
+/// Where a screen's monitor is, as one DXGI enumeration sees it. See
+/// [`locate_screen`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Located {
+    found: Relocation,
+    home_idx: u32,
+    /// See [`home_is_anothers`].
+    home_taken: bool,
+}
+
+/// A supervisor's decisions between runs, kept apart from the processes so
+/// the state machine can be tested without ffmpeg or displays.
+#[derive(Debug, Default)]
+struct Supervision {
+    /// Consecutive failures counted against [`MAX_RESTARTS`].
+    restarts: u32,
+    /// Set while a screen waits out an outage. See [`ScreenFailure::Outage`].
+    outage: Option<Outage>,
+    /// The track has footage from this session. Until it does, outages spend
+    /// the restart budget like any other failure.
+    recorded: bool,
+    /// Consecutive relocations that found no monitor.
+    missing: u32,
+    /// Consecutive relocations that found it on another adapter.
+    other_adapter: u32,
+}
+
+impl Supervision {
+    fn new(recorded: bool) -> Self {
+        Self {
+            recorded,
+            ..Default::default()
+        }
+    }
+
+    /// A run ended. One that recorded proves the track works: the next failure
+    /// starts a fresh count and a fresh outage. Without this a long session's
+    /// unrelated hiccups accumulated until the track was abandoned.
+    fn ran(&mut self, produced: bool) {
+        if produced {
+            self.restarts = 0;
+            self.outage = None;
+            self.recorded = true;
+        }
+    }
+
+    /// Whether an unrecognised failure is read as the outage already under way.
+    /// Once a screen is waiting one out, a relaunch that fails in a way we do
+    /// not recognise is still the outage: a dark or locked display can fail in
+    /// more ways than the logs have shown us. Only fatal markers or footage end
+    /// the wait.
+    fn promotes(&self, class: ScreenFailure, is_screen: bool) -> bool {
+        is_screen && class == ScreenFailure::Unknown && self.outage.is_some()
+    }
+
+    /// Decide what a failed run of class `class` leads to, at `now`.
+    fn failed(&mut self, class: ScreenFailure, is_screen: bool, now: i64) -> Verdict {
+        let class = match &self.outage {
+            Some(o) if self.promotes(class, is_screen) => ScreenFailure::Outage(o.fault),
+            _ => class,
+        };
+        match class {
+            ScreenFailure::Fatal(fault) => Verdict::Fatal(fault),
+            ScreenFailure::Outage(fault) => {
+                // Before any footage an outage may be no outage at all: a QSV
+                // encoder that can never open reads as the GPU running out of
+                // memory, every time.
+                if !self.recorded && self.spend_restart() {
+                    return Verdict::GiveUp;
+                }
+                let began = self.outage.is_none();
+                match &mut self.outage {
+                    Some(o) => o.record(fault),
+                    None => self.outage = Some(Outage::new(now, fault)),
+                }
+                Verdict::Wait { began }
+            }
+            ScreenFailure::Unknown => {
+                if self.spend_restart() {
+                    Verdict::GiveUp
+                } else {
+                    Verdict::Restart
+                }
+            }
+        }
+    }
+
+    /// Count a restart; `true` once the budget is spent.
+    fn spend_restart(&mut self) -> bool {
+        self.restarts += 1;
+        self.restarts > MAX_RESTARTS
+    }
+
+    /// What to launch, given where the monitor is now (`None`: not a screen, or
+    /// DXGI could not be enumerated, so the old index is tried again).
+    fn plan_relaunch(&mut self, located: Option<Located>) -> RelaunchPlan {
+        let Some(at) = located else {
+            self.missing = 0;
+            self.other_adapter = 0;
+            return RelaunchPlan::Launch(None);
+        };
+        match at.found {
+            Relocation::Found(idx) => {
+                self.missing = 0;
+                self.other_adapter = 0;
+                RelaunchPlan::Launch(Some(idx))
+            }
+            Relocation::OtherAdapter(adapter) => {
+                self.missing = 0;
+                self.other_adapter += 1;
+                if self.other_adapter >= MOVED_ADAPTER_CONFIRMATIONS {
+                    RelaunchPlan::MovedAdapter(adapter)
+                } else {
+                    RelaunchPlan::Wait(Some(adapter))
+                }
+            }
+            Relocation::Missing => {
+                self.other_adapter = 0;
+                self.missing += 1;
+                if self.missing < MISSING_PROBE_EVERY {
+                    return RelaunchPlan::Wait(None);
+                }
+                self.missing = 0;
+                if at.home_taken {
+                    RelaunchPlan::Wait(None)
+                } else {
+                    RelaunchPlan::Probe(at.home_idx)
+                }
+            }
+        }
     }
 }
 
@@ -2443,27 +2704,35 @@ fn output_for<'a>(outs: &'a [OutputState], track_id: &str) -> Option<&'a OutputS
 /// ffmpeg whenever it dies. How long it keeps trying depends on why it died:
 ///
 /// - A screen in an outage ([`ScreenFailure::Outage`]) waits it out, retrying on
-///   [`outage_backoff_ms`] until capture works again or the session stops.
+///   [`outage_delay_ms`] until capture works again or the session stops. Until
+///   the track has recorded, those attempts also spend [`MAX_RESTARTS`].
 /// - A fatal failure ([`ScreenFailure::Fatal`]) stops the track at once.
 /// - Anything else gets [`MAX_RESTARTS`] consecutive attempts.
 ///
 /// Either way the time it is down becomes one gap with a human reason (see
-/// [`note_downtime`]), and [`TrackHealth`] says what it is waiting for.
+/// [`note_downtime`]), and [`TrackHealth`] says what it is waiting for. The
+/// decisions themselves live in [`Supervision`].
 fn supervise_track(inner: Arc<Inner>, spec: TrackSpec) {
-    let mut outs: Vec<OutputState> = spec
+    let outs: Vec<OutputState> = spec
         .outputs
         .iter()
         .map(|o| OutputState::new(&inner.session_dir, o))
         .collect();
+    supervise_outputs(inner, spec, outs);
+}
 
+/// [`supervise_track`] with its outputs already built, so a microphone split
+/// out of the webcam pair keeps the open downtime and idle tail it had inside
+/// it. See [`split_pair`].
+fn supervise_outputs(inner: Arc<Inner>, spec: TrackSpec, mut outs: Vec<OutputState>) {
     // The source can change under us: a shared webcam+mic process that cannot run
     // gives up the pairing and continues as a solo capture (see `split_pair`), and
     // a screen follows its monitor to a new output index (see `relocate_screen`).
     let mut source = spec.source.clone();
-    // Consecutive failures we cannot explain. See MAX_RESTARTS.
-    let mut restarts: u32 = 0;
-    // Set while a screen waits out an outage. See `ScreenFailure::Outage`.
-    let mut outage: Option<Outage> = None;
+    // A track with footage from before this supervisor (a split-out mic) has
+    // already shown it works.
+    let recorded = outs.iter().any(|o| track_end(&inner, &o.track_id).is_some());
+    let mut sup = Supervision::new(recorded);
     let mut relaunch = false;
 
     // Screens are launched a few hundred ms apart; see SCREEN_STAGGER_MS.
@@ -2482,68 +2751,59 @@ fn supervise_track(inner: Arc<Inner>, spec: TrackSpec) {
         // kill screen captures are the same ones that renumber, rename and remove
         // DXGI outputs.
         if relaunch {
-            match relocate_before_relaunch(&inner, &spec.id, &mut source) {
-                Some(Relocation::Missing) => {
-                    // Nothing to launch into, so launch nothing and wait.
-                    let now = now_ms();
-                    let next = match outage.take() {
-                        Some(mut o) => {
-                            o.record(ScreenFault::MonitorMissing);
-                            o
-                        }
-                        None => {
-                            inner.warn(format!(
-                                "{}: {}. Waiting for it to come back, checking every \
-                                 {}s or sooner for as long as the session runs",
-                                spec.id,
-                                ScreenFault::MonitorMissing.human(),
-                                OUTAGE_BACKOFF_CAP_MS / 1000
-                            ));
-                            Outage::new(now, ScreenFault::MonitorMissing)
-                        }
-                    };
-                    let o = outage.insert(next);
+            match sup.plan_relaunch(locate_screen(&inner, &source)) {
+                RelaunchPlan::Launch(Some(idx)) => point_screen_at(&inner, &spec.id, &mut source, idx),
+                RelaunchPlan::Launch(None) => {}
+                RelaunchPlan::Probe(idx) => {
                     note_track_log(
                         &inner,
                         &spec.id,
                         &format!(
-                            "monitor not among the attached DXGI outputs; not launching \
-                             (attempt {}, next in {}s)",
-                            o.attempts,
-                            outage_backoff_ms(o.attempts) / 1000
+                            "monitor still not matched after {} looks; trying one launch \
+                             at its session-start output {}",
+                            MISSING_PROBE_EVERY, idx
                         ),
                     );
-                    if !wait_out_outage(&inner, &mut outs, o, None) {
+                    point_screen_at(&inner, &spec.id, &mut source, idx);
+                }
+                RelaunchPlan::Wait(seen_on) => {
+                    // Nothing to launch into, so launch nothing and wait.
+                    let line = match seen_on {
+                        Some(a) => format!(
+                            "monitor seen on adapter {}; not launching until that holds or \
+                             it comes back",
+                            a
+                        ),
+                        None => "monitor not among the attached DXGI outputs; not launching"
+                            .to_string(),
+                    };
+                    let class = ScreenFailure::Outage(ScreenFault::MonitorMissing);
+                    let verdict = sup.failed(class, true, now_ms());
+                    if !after_failure(&inner, &spec, &mut source, &mut outs, &mut sup, verdict, &line) {
+                        return;
+                    }
+                    if inner.stopping() {
                         break;
                     }
                     continue;
                 }
-                Some(Relocation::OtherAdapter(adapter)) => {
+                RelaunchPlan::MovedAdapter(adapter) => {
                     let detail = format!("the monitor is now on adapter {}", adapter);
-                    let fault = FatalFault::MovedAdapter;
-                    fail_for_good(&inner, &spec.id, &mut outs, fault, &detail);
+                    fail_for_good(&inner, &spec.id, &mut outs, FatalFault::MovedAdapter, &detail);
                     return;
                 }
-                Some(Relocation::Found(_)) | None => {}
             }
         }
         relaunch = true;
 
         // A waiting track stays Restarting until footage actually appears
         // (`run_track_once` flips it then); anything else counts from launch.
-        if outage.is_none() {
+        if sup.outage.is_none() {
             set_all_status(&inner, &outs, TrackStatus::Recording, None);
         }
 
         let outcome = run_track_once(&inner, &spec, &source, &mut outs);
-
-        // A run that recorded proves the track works: the next failure starts a
-        // fresh count and a fresh outage. Without this a long session's unrelated
-        // hiccups accumulated until the track was abandoned.
-        if outs.iter().any(|o| o.produced > 0) {
-            restarts = 0;
-            outage = None;
-        }
+        sup.ran(outs.iter().any(|o| o.produced > 0));
 
         let (reason, death) = match outcome {
             RunOutcome::Finished => break,
@@ -2572,144 +2832,12 @@ fn supervise_track(inner: Arc<Inner>, spec: TrackSpec) {
             Some(d) if is_screen => classify_screen_failure(&d.stderr, d.no_media),
             _ => ScreenFailure::Unknown,
         };
-        // Once a screen is waiting out an outage, a relaunch that fails in a way
-        // we do not recognise is still the outage: a dark or locked display can
-        // fail in more ways than the logs have shown us. Only fatal markers or
-        // footage end the wait.
-        let class = match (class, &outage) {
-            (ScreenFailure::Unknown, Some(o)) if is_screen => {
-                let line = "not recognised; still waiting out the outage";
-                note_track_log(&inner, &spec.id, line);
-                ScreenFailure::Outage(o.fault)
-            }
-            (c, _) => c,
-        };
-
-        match class {
-            ScreenFailure::Fatal(fault) => {
-                fail_for_good(&inner, &spec.id, &mut outs, fault, &reason);
-                return;
-            }
-            ScreenFailure::Outage(fault) => {
-                let now = now_ms();
-                let next = match outage.take() {
-                    Some(mut o) => {
-                        o.record(fault);
-                        o
-                    }
-                    None => {
-                        inner.warn(format!(
-                            "{}: {}. Waiting for capture to work again, retrying every \
-                             {}s or sooner for as long as the session runs ({})",
-                            spec.id,
-                            fault.human(),
-                            OUTAGE_BACKOFF_CAP_MS / 1000,
-                            reason
-                        ));
-                        Outage::new(now, fault)
-                    }
-                };
-                let o = outage.insert(next);
-                note_track_log(
-                    &inner,
-                    &spec.id,
-                    &format!(
-                        "read as an outage: {} (attempt {}, next in {}s)",
-                        o.fault.human(),
-                        o.attempts,
-                        outage_backoff_ms(o.attempts) / 1000
-                    ),
-                );
-                for out in &outs {
-                    bump_restarts(&inner, &out.track_id);
-                }
-                if !wait_out_outage(&inner, &mut outs, o, Some(reason)) {
-                    break;
-                }
-            }
-            ScreenFailure::Unknown => {
-                restarts += 1;
-                let now = now_ms();
-                // A screen's gap gets a sentence. The other tracks' gaps keep
-                // ffmpeg's own words, as before: their failures are not classified.
-                let (human, gap_reason) = if is_screen {
-                    (SCREEN_UNKNOWN_HUMAN, SCREEN_UNKNOWN_HUMAN.to_string())
-                } else {
-                    ("Stopped unexpectedly; restarting", reason.clone())
-                };
-                for o in outs.iter_mut() {
-                    note_downtime(&inner, o, now, &gap_reason);
-                }
-                inner.warn(format!(
-                    "track {} died ({}), restart {}/{}",
-                    spec.id, reason, restarts, MAX_RESTARTS
-                ));
-                if restarts > MAX_RESTARTS {
-                    let gave_up = if is_screen {
-                        "Screen capture kept failing and was stopped"
-                    } else {
-                        "Kept failing and was stopped"
-                    };
-                    inner.set_health(
-                        &outs,
-                        TrackHealth {
-                            last_error_human: Some(gave_up.to_string()),
-                            ..Default::default()
-                        },
-                    );
-                    set_all_status(
-                        &inner,
-                        &outs,
-                        TrackStatus::Failed,
-                        Some(format!("gave up after {} restarts: {}", MAX_RESTARTS, reason)),
-                    );
-                    inner.flush();
-                    return;
-                }
-                set_all_status(&inner, &outs, TrackStatus::Restarting, Some(reason.clone()));
-                for o in &outs {
-                    bump_restarts(&inner, &o.track_id);
-                }
-
-                // A shared process in which either half keeps producing nothing is
-                // worse than no pairing at all. Two shapes, one remedy:
-                //
-                // - Neither produces (the camera is held by another app, so the
-                //   single combined input cannot open): both tracks get nothing.
-                // - One produces and the other does not (a device unplugged
-                //   mid-session): the watchdog kills the process on the silent
-                //   output, so the healthy half is repeatedly cut short too, and
-                //   after MAX_RESTARTS it would be marked Failed alongside the
-                //   device that actually broke.
-                //
-                // Lip-sync is a luxury on top of recording; recording comes first.
-                // So give the mic its own supervisor and carry on solo — exactly
-                // the pre-existing arrangement, with its independent failure
-                // behaviour restored, after which each device can die on its own.
-                if outs.len() > 1 && outs.iter().any(|o| o.barren_runs >= PAIR_SPLIT_AFTER) {
-                    if let Some(solo) = split_pair(&inner, &source, &mut outs, &reason) {
-                        source = solo;
-                        for o in outs.iter_mut() {
-                            o.barren_runs = 0;
-                        }
-                        restarts = 0;
-                    }
-                }
-                // Back off a little so a permanently missing device doesn't spin.
-                let backoff = (500 * restarts.min(6) as u64).max(500);
-                inner.set_health(
-                    &outs,
-                    TrackHealth {
-                        last_error_human: Some(human.to_string()),
-                        waiting_since_epoch_ms: None,
-                        next_attempt_epoch_ms: Some(now + backoff as i64),
-                    },
-                );
-                inner.flush();
-                if !sleep_unless_stopping(&inner, backoff) {
-                    break;
-                }
-            }
+        if sup.promotes(class, is_screen) {
+            note_track_log(&inner, &spec.id, "not recognised; still waiting out the outage");
+        }
+        let verdict = sup.failed(class, is_screen, now_ms());
+        if !after_failure(&inner, &spec, &mut source, &mut outs, &mut sup, verdict, &reason) {
+            return;
         }
     }
 
@@ -2725,17 +2853,193 @@ fn supervise_track(inner: Arc<Inner>, spec: TrackSpec) {
     inner.flush();
 }
 
-/// Re-find a screen's monitor before relaunching it, and follow it to its new
-/// output index and name. `None` for any other track, or when DXGI cannot be
-/// enumerated at all, in which case the old index is simply tried again.
-fn relocate_before_relaunch(
+/// Carry out a [`Verdict`]: wait, back off, or stop the track. `reason` is the
+/// raw failure. `false` when the track is finished for good (the caller
+/// returns); `true` to go round again, also when the session is stopping, which
+/// the caller checks.
+fn after_failure(
+    inner: &Arc<Inner>,
+    spec: &TrackSpec,
+    source: &mut TrackSource,
+    outs: &mut Vec<OutputState>,
+    sup: &mut Supervision,
+    verdict: Verdict,
+    reason: &str,
+) -> bool {
+    let is_screen = matches!(source, TrackSource::Screen { .. });
+    match verdict {
+        Verdict::Fatal(fault) => {
+            fail_for_good(inner, &spec.id, outs, fault, reason);
+            false
+        }
+        Verdict::Wait { began } => {
+            wait_in_outage(inner, &spec.id, outs, sup, began, reason);
+            true
+        }
+        Verdict::GiveUp => {
+            give_up(inner, &spec.id, outs, sup, is_screen, reason);
+            false
+        }
+        Verdict::Restart => {
+            let now = now_ms();
+            // A screen's gap gets a sentence. The other tracks' gaps keep
+            // ffmpeg's own words, as before: their failures are not classified.
+            let (human, gap_reason) = if is_screen {
+                (SCREEN_UNKNOWN_HUMAN, SCREEN_UNKNOWN_HUMAN.to_string())
+            } else {
+                ("Stopped unexpectedly; restarting", reason.to_string())
+            };
+            for o in outs.iter_mut() {
+                note_downtime(inner, o, now, &gap_reason);
+            }
+            inner.warn(format!(
+                "track {} died ({}), restart {}/{}",
+                spec.id, reason, sup.restarts, MAX_RESTARTS
+            ));
+            set_all_status(inner, outs, TrackStatus::Restarting, Some(reason.to_string()));
+            for o in outs.iter() {
+                bump_restarts(inner, &o.track_id);
+            }
+
+            // A shared process in which either half keeps producing nothing is
+            // worse than no pairing at all. Two shapes, one remedy:
+            //
+            // - Neither produces (the camera is held by another app, so the
+            //   single combined input cannot open): both tracks get nothing.
+            // - One produces and the other does not (a device unplugged
+            //   mid-session): the watchdog kills the process on the silent
+            //   output, so the healthy half is repeatedly cut short too, and
+            //   after MAX_RESTARTS it would be marked Failed alongside the
+            //   device that actually broke.
+            //
+            // Lip-sync is a luxury on top of recording; recording comes first.
+            // So give the mic its own supervisor and carry on solo — exactly
+            // the pre-existing arrangement, with its independent failure
+            // behaviour restored, after which each device can die on its own.
+            if outs.len() > 1 && outs.iter().any(|o| o.barren_runs >= PAIR_SPLIT_AFTER) {
+                if let Some(solo) = split_pair(inner, source, outs, reason) {
+                    *source = solo;
+                    for o in outs.iter_mut() {
+                        o.barren_runs = 0;
+                    }
+                    sup.restarts = 0;
+                }
+            }
+            // Back off a little so a permanently missing device doesn't spin.
+            let backoff = (500 * sup.restarts.min(6) as u64).max(500);
+            inner.set_health(
+                outs,
+                TrackHealth {
+                    last_error_human: Some(human.to_string()),
+                    waiting_since_epoch_ms: None,
+                    next_attempt_epoch_ms: Some(now + backoff as i64),
+                },
+            );
+            inner.flush();
+            sleep_unless_stopping(inner, backoff);
+            true
+        }
+    }
+}
+
+/// Publish and wait out the outage `sup` is in. `began` when this failure
+/// started it, which is the only time it counts as a restart in the manifest:
+/// a ten-hour display-off is one restart, not twelve hundred.
+fn wait_in_outage(
     inner: &Arc<Inner>,
     id: &str,
-    source: &mut TrackSource,
-) -> Option<Relocation> {
+    outs: &mut [OutputState],
+    sup: &mut Supervision,
+    began: bool,
+    reason: &str,
+) {
+    let recorded = sup.recorded;
+    let Some(o) = sup.outage.as_mut() else {
+        return;
+    };
+    if began {
+        let how_long = if recorded {
+            "for as long as the session runs".to_string()
+        } else {
+            format!("up to {} times, as it has not recorded yet", MAX_RESTARTS)
+        };
+        inner.warn(format!(
+            "{}: {}. Waiting for capture to work again, retrying every {}s or sooner \
+             (every {}s while nobody is at the machine) {} ({})",
+            id,
+            o.fault.human(),
+            OUTAGE_BACKOFF_CAP_MS / 1000,
+            AWAY_RETRY_MS / 1000,
+            how_long,
+            reason
+        ));
+        for out in outs.iter() {
+            bump_restarts(inner, &out.track_id);
+        }
+    }
+    let now = now_ms();
+    let delay = outage_delay_ms(o.attempts, poll_last_input_ms().map(|t| now - t));
+    note_track_log(
+        inner,
+        id,
+        &format!(
+            "read as an outage: {} (attempt {}, next in {}s): {}",
+            o.fault.human(),
+            o.attempts,
+            delay / 1000,
+            reason
+        ),
+    );
+    wait_out_outage(inner, outs, o, delay, Some(reason.to_string()));
+}
+
+/// Stop a track whose restart budget is spent, with its raw error.
+fn give_up(
+    inner: &Arc<Inner>,
+    id: &str,
+    outs: &mut [OutputState],
+    sup: &Supervision,
+    is_screen: bool,
+    reason: &str,
+) {
+    let now = now_ms();
+    let gap_reason = match (&sup.outage, is_screen) {
+        (Some(o), _) => o.fault.human().to_string(),
+        (None, true) => SCREEN_UNKNOWN_HUMAN.to_string(),
+        (None, false) => reason.to_string(),
+    };
+    for o in outs.iter_mut() {
+        note_downtime(inner, o, now, &gap_reason);
+    }
+    inner.warn(format!("track {} gave up after {} restarts ({})", id, MAX_RESTARTS, reason));
+    let gave_up = if is_screen {
+        "Screen capture kept failing and was stopped"
+    } else {
+        "Kept failing and was stopped"
+    };
+    inner.set_health(
+        outs,
+        TrackHealth {
+            last_error_human: Some(gave_up.to_string()),
+            ..Default::default()
+        },
+    );
+    set_all_status(
+        inner,
+        outs,
+        TrackStatus::Failed,
+        Some(format!("gave up after {} restarts: {}", MAX_RESTARTS, reason)),
+    );
+    inner.flush();
+}
+
+/// Find a screen's monitor in a fresh DXGI enumeration. `None` for any other
+/// track, or when DXGI cannot be enumerated at all, in which case the old index
+/// is simply tried again.
+fn locate_screen(inner: &Inner, source: &TrackSource) -> Option<Located> {
     let TrackSource::Screen {
         adapter,
-        output_idx,
+        home_idx,
         identity,
         ..
     } = source
@@ -2743,30 +3047,37 @@ fn relocate_before_relaunch(
         return None;
     };
     let outputs = enumerate_dxgi_outputs().ok().filter(|o| !o.is_empty())?;
-    let found = relocate_screen(identity, *adapter, &outputs);
-    if let Relocation::Found(idx) = found {
-        if let Some(now) = outputs
-            .iter()
-            .find(|o| o.attached && o.adapter == *adapter && o.output_idx == idx)
-        {
-            // Match on what it is called now from here on.
-            identity.device_name = now.device_name.clone();
-            (identity.x, identity.y, identity.w, identity.h) = (now.x, now.y, now.w, now.h);
-        }
-        if idx != *output_idx {
-            inner.warn(format!(
-                "{}: {} is now DXGI output {} (was {}); the outputs were renumbered and \
-                 the track follows its monitor",
-                id, identity.device_name, idx, output_idx
-            ));
-            *output_idx = idx;
-            let mut m = inner.manifest.lock().unwrap();
-            if let Some(mon) = m.track_mut(id).and_then(|t| t.monitor.as_mut()) {
-                mon.output_idx = idx;
-            }
-        }
+    let others = &inner.screen_identities;
+    Some(Located {
+        found: relocate_screen(identity, *adapter, *home_idx, others, &outputs),
+        home_idx: *home_idx,
+        home_taken: home_is_anothers(identity, *adapter, *home_idx, others, &outputs),
+    })
+}
+
+/// Point a screen track at DXGI output `idx`, saying so when that is a move.
+fn point_screen_at(inner: &Arc<Inner>, id: &str, source: &mut TrackSource, idx: u32) {
+    let TrackSource::Screen {
+        output_idx,
+        identity,
+        ..
+    } = source
+    else {
+        return;
+    };
+    if idx == *output_idx {
+        return;
     }
-    Some(found)
+    inner.warn(format!(
+        "{}: the monitor that was {} at session start is now DXGI output {} (was {}); \
+         the outputs were renumbered and the track follows its monitor",
+        id, identity.device_name, idx, output_idx
+    ));
+    *output_idx = idx;
+    let mut m = inner.manifest.lock().unwrap();
+    if let Some(mon) = m.track_mut(id).and_then(|t| t.monitor.as_mut()) {
+        mon.output_idx = idx;
+    }
 }
 
 /// How a wait between attempts ended.
@@ -2803,13 +3114,14 @@ fn wait_for_retry(inner: &Arc<Inner>, ms: u64, away: &mut bool) -> Wake {
     }
 }
 
-/// Stretch the downtime gap, publish the waiting state, then wait for the next
-/// attempt. `error` replaces the track's raw `error` when there is a new one.
-/// `false` when the session is stopping.
+/// Stretch the downtime gap, publish the waiting state, then wait `delay` ms
+/// for the next attempt. `error` replaces the track's raw `error` when there is
+/// a new one. `false` when the session is stopping.
 fn wait_out_outage(
     inner: &Arc<Inner>,
     outs: &mut [OutputState],
     o: &mut Outage,
+    delay: u64,
     error: Option<String>,
 ) -> bool {
     let now = now_ms();
@@ -2818,7 +3130,6 @@ fn wait_out_outage(
         note_downtime(inner, out, now, human);
     }
     set_all_status(inner, outs, TrackStatus::Restarting, error);
-    let delay = outage_backoff_ms(o.attempts);
     inner.set_health(
         outs,
         TrackHealth {
@@ -2902,7 +3213,17 @@ fn split_pair(
         reason
     ));
 
-    outs.retain(|o| o.track_id != "mic");
+    // The mic's state moves with it: an open downtime gap closes where its first
+    // solo segment begins (rather than that segment also recording a "track
+    // restarted" gap over the same hole), and an idle run still collapses into
+    // one gap. Its health is cleared, as for any track that is launching.
+    let mic_out = outs
+        .iter()
+        .position(|o| o.track_id == "mic")
+        .map(|i| outs.remove(i));
+    if let Some(m) = &mic_out {
+        inner.clear_health(std::slice::from_ref(m));
+    }
 
     // `segment_seconds_for` keys off the track id, so the mic keeps the same
     // audio segment length it had inside the pair.
@@ -2917,7 +3238,10 @@ fn split_pair(
     let inner2 = inner.clone();
     match std::thread::Builder::new()
         .name("rec-mic".into())
-        .spawn(move || supervise_track(inner2, mic_spec))
+        .spawn(move || match mic_out {
+            Some(out) => supervise_outputs(inner2, mic_spec, vec![out]),
+            None => supervise_track(inner2, mic_spec),
+        })
     {
         Ok(h) => inner.extra_joins.lock().unwrap().push(h),
         Err(e) => {
@@ -3629,29 +3953,7 @@ fn index_segment(
             return;
         };
 
-        // After an idle run, `chain_override` carries the end of the deleted
-        // stretch so this segment chains onto it (delta ≈ 0, no drift gap) rather
-        // than onto the last *kept* segment before the hole. After downtime there
-        // is nothing to chain onto: the downtime gap already covers the hole.
-        let chained = if resumed.is_some() {
-            None
-        } else {
-            chain_override.or_else(|| {
-                track
-                    .segments
-                    .last()
-                    .map(|s| s.start_epoch_ms + s.duration_ms)
-            })
-        };
-
-        let decided = decide_segment_start(anchor, chained, observed);
-        let start = decided.start_epoch_ms;
-        if let Some(g) = decided.gap {
-            track.gaps.push(g);
-        }
-        if let Some(d) = &resumed {
-            stretch_downtime_gap(&mut track.gaps, d, start);
-        }
+        let start = place_segment(track, observed, anchor, chain_override, resumed.as_ref());
 
         if track.segments.is_empty() {
             track.start_epoch_ms = start;
@@ -3683,6 +3985,42 @@ fn index_segment(
     }
 
     inner.flush();
+}
+
+/// Where a closed segment starts on `track`'s timeline, adding whatever gap
+/// that leaves before it. Pure, for [`index_segment`].
+///
+/// After an idle run, `chain_override` carries the end of the deleted stretch
+/// so the segment chains onto it (delta ≈ 0, no drift gap) rather than onto the
+/// last *kept* segment before the hole. After downtime (`resumed`) there is
+/// nothing to chain onto: the downtime gap already covers the hole, and it is
+/// closed where this segment begins.
+fn place_segment(
+    track: &mut Track,
+    observed: i64,
+    anchor: Option<i64>,
+    chain_override: Option<i64>,
+    resumed: Option<&Downtime>,
+) -> i64 {
+    let chained = if resumed.is_some() {
+        None
+    } else {
+        chain_override.or_else(|| {
+            track
+                .segments
+                .last()
+                .map(|s| s.start_epoch_ms + s.duration_ms)
+        })
+    };
+    let decided = decide_segment_start(anchor, chained, observed);
+    let start = decided.start_epoch_ms;
+    if let Some(g) = decided.gap {
+        track.gaps.push(g);
+    }
+    if let Some(d) = resumed {
+        stretch_downtime_gap(&mut track.gaps, d, start);
+    }
+    start
 }
 
 fn record_gap(inner: &Arc<Inner>, track_id: &str, from: i64, to: i64, reason: &str) {
@@ -5128,12 +5466,22 @@ mod tests {
         }
     }
 
+    fn identities(outs: &[DisplayOutput]) -> Vec<ScreenIdentity> {
+        outs.iter().map(identity_of).collect()
+    }
+
+    /// Find `before[i]` in `after`, every screen of `before` being the session's.
+    fn relocate(before: &[DisplayOutput], i: usize, after: &[DisplayOutput]) -> Relocation {
+        let b = &before[i];
+        relocate_screen(&identity_of(b), b.adapter, b.output_idx, &identities(before), after)
+    }
+
     #[test]
     fn an_unchanged_layout_finds_every_screen_where_it_was() {
         let outs = real_outputs();
-        for o in &outs {
+        for (i, o) in outs.iter().enumerate() {
             assert_eq!(
-                relocate_screen(&identity_of(o), o.adapter, &outs),
+                relocate(&outs, i, &outs),
                 Relocation::Found(o.output_idx),
                 "{}",
                 o.device_name
@@ -5148,7 +5496,7 @@ mod tests {
         after[0].output_idx = 1;
         after[1].output_idx = 0;
         assert_eq!(
-            relocate_screen(&identity_of(&before[1]), 0, &after),
+            relocate(&before, 1, &after),
             Relocation::Found(0)
         );
     }
@@ -5159,7 +5507,7 @@ mod tests {
         let mut after = real_outputs();
         after[0].device_name = r"\\.\DISPLAY11".to_string();
         assert_eq!(
-            relocate_screen(&identity_of(&before[0]), 0, &after),
+            relocate(&before, 0, &after),
             Relocation::Found(0)
         );
     }
@@ -5170,7 +5518,7 @@ mod tests {
         let mut after = real_outputs();
         (after[0].w, after[0].h) = (3840, 2160);
         assert_eq!(
-            relocate_screen(&identity_of(&before[0]), 0, &after),
+            relocate(&before, 0, &after),
             Relocation::Found(0)
         );
     }
@@ -5180,16 +5528,16 @@ mod tests {
         let before = real_outputs();
         let unplugged: Vec<DisplayOutput> = real_outputs().into_iter().take(2).collect();
         assert_eq!(
-            relocate_screen(&identity_of(&before[2]), 0, &unplugged),
+            relocate(&before, 2, &unplugged),
             Relocation::Missing
         );
         let mut detached = real_outputs();
         detached[2].attached = false;
         assert_eq!(
-            relocate_screen(&identity_of(&before[2]), 0, &detached),
+            relocate(&before, 2, &detached),
             Relocation::Missing
         );
-        assert_eq!(relocate_screen(&identity_of(&before[2]), 0, &[]), Relocation::Missing);
+        assert_eq!(relocate(&before, 2, &[]), Relocation::Missing);
     }
 
     #[test]
@@ -5199,7 +5547,7 @@ mod tests {
         after[3].adapter = 0;
         after[3].output_idx = 3;
         assert_eq!(
-            relocate_screen(&identity_of(&before[3]), 1, &after),
+            relocate(&before, 3, &after),
             Relocation::OtherAdapter(0)
         );
     }
@@ -5214,7 +5562,7 @@ mod tests {
         (stranger.x, stranger.y, stranger.w, stranger.h) = (-3840, -15, 3840, 2160);
         after.push(stranger);
         assert_eq!(
-            relocate_screen(&identity_of(&before[2]), 0, &after),
+            relocate(&before, 2, &after),
             Relocation::Missing
         );
     }
@@ -5283,5 +5631,383 @@ mod tests {
         stretch_downtime_gap(&mut gaps, &d, 2_000);
         stretch_downtime_gap(&mut gaps, &d, 900);
         assert!(gaps.is_empty(), "footage from before the failure erases the open gap");
+    }
+
+    // -- two same-size monitors trading names ----------------------------------
+
+    /// `o` under another device name and output index. In `real_outputs`,
+    /// screen-1 (DISPLAY2, right of the ultrawide) and screen-2 (DISPLAY3, left
+    /// of it) are both 3840x2160 on adapter 0.
+    fn renamed(mut o: DisplayOutput, name: &str, idx: u32) -> DisplayOutput {
+        o.device_name = name.to_string();
+        o.output_idx = idx;
+        o
+    }
+
+    #[test]
+    fn two_same_size_monitors_trading_names_are_never_recorded_twice() {
+        let before = real_outputs();
+        let (right, left) = (1, 2);
+
+        // A clean swap of names, and of names and indices: each follows its own
+        // rectangle.
+        let names_only = vec![
+            before[0].clone(),
+            renamed(before[right].clone(), r"\\.\DISPLAY3", 1),
+            renamed(before[left].clone(), r"\\.\DISPLAY2", 2),
+            before[3].clone(),
+        ];
+        assert_eq!(relocate(&before, right, &names_only), Relocation::Found(1));
+        assert_eq!(relocate(&before, left, &names_only), Relocation::Found(2));
+        let both = vec![
+            before[0].clone(),
+            renamed(before[right].clone(), r"\\.\DISPLAY3", 2),
+            renamed(before[left].clone(), r"\\.\DISPLAY2", 1),
+            before[3].clone(),
+        ];
+        assert_eq!(relocate(&before, right, &both), Relocation::Found(2));
+        assert_eq!(relocate(&before, left, &both), Relocation::Found(1));
+
+        // Mid-settle: the left monitor is back first, under the right one's old
+        // name. That is the left monitor, so the right screen waits instead of
+        // recording it (the old name-only fallback took it, and then kept it).
+        let settling = vec![
+            before[0].clone(),
+            renamed(before[left].clone(), r"\\.\DISPLAY2", 1),
+            before[3].clone(),
+        ];
+        assert_eq!(relocate(&before, right, &settling), Relocation::Missing);
+        assert_eq!(relocate(&before, left, &settling), Relocation::Found(1));
+
+        // Then the right one arrives under the left one's old name. Both find
+        // their own, because both still match against how the session began.
+        let settled = vec![
+            before[0].clone(),
+            renamed(before[left].clone(), r"\\.\DISPLAY2", 1),
+            renamed(before[right].clone(), r"\\.\DISPLAY3", 2),
+            before[3].clone(),
+        ];
+        assert_eq!(relocate(&before, right, &settled), Relocation::Found(2));
+        assert_eq!(relocate(&before, left, &settled), Relocation::Found(1));
+    }
+
+    #[test]
+    fn another_screens_exact_identity_is_never_a_candidate() {
+        // Mirrored or mid-reconfigure: screen-1's rectangle also holds an output
+        // that is exactly screen-2 as the session began. It is not screen-1's.
+        let before = real_outputs();
+        let mut sessions = identities(&before);
+        sessions[2].x = 5120; // screen-2 began on screen-1's rectangle, mirrored
+        let impostor = DisplayOutput {
+            device_name: r"\\.\DISPLAY3".to_string(),
+            output_idx: 1,
+            ..before[1].clone()
+        };
+        let after = vec![before[0].clone(), impostor];
+        let me = identity_of(&before[1]);
+        assert_eq!(relocate_screen(&me, 0, 1, &sessions, &after), Relocation::Missing);
+    }
+
+    #[test]
+    fn a_tie_goes_to_the_session_start_index() {
+        // Two outputs on screen-1's rectangle under unknown names (a clone).
+        let before = real_outputs();
+        let after = vec![
+            before[0].clone(),
+            renamed(before[1].clone(), r"\\.\DISPLAY8", 4),
+            renamed(before[1].clone(), r"\\.\DISPLAY7", 1),
+        ];
+        assert_eq!(relocate(&before, 1, &after), Relocation::Found(1));
+        // Without the home index among them, the first one.
+        let after = vec![
+            renamed(before[1].clone(), r"\\.\DISPLAY8", 4),
+            renamed(before[1].clone(), r"\\.\DISPLAY7", 5),
+        ];
+        assert_eq!(relocate(&before, 1, &after), Relocation::Found(4));
+    }
+
+    #[test]
+    fn the_home_index_is_off_limits_only_when_another_screen_sits_there() {
+        let before = real_outputs();
+        let ids = identities(&before);
+        let me = identity_of(&before[1]);
+        // screen-2's monitor took output 1, under any name.
+        let taken = vec![renamed(before[2].clone(), r"\\.\DISPLAY9", 1)];
+        assert!(home_is_anothers(&me, 0, 1, &ids, &taken));
+        // A stranger there, or nothing there, may be tried.
+        let mut stranger = renamed(before[1].clone(), r"\\.\DISPLAY9", 1);
+        stranger.x = 9000;
+        assert!(!home_is_anothers(&me, 0, 1, &ids, &[stranger]));
+        assert!(!home_is_anothers(&me, 0, 1, &ids, &[]));
+    }
+
+    // -- the supervisor's state machine ------------------------------------------
+
+    const LOST: ScreenFailure = ScreenFailure::Outage(ScreenFault::AccessLost);
+    const DENIED: ScreenFailure = ScreenFailure::Outage(ScreenFault::AccessDenied);
+    const GPU: ScreenFailure = ScreenFailure::Outage(ScreenFault::GpuBusy);
+
+    #[test]
+    fn an_unrecognised_failure_during_an_outage_is_the_outage() {
+        let mut sup = Supervision::new(true);
+        assert!(!sup.promotes(ScreenFailure::Unknown, true), "no outage yet");
+        assert_eq!(sup.failed(DENIED, true, 1_000), Verdict::Wait { began: true });
+        assert!(sup.promotes(ScreenFailure::Unknown, true));
+        assert_eq!(sup.failed(ScreenFailure::Unknown, true, 2_000), Verdict::Wait { began: false });
+        let o = sup.outage.as_ref().map(|o| (o.fault, o.attempts, o.since));
+        assert_eq!(o, Some((ScreenFault::AccessDenied, 2, 1_000)));
+        assert_eq!(sup.restarts, 0, "waited out, not spent");
+        // Fatal still ends it, and non-screens are never promoted.
+        let fatal = ScreenFailure::Fatal(FatalFault::EncoderMissing);
+        assert_eq!(sup.failed(fatal, true, 3_000), Verdict::Fatal(FatalFault::EncoderMissing));
+        assert!(!sup.promotes(ScreenFailure::Unknown, false));
+        assert_eq!(sup.failed(ScreenFailure::Unknown, false, 3_000), Verdict::Restart);
+    }
+
+    #[test]
+    fn footage_ends_the_outage_and_the_next_one_starts_fresh() {
+        let mut sup = Supervision::new(true);
+        for _ in 0..5 {
+            sup.failed(DENIED, true, 1_000);
+        }
+        sup.ran(false);
+        assert_eq!(sup.outage.as_ref().map(|o| o.attempts), Some(5), "nothing recorded, still waiting");
+        sup.ran(true);
+        assert!(sup.outage.is_none());
+        assert_eq!(sup.restarts, 0);
+        assert_eq!(sup.failed(LOST, true, 9_000), Verdict::Wait { began: true });
+        let o = sup.outage.as_ref().map(|o| (o.attempts, o.since));
+        assert_eq!(o, Some((1, 9_000)));
+    }
+
+    #[test]
+    fn a_screen_that_has_recorded_waits_out_any_outage_forever() {
+        // Ten hours at the 120s away spacing is 300 attempts; go well past it.
+        let mut sup = Supervision::new(true);
+        let mut began = 0;
+        for i in 0..5_000 {
+            match sup.failed(if i % 2 == 0 { DENIED } else { LOST }, true, i) {
+                Verdict::Wait { began: b } => began += b as u32,
+                v => panic!("attempt {i}: {v:?}"),
+            }
+        }
+        assert_eq!(began, 1, "one outage, so one restart in the manifest");
+    }
+
+    #[test]
+    fn an_encoder_that_never_opens_fails_with_its_raw_error_instead_of_waiting() {
+        // A QSV encoder that cannot initialise reads as GpuBusy every time. Before
+        // any footage that spends the budget like any other failure.
+        let mut sup = Supervision::new(false);
+        for i in 1..=MAX_RESTARTS {
+            assert_eq!(
+                sup.failed(GPU, true, i as i64),
+                Verdict::Wait { began: i == 1 },
+                "attempt {i}"
+            );
+        }
+        assert_eq!(sup.failed(GPU, true, 99), Verdict::GiveUp);
+        // Footage once is enough to make outages free again.
+        let mut sup = Supervision::new(false);
+        sup.failed(GPU, true, 0);
+        sup.ran(true);
+        for i in 0..(MAX_RESTARTS * 5) {
+            assert!(matches!(sup.failed(GPU, true, i as i64), Verdict::Wait { .. }));
+        }
+    }
+
+    #[test]
+    fn unrecognised_failures_spend_the_budget() {
+        let mut sup = Supervision::new(true);
+        for _ in 0..MAX_RESTARTS {
+            assert_eq!(sup.failed(ScreenFailure::Unknown, false, 0), Verdict::Restart);
+        }
+        assert_eq!(sup.failed(ScreenFailure::Unknown, false, 0), Verdict::GiveUp);
+    }
+
+    fn at(found: Relocation, home_taken: bool) -> Option<Located> {
+        Some(Located {
+            found,
+            home_idx: 2,
+            home_taken,
+        })
+    }
+
+    #[test]
+    fn a_missing_monitor_launches_nothing_but_probes_its_home_every_tenth_look() {
+        let mut sup = Supervision::new(true);
+        for round in 0..3 {
+            for look in 1..MISSING_PROBE_EVERY {
+                assert_eq!(
+                    sup.plan_relaunch(at(Relocation::Missing, false)),
+                    RelaunchPlan::Wait(None),
+                    "round {round}, look {look}"
+                );
+            }
+            assert_eq!(sup.plan_relaunch(at(Relocation::Missing, false)), RelaunchPlan::Probe(2));
+        }
+        // Another screen's monitor at home: no probe, keep waiting.
+        for _ in 1..MISSING_PROBE_EVERY {
+            sup.plan_relaunch(at(Relocation::Missing, true));
+        }
+        assert_eq!(sup.plan_relaunch(at(Relocation::Missing, true)), RelaunchPlan::Wait(None));
+        // Finding it resets the count.
+        for _ in 1..MISSING_PROBE_EVERY {
+            sup.plan_relaunch(at(Relocation::Missing, false));
+        }
+        assert_eq!(sup.plan_relaunch(at(Relocation::Found(0), false)), RelaunchPlan::Launch(Some(0)));
+        assert_eq!(sup.plan_relaunch(at(Relocation::Missing, false)), RelaunchPlan::Wait(None));
+        // Not a screen, or no enumeration: launch where it was.
+        assert_eq!(sup.plan_relaunch(None), RelaunchPlan::Launch(None));
+    }
+
+    #[test]
+    fn a_missing_monitor_waits_as_an_outage_without_a_launch() {
+        // The no-launch path feeds the same outage as a failed run would.
+        let mut sup = Supervision::new(true);
+        assert_eq!(sup.plan_relaunch(at(Relocation::Missing, false)), RelaunchPlan::Wait(None));
+        let missing = ScreenFailure::Outage(ScreenFault::MonitorMissing);
+        assert_eq!(sup.failed(missing, true, 5), Verdict::Wait { began: true });
+        assert_eq!(sup.failed(missing, true, 6), Verdict::Wait { began: false });
+        assert_eq!(sup.outage.as_ref().map(|o| o.fault), Some(ScreenFault::MonitorMissing));
+    }
+
+    #[test]
+    fn a_monitor_on_another_adapter_must_stay_there_three_looks_running() {
+        let mut sup = Supervision::new(true);
+        let other = at(Relocation::OtherAdapter(1), false);
+        assert_eq!(sup.plan_relaunch(other), RelaunchPlan::Wait(Some(1)));
+        assert_eq!(sup.plan_relaunch(other), RelaunchPlan::Wait(Some(1)));
+        // Interrupted: start again.
+        assert_eq!(sup.plan_relaunch(at(Relocation::Missing, false)), RelaunchPlan::Wait(None));
+        assert_eq!(sup.plan_relaunch(other), RelaunchPlan::Wait(Some(1)));
+        assert_eq!(sup.plan_relaunch(other), RelaunchPlan::Wait(Some(1)));
+        assert_eq!(sup.plan_relaunch(other), RelaunchPlan::MovedAdapter(1));
+    }
+
+    #[test]
+    fn nobody_at_the_machine_means_one_attempt_every_two_minutes() {
+        let away = Some(AWAY_IDLE_MS);
+        // The ramp is untouched, so a short outage nobody is touching the mouse
+        // through (a film changing mode) still recovers in seconds.
+        for attempt in 1..=5 {
+            assert_eq!(outage_delay_ms(attempt, away), outage_backoff_ms(attempt));
+        }
+        assert_eq!(outage_delay_ms(6, away), AWAY_RETRY_MS);
+        assert_eq!(outage_delay_ms(600, Some(36_000_000)), AWAY_RETRY_MS);
+        // Someone there, or no reading: the normal cap.
+        assert_eq!(outage_delay_ms(600, Some(AWAY_IDLE_MS - 1)), OUTAGE_BACKOFF_CAP_MS);
+        assert_eq!(outage_delay_ms(600, None), OUTAGE_BACKOFF_CAP_MS);
+        // A display-off night of 10h is 300 attempts, not 1200.
+        let night: u64 = 10 * 3_600_000;
+        assert_eq!(night / AWAY_RETRY_MS, 300);
+    }
+
+    // -- waiting, against a throwaway session directory ------------------------
+
+    /// An `Inner` with one screen track, writing its manifest under the temp
+    /// dir. Nothing here launches ffmpeg or touches a display.
+    fn test_inner(tag: &str) -> Arc<Inner> {
+        let dir = std::env::temp_dir().join(format!("chirptime-{}-{}", tag, std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join("screen-0"));
+        let mut manifest = SessionManifest::new("test".into(), 0, 60, Rect::default());
+        manifest
+            .tracks
+            .push(new_track("screen-0", "screen", "test", None, "h264", 0, 0, 30));
+        Arc::new(Inner {
+            session_dir: dir,
+            segment_seconds: 60,
+            ffmpeg: "unused".into(),
+            ffprobe: "unused".into(),
+            manifest: Mutex::new(manifest),
+            stop: AtomicBool::new(false),
+            logs: Mutex::new(Default::default()),
+            warnings: Mutex::new(Vec::new()),
+            fatal: Mutex::new(None),
+            extra_joins: Mutex::new(Vec::new()),
+            last_input_ms: AtomicI64::new(0),
+            drop_idle_after_ms: 0,
+            health: Mutex::new(Default::default()),
+            screen_identities: Vec::new(),
+        })
+    }
+
+    fn screen_out(inner: &Inner) -> OutputState {
+        OutputState::new(
+            &inner.session_dir,
+            &OutputSpec {
+                track_id: "screen-0".into(),
+                dir_name: "screen-0".into(),
+                segment_seconds: 60,
+            },
+        )
+    }
+
+    #[test]
+    fn stop_during_an_outage_wait_returns_promptly() {
+        let inner = test_inner("stopwait");
+        let waiter = {
+            let inner = inner.clone();
+            std::thread::spawn(move || {
+                let mut outs = vec![screen_out(&inner)];
+                let mut sup = Supervision::new(true);
+                let v = sup.failed(DENIED, true, now_ms());
+                let started = std::time::Instant::now();
+                wait_in_outage(&inner, "screen-0", &mut outs, &mut sup, v == Verdict::Wait { began: true }, "test");
+                // And the plain wait, the longest one there is.
+                let o = sup.outage.as_mut().expect("waiting");
+                let more = wait_out_outage(&inner, &mut outs, o, AWAY_RETRY_MS, None);
+                (started.elapsed(), more)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        // Waiting is published while it lasts.
+        let health = inner.health.lock().unwrap().get("screen-0").cloned();
+        assert!(health.is_some_and(|h| h.waiting_since_epoch_ms.is_some()));
+        inner.stop.store(true, Ordering::SeqCst);
+        let (took, more) = waiter.join().expect("waiter");
+        assert!(!more, "a stopping session ends the wait");
+        assert!(took < Duration::from_secs(6), "took {took:?}");
+        assert_eq!(inner.manifest.lock().unwrap().tracks[0].restarts, 1);
+        let _ = std::fs::remove_dir_all(&inner.session_dir);
+    }
+
+    // -- placing the segment that ends downtime ----------------------------------
+
+    fn track_down_since(end: i64, until: i64, reason: &str) -> (Track, Downtime) {
+        let mut t = new_track("mic", "mic", "test", None, "aac", 0, 0, 0);
+        t.segments.push(Segment {
+            file: "a.mp4".into(),
+            start_epoch_ms: 0,
+            duration_ms: end,
+            bytes: 1,
+        });
+        let d = down(end, reason);
+        stretch_downtime_gap(&mut t.gaps, &d, until);
+        (t, d)
+    }
+
+    #[test]
+    fn the_segment_that_ends_downtime_closes_its_gap_and_adds_none() {
+        // Anchored (a dshow track): the gap ends where the content began.
+        let (mut t, d) = track_down_since(10_000, 50_000, "Stopped unexpectedly; restarting");
+        let start = place_segment(&mut t, 49_500, Some(48_000), None, Some(&d));
+        assert_eq!(start, 48_000);
+        assert_eq!(t.gaps.len(), 1, "{:?}", t.gaps);
+        assert_eq!((t.gaps[0].from_epoch_ms, t.gaps[0].to_epoch_ms), (10_000, 48_000));
+        assert_eq!(t.gaps[0].reason, "Stopped unexpectedly; restarting");
+
+        // Unanchored (a screen): at the file's own time, never chained across.
+        let (mut t, d) = track_down_since(10_000, 50_000, "Display was locked or asleep");
+        assert_eq!(place_segment(&mut t, 51_000, None, None, Some(&d)), 51_000);
+        assert_eq!(t.gaps.len(), 1);
+        assert_eq!(t.gaps[0].to_epoch_ms, 51_000);
+
+        // What a split-out mic did before it kept its state: no downtime to
+        // resume, so the anchor laid a second gap over the open one.
+        let (mut t, _) = track_down_since(10_000, 50_000, "Stopped unexpectedly; restarting");
+        place_segment(&mut t, 49_500, Some(48_000), None, None);
+        assert_eq!(t.gaps.len(), 2);
+        assert_eq!(t.gaps[1].reason, "track restarted");
     }
 }
