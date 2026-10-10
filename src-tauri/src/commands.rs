@@ -911,15 +911,25 @@ pub async fn add_marker(
     rec.add_marker(label)
 }
 
-/// Set or clear a mark's note (S6). Lead pre-wire: `library` replaces the stub.
+pub const LIVE_NOTES_ERR: &str = "Stop recording to edit notes";
+
+/// Set or clear a mark's note. An empty label means no note. Refused while the
+/// session records: the recorder owns that manifest and its next flush would
+/// overwrite the edit.
 #[tauri::command]
 pub async fn set_marker_label(
+    state: tauri::State<'_, State>,
     session_id: String,
     epoch_ms: i64,
     label: String,
-) -> Result<(), String> {
-    let _ = (session_id, epoch_ms, label);
-    Err("Editing notes is not built yet".into())
+) -> Result<crate::session::Marker, String> {
+    let (_, dir) = editable_session(state.inner(), &session_id)
+        .await
+        .map_err(|e| match e.as_str() {
+            crate::edit::LIVE_SESSION_ERR | crate::edit::STOPPING_SESSION_ERR => LIVE_NOTES_ERR.to_string(),
+            _ => e,
+        })?;
+    blocking(move || crate::edit::set_marker_label(&dir, epoch_ms, &label)).await
 }
 
 /// Reconstruct a session's manifest purely by scanning its directory and

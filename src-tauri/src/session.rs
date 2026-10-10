@@ -288,15 +288,25 @@ pub fn append_marker(session_dir: &Path, marker: &Marker) -> Result<(), String> 
     writeln!(f, "{}", line).map_err(|e| e.to_string())
 }
 
+/// Every mark, in the order first made. A note edit appends the same instant
+/// again with its new label; the last line per instant wins.
 pub fn read_markers(session_dir: &Path) -> Vec<Marker> {
     let path = session_dir.join(MARKERS_FILE);
     let Ok(data) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
-    data.lines()
+    let mut out: Vec<Marker> = Vec::new();
+    for mk in data
+        .lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<Marker>(l).ok())
-        .collect()
+    {
+        match out.iter_mut().find(|o| o.epoch_ms == mk.epoch_ms) {
+            Some(o) => o.label = mk.label,
+            None => out.push(mk),
+        }
+    }
+    out
 }
 
 pub fn append_cut(session_dir: &Path, cut: &Cut) -> Result<(), String> {

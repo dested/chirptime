@@ -1191,6 +1191,31 @@ pub fn purge_thumbs(session_dir: &Path, cut: &Cut) -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// Mark notes
+// ---------------------------------------------------------------------------
+
+pub const NO_MARK_ERR: &str = "That mark is no longer in this session";
+
+/// Set (or, with an empty label, clear) the note on the mark at `epoch_ms`. The
+/// manifest is rewritten and the new label appended to `markers.jsonl`, whose
+/// last line per instant wins, so a rebuild keeps the note. The caller has
+/// refused the live session: the recorder owns that manifest.
+pub fn set_marker_label(session_dir: &Path, epoch_ms: i64, label: &str) -> Result<Marker, String> {
+    let _g = edit_lock();
+    let mut m = load_manifest(session_dir)?;
+    let mk = m
+        .markers
+        .iter_mut()
+        .find(|mk| mk.epoch_ms == epoch_ms)
+        .ok_or(NO_MARK_ERR)?;
+    mk.label = label.trim().to_string();
+    let out = mk.clone();
+    session::write_manifest(session_dir, &m)?;
+    session::append_marker(session_dir, &out)?;
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // Whole sessions
 // ---------------------------------------------------------------------------
 

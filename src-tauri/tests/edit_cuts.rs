@@ -566,3 +566,37 @@ fn a_torn_cuts_line_does_not_swallow_the_next() {
     session::append_cut(&dir, &cut).unwrap();
     assert_eq!(session::read_cuts(&dir), vec![cut]);
 }
+
+#[test]
+fn a_mark_note_is_set_cleared_and_survives_a_rebuild() {
+    let dir = std::env::temp_dir()
+        .join("chirptime-edit-cuts")
+        .join(format!("notes-{}", std::process::id()))
+        .join(ID);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let base = base_epoch();
+    let first = Marker { epoch_ms: base + 5_000, label: String::new() };
+    let second = Marker { epoch_ms: base + 30_000, label: "old".into() };
+    let mut m = SessionManifest::new(ID.to_string(), base, 10, Rect::default());
+    m.markers = vec![first.clone(), second.clone()];
+    m.ended_epoch_ms = Some(base + AUDIO_LEN_MS);
+    session::write_manifest(&dir, &m).unwrap();
+    session::append_marker(&dir, &first).unwrap();
+    session::append_marker(&dir, &second).unwrap();
+
+    let set = edit::set_marker_label(&dir, first.epoch_ms, "  Bug repro ").unwrap();
+    assert_eq!(set.label, "Bug repro");
+    edit::set_marker_label(&dir, second.epoch_ms, "").unwrap();
+
+    let labels = |ms: &[Marker]| ms.iter().map(|mk| (mk.epoch_ms, mk.label.clone())).collect::<Vec<_>>();
+    let want = vec![(first.epoch_ms, "Bug repro".to_string()), (second.epoch_ms, String::new())];
+    assert_eq!(labels(&session::read_manifest(&dir).unwrap().markers), want);
+    // the sidecar a rebuild reads: one entry per instant, last label wins
+    assert_eq!(labels(&session::read_markers(&dir)), want);
+
+    assert_eq!(
+        edit::set_marker_label(&dir, base + 1, "nope").unwrap_err(),
+        edit::NO_MARK_ERR
+    );
+}
