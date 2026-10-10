@@ -39,6 +39,11 @@ windows = { version = "0.61", features = [
     # coordinates, so the manifest's desktop box and monitor rects come out
     # scaled by the display scale factor. See recorder::ensure_process_dpi_aware.
     "Win32_UI_HiDpi",
+    # Session recorder inactivity trimming (src/recorder.rs): GetLastInputInfo
+    # reports the last system-wide keyboard/mouse input, and GetTickCount is the
+    # clock its timestamp is measured in. See recorder::poll_last_input_ms.
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_SystemInformation",
     # Native folder picker for the output directory (src/nativeui.rs):
     # IFileOpenDialog + FOS_PICKFOLDERS, owned by the widget window so it cannot
     # open behind an always-on-top widget.

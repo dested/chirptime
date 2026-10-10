@@ -84,6 +84,62 @@ const PAIR_SPLIT_AFTER: u32 = 4;
 /// atom, so this trades a bounded, distributed loss for a rarer but much larger
 /// one. See decisions.md — this was a deliberate call, not an oversight.
 const AUDIO_SEGMENT_SECONDS: u32 = 600;
+/// How often the idle tracker re-reads the system-wide last-input time. Coarse on
+/// purpose: the inactivity threshold is measured in minutes, so second-scale
+/// resolution is ample and the poll costs one cheap syscall.
+const IDLE_POLL_MS: u64 = 2_000;
+
+// ---------------------------------------------------------------------------
+// Inactivity tracking
+// ---------------------------------------------------------------------------
+
+/// The epoch-ms of the most recent system-wide keyboard or mouse input.
+///
+/// `GetLastInputInfo` reports the last input across the whole desktop session —
+/// any application, not just this one — which is exactly the signal inactivity
+/// trimming wants: "was the user doing anything, anywhere". `dwTime` is a
+/// `GetTickCount` value (ms since boot, 32-bit, wraps ~every 49.7 days), so the
+/// idle duration is `GetTickCount() - dwTime` computed with wrapping arithmetic,
+/// and the wall-clock instant of that input is `now - idle`.
+#[cfg(target_os = "windows")]
+fn poll_last_input_ms() -> Option<i64> {
+    use windows::Win32::System::SystemInformation::GetTickCount;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+
+    let mut lii = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    let ok = unsafe { GetLastInputInfo(&mut lii) };
+    if !ok.as_bool() {
+        return None;
+    }
+    let tick = unsafe { GetTickCount() };
+    let idle_ms = tick.wrapping_sub(lii.dwTime) as i64;
+    Some(now_ms() - idle_ms)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn poll_last_input_ms() -> Option<i64> {
+    None
+}
+
+/// Keep `inner.last_input_ms` current for as long as the session runs. Only
+/// spawned when inactivity trimming is on.
+fn idle_poll_loop(inner: Arc<Inner>) {
+    while !inner.stopping() {
+        if let Some(t) = poll_last_input_ms() {
+            inner.last_input_ms.fetch_max(t, Ordering::Relaxed);
+        }
+        // Sleep IDLE_POLL_MS in short slices so stop is prompt.
+        for _ in 0..(IDLE_POLL_MS / 100).max(1) {
+            if inner.stopping() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Process helpers
@@ -1319,6 +1375,10 @@ pub struct SessionOptions {
     pub mic_device: Option<String>,
     pub record_system_audio: bool,
     pub mic_sidecar_16k: bool,
+    /// Delete any segment that covered a stretch with **no** keyboard or mouse
+    /// input, once the idle stretch has run longer than this. `0` disables it and
+    /// every segment is kept. Windows-only — see [`Inner::drop_idle_after_ms`].
+    pub drop_idle_after_seconds: u32,
 }
 
 impl Default for SessionOptions {
@@ -1336,6 +1396,7 @@ impl Default for SessionOptions {
             mic_device: None,
             record_system_audio: true,
             mic_sidecar_16k: true,
+            drop_idle_after_seconds: 60,
         }
     }
 }
@@ -1358,6 +1419,14 @@ struct Inner {
     /// the shared webcam/mic process into two solo ones if the pair cannot run.
     /// `stop` drains this as well, so a split session still shuts down cleanly.
     extra_joins: Mutex<Vec<JoinHandle<()>>>,
+    /// Epoch-ms of the last system-wide keyboard/mouse input, maintained by
+    /// [`idle_poll_loop`]. Read when a segment closes to decide whether it covered
+    /// a stretch with no user activity.
+    last_input_ms: AtomicI64,
+    /// Delete a closed segment whose whole span was idle, once the idle stretch
+    /// has run at least this long. `0` disables trimming (also forced to `0` off
+    /// Windows, where there is no input poller). See [`index_output_segment`].
+    drop_idle_after_ms: i64,
 }
 
 impl Inner {
@@ -1701,6 +1770,18 @@ impl Recorder {
             }
         }
 
+        // Inactivity trimming is Windows-only: it depends on the input poller, and
+        // without one every segment past the threshold would be read as idle and
+        // deleted. Off Windows the feature is simply disabled.
+        #[cfg(target_os = "windows")]
+        let drop_idle_after_ms = opts.drop_idle_after_seconds as i64 * 1000;
+        #[cfg(not(target_os = "windows"))]
+        let drop_idle_after_ms = 0i64;
+
+        // Seed from a real reading so a session that starts mid-activity is not
+        // mistaken for idle; fall back to "now" if the poll fails.
+        let seed_input_ms = poll_last_input_ms().unwrap_or_else(now_ms);
+
         let inner = Arc::new(Inner {
             session_dir: session_dir.clone(),
             segment_seconds: manifest.segment_seconds,
@@ -1712,6 +1793,8 @@ impl Recorder {
             warnings: Mutex::new(warnings),
             fatal: Mutex::new(None),
             extra_joins: Mutex::new(Vec::new()),
+            last_input_ms: AtomicI64::new(seed_input_ms),
+            drop_idle_after_ms,
         });
         inner.flush();
 
@@ -1736,6 +1819,17 @@ impl Recorder {
                     .name("rec-diskguard".into())
                     .spawn(move || disk_guard(inner))
                     .map_err(|e| format!("spawn disk guard: {}", e))?,
+            );
+        }
+
+        // Inactivity tracker — only when trimming is on.
+        if inner.drop_idle_after_ms > 0 {
+            let inner = inner.clone();
+            joins.push(
+                std::thread::Builder::new()
+                    .name("rec-idle".into())
+                    .spawn(move || idle_poll_loop(inner))
+                    .map_err(|e| format!("spawn idle tracker: {}", e))?,
             );
         }
 
@@ -1840,6 +1934,18 @@ enum RunOutcome {
     SpawnFailed(String),
 }
 
+/// A run of consecutive segments deleted for inactivity, collapsed into one gap.
+///
+/// `from` is where the first dropped segment began and `to` where the most recent
+/// one ended. The next *kept* segment flushes this as a single manifest gap and
+/// chains across it, so a long idle stretch is one honest hole rather than a
+/// scatter of per-segment gaps or a spurious "dropped time" drift gap.
+#[derive(Debug, Clone, Copy)]
+struct IdleTail {
+    from: i64,
+    to: i64,
+}
+
 /// One output file stream of a supervisor's ffmpeg process, and the manifest
 /// track it feeds.
 struct OutputState {
@@ -1865,6 +1971,22 @@ struct OutputState {
     /// "the pair cannot run" from "one half of the pair is broken". Both are
     /// answered the same way — see [`split_pair`].
     barren_runs: u32,
+    /// The still-open run of inactivity-dropped segments, if the last few segments
+    /// were all deleted for idle. Flushed by the next kept segment. See
+    /// [`index_output_segment`] and [`IdleTail`].
+    idle_tail: Option<IdleTail>,
+}
+
+/// Whether a segment starting at `seg_start` should be deleted for inactivity,
+/// given the last input at `last_input` and a threshold of `drop_after_ms`.
+///
+/// Drop only when there was no input from before the segment began (`last_input <
+/// seg_start`) *and* the idle stretch had already run at least the threshold by
+/// the time it started. That second clause is what keeps up to one threshold's
+/// worth of footage after the last activity, instead of cutting the instant input
+/// stops. `drop_after_ms <= 0` never drops.
+fn should_drop_idle(last_input: i64, seg_start: i64, drop_after_ms: i64) -> bool {
+    drop_after_ms > 0 && last_input < seg_start && seg_start - last_input >= drop_after_ms
 }
 
 impl OutputState {
@@ -1885,6 +2007,7 @@ impl OutputState {
             segment_seconds: o.segment_seconds,
             produced: 0,
             barren_runs: 0,
+            idle_tail: None,
         }
     }
 
@@ -2490,6 +2613,53 @@ fn index_output_segment(
     file: &str,
     observed: i64,
 ) {
+    // Inactivity trimming. A segment spans roughly [observed, now]: `observed` is
+    // when the file first appeared (≈ its start) and now is when the next file
+    // appeared / the process exited (≈ its close). Delete it when there was no
+    // keyboard/mouse input across that whole span *and* the idle stretch had
+    // already run past the threshold when the segment began — so up to one
+    // threshold's worth of footage after the last activity is always kept.
+    if inner.drop_idle_after_ms > 0 {
+        let last_input = inner.last_input_ms.load(Ordering::Relaxed);
+        if should_drop_idle(last_input, observed, inner.drop_idle_after_ms) {
+            let seg_end = now_ms();
+            let path = o.dir.join(file);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    let from = o.idle_tail.map(|t| t.from).unwrap_or(observed);
+                    o.idle_tail = Some(IdleTail { from, to: seg_end });
+                    // The run's anchor no longer describes a later kept segment, and
+                    // the process is plainly healthy, so consume both.
+                    o.anchor_pending = false;
+                    o.produced += 1;
+                    return;
+                }
+                Err(e) => {
+                    // Never orphan an un-indexed file on disk; fall through and keep
+                    // it so playback can still find it.
+                    eprintln!(
+                        "[recorder] idle segment {}/{} not deleted ({}); keeping it",
+                        o.track_id, file, e
+                    );
+                }
+            }
+        }
+    }
+
+    // A kept segment after an idle run flushes the collapsed idle gap and chains
+    // across it, so the drift logic in `decide_segment_start` does not also record
+    // a "dropped time" gap for the same hole.
+    let chain_override = o.idle_tail.take().map(|t| {
+        record_gap(
+            inner,
+            &o.track_id,
+            t.from,
+            t.to,
+            "idle — no keyboard or mouse activity",
+        );
+        t.to
+    });
+
     // Only the first segment of a run is placed by the anchor; the rest chain off
     // it, so a late-resolving estimate cannot shunt the track mid-run.
     let a = if o.anchor_pending { anchor.resolve() } else { None };
@@ -2503,6 +2673,7 @@ fn index_output_segment(
         observed,
         a,
         o.segment_seconds,
+        chain_override,
     );
 }
 
@@ -2616,6 +2787,7 @@ fn index_segment(
     observed: i64,
     anchor: Option<i64>,
     segment_seconds: u32,
+    chain_override: Option<i64>,
 ) {
     let path = dir.join(file);
     let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -2644,10 +2816,15 @@ fn index_segment(
             return;
         };
 
-        let chained = track
-            .segments
-            .last()
-            .map(|s| s.start_epoch_ms + s.duration_ms);
+        // After an idle run, `chain_override` carries the end of the deleted
+        // stretch so this segment chains onto it (delta ≈ 0, no drift gap) rather
+        // than onto the last *kept* segment before the hole.
+        let chained = chain_override.or_else(|| {
+            track
+                .segments
+                .last()
+                .map(|s| s.start_epoch_ms + s.duration_ms)
+        });
 
         let decided = decide_segment_start(anchor, chained, observed);
         let start = decided.start_epoch_ms;
@@ -3292,7 +3469,8 @@ mod tests {
             "record_mic": true,
             "mic_device": null,
             "record_system_audio": false,
-            "mic_sidecar_16k": true
+            "mic_sidecar_16k": true,
+            "drop_idle_after_seconds": 120
         }"#;
         let o: SessionOptions = serde_json::from_str(json).expect("frontend payload must parse");
         assert_eq!(o.segment_seconds, 30);
@@ -3303,6 +3481,17 @@ mod tests {
         assert_eq!(o.mic_device, None);
         assert!(!o.record_system_audio);
         assert!(o.mic_sidecar_16k);
+        assert_eq!(o.drop_idle_after_seconds, 120);
+    }
+
+    /// A payload from a widget that predates this field still parses, and the
+    /// field falls back to its default rather than 0 (which would silently disable
+    /// trimming for everyone who upgraded).
+    #[test]
+    fn an_older_payload_without_the_idle_field_defaults_it() {
+        let json = r#"{ "segment_seconds": 60 }"#;
+        let o: SessionOptions = serde_json::from_str(json).expect("partial payload must parse");
+        assert_eq!(o.drop_idle_after_seconds, 60);
     }
 
     /// The widget's `DEFAULT_OPTIONS` must be this struct's defaults, or the
@@ -3317,6 +3506,7 @@ mod tests {
         assert!(d.screens.is_empty(), "empty means every capturable screen");
         assert!(d.record_screens && d.record_webcam && d.record_mic && d.record_system_audio);
         assert!(d.mic_sidecar_16k);
+        assert_eq!(d.drop_idle_after_seconds, 60);
     }
 
     // -- microphone selection ------------------------------------------------
@@ -3621,6 +3811,41 @@ mod tests {
         let gap = d.gap.expect("the restart downtime must be recorded");
         assert_eq!((gap.from_epoch_ms, gap.to_epoch_ms), (chained, restarted));
         assert_eq!(gap.reason, "track restarted");
+    }
+
+    // -- inactivity trimming -------------------------------------------------
+
+    #[test]
+    fn a_segment_with_recent_input_is_kept() {
+        let last_input = 1_785_180_030_000i64;
+        // Segment started 30s before that input, so input happened during it.
+        let seg_start = last_input - 30_000;
+        assert!(!should_drop_idle(last_input, seg_start, 60_000));
+    }
+
+    #[test]
+    fn a_fully_idle_segment_past_the_threshold_is_dropped() {
+        let last_input = 1_785_180_000_000i64;
+        // Started 61s after the last input — idle longer than the 60s threshold.
+        let seg_start = last_input + 61_000;
+        assert!(should_drop_idle(last_input, seg_start, 60_000));
+    }
+
+    #[test]
+    fn footage_within_one_threshold_of_the_last_input_survives() {
+        let last_input = 1_785_180_000_000i64;
+        // Idle, but only 30s in — under the 60s grace, so it is kept.
+        let seg_start = last_input + 30_000;
+        assert!(!should_drop_idle(last_input, seg_start, 60_000));
+        // Exactly at the threshold is the first one dropped.
+        assert!(should_drop_idle(last_input, last_input + 60_000, 60_000));
+    }
+
+    #[test]
+    fn a_zero_threshold_disables_trimming() {
+        let last_input = 1_785_180_000_000i64;
+        // Hours idle, but trimming is off, so nothing is ever dropped.
+        assert!(!should_drop_idle(last_input, last_input + 6 * 3_600_000, 0));
     }
 
     // -- exit diagnosis ------------------------------------------------------

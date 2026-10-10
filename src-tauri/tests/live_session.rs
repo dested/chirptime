@@ -119,6 +119,7 @@ fn opts(segment_seconds: u32) -> SessionOptions {
         record_webcam: false, // the BRIO is frequently held by another app; see report
         record_mic: true,
         record_system_audio: true,
+        drop_idle_after_seconds: 0, // the audit checks coverage; don't let idle trimming delete segments
         ..Default::default()
     }
 }
@@ -333,6 +334,7 @@ fn lipsync() {
         // and that must stay true here.
         webcam_device: None,
         mic_device: None,
+        drop_idle_after_seconds: 0, // the audit checks coverage; don't let idle trimming delete segments
         ..Default::default()
     };
 
@@ -432,6 +434,7 @@ fn pair_split() {
         record_system_audio: false,
         webcam_device: Some("ChirpTime No Such Camera".into()),
         mic_device: None,
+        drop_idle_after_seconds: 0,
         ..Default::default()
     };
 

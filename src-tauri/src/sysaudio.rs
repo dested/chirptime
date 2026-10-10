@@ -1052,6 +1052,69 @@ mod tests {
         );
     }
 
+    /// Live diagnostic, not a regression test: opens loopback on the CURRENT
+    /// default render endpoint, plays a Windows sound to that endpoint partway
+    /// through, and reports what WASAPI actually delivered. Run with
+    /// `cargo test --lib live_loopback_probe -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn live_loopback_probe() {
+        let _com = ComApartment::new().expect("COM");
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }.expect("enum");
+
+        let default_id = unsafe { default_render_id(&enumerator) }.expect("default id");
+        println!("default render endpoint: {default_id}");
+
+        let mut s = unsafe { Stream::open_default(&enumerator) }.expect("open loopback");
+        println!(
+            "opened: device={} fmt={:?} {}ch {}Hz",
+            s.device_id, s.fmt.kind, s.fmt.channels, s.fmt.rate
+        );
+
+        let mut ring: VecDeque<f32> = VecDeque::new();
+        let mut played = false;
+        let started = Instant::now();
+        let mut per_second: Vec<(u64, usize, usize, f32)> = Vec::new(); // (sec, samples, nonzero, peak)
+        let mut cur = (0u64, 0usize, 0usize, 0f32);
+
+        while started.elapsed() < Duration::from_secs(8) {
+            if !played && started.elapsed() >= Duration::from_secs(2) {
+                played = true;
+                // SoundPlayer renders via waveOut -> default console endpoint.
+                let _ = std::process::Command::new("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-c",
+                        "(New-Object Media.SoundPlayer 'C:\\Windows\\Media\\Alarm01.wav').Play(); Start-Sleep -s 4",
+                    ])
+                    .spawn();
+                println!("--- playback launched at t+2s ---");
+            }
+            if let Err(e) = unsafe { s.drain(&mut ring) } {
+                println!("drain error: {e}");
+                break;
+            }
+            let sec = started.elapsed().as_secs();
+            if sec != cur.0 {
+                per_second.push(cur);
+                cur = (sec, 0, 0, 0.0);
+            }
+            for v in ring.drain(..) {
+                cur.1 += 1;
+                if v.abs() > 1e-4 {
+                    cur.2 += 1;
+                }
+                cur.3 = cur.3.max(v.abs());
+            }
+            thread::sleep(TICK);
+        }
+        per_second.push(cur);
+        for (sec, n, nz, peak) in per_second {
+            println!("t={sec}s: {n} samples delivered, {nz} non-silent, peak={peak:.4}");
+        }
+    }
+
     #[test]
     fn no_switch_is_reported_twice_for_the_same_settled_candidate() {
         // The worker calls rebind() after acting; until it does, the watcher will

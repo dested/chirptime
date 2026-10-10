@@ -6,6 +6,42 @@
 > Entries below dated 2026-03-xx were reconstructed from the code on 2026-07-27
 > when this file was created; the reasoning is inferred from the implementation.
 
+## 2026-08-01 — Idle footage is trimmed by deleting closed segments, not by pausing
+**Why:** a life recorder that runs all day fills a disk with footage of nobody
+being there (~5–8 GB/hr). The user asked for it to be "smarter" — drop stretches
+with no keyboard/mouse activity, ideally in real time.
+**Chosen (scope, confirmed with the user):** the **continuous session recorder
+only**; **keyboard/mouse only** as the activity signal (`GetLastInputInfo`, which
+is system-wide across every app — the right question is "was the user doing
+anything, anywhere"); and **drop everything idle**, video and audio alike.
+**Chosen (mechanism):** leave every ffmpeg process running and **delete each
+closed segment whose whole span was idle** before it is indexed
+(`index_output_segment` → `remove_file`, skip the manifest). Segments are already
+discrete `-strftime` files, so this is the natural real-time unit.
+**Rejected — pause/resume the capture while idle:** worse in practice. The webcam
+takes ~1.3s to warm up, a force-kill leaves an unfinalized (unplayable) final
+segment (see the seam-gap decision), and NVENC recording is nearly free anyway —
+the cost we're actually cutting is *disk*, which delete-on-close reclaims without
+the recorder ever skipping a beat.
+**Rejected — an "audio is playing" exception** (keep footage during videos/calls
+with no input): the user explicitly chose pure keyboard/mouse. This means passive
+viewing reads as idle and will be dropped; accepted as the desired behaviour, and
+the grace window below softens it.
+**Details that matter:** a segment is dropped only once the idle stretch has run
+past the threshold *before the segment began*, so up to one threshold's worth of
+footage after the last activity is always kept (`should_drop_idle`). Threshold is
+`SessionOptions.drop_idle_after_seconds` (default 60s, 0 disables), and the whole
+feature is **Windows-only** — off Windows there is no input poller, so it is
+forced off rather than risk reading every segment as idle and mass-deleting.
+Consecutive drops collapse into a single "idle" gap and the next kept segment
+chains across the hole (`chain_override`), so the drift logic doesn't also record
+a spurious "dropped time" gap. A failed delete falls back to keeping the segment,
+never orphaning an un-indexed file.
+**Consequence:** the manifest legitimately has holes that are neither device
+failures nor lost time, tagged with the "idle — no keyboard or mouse activity"
+reason. `captures_today`-style totals and any future "expected vs actual
+coverage" check must treat idle gaps as intentional.
+
 ## 2026-07-27 — ChirpTime is MIT, and that is what keeps FFmpeg out of the installer
 **Why:** the repo had no LICENSE at all, which made "can we ship FFmpeg with
 this" unanswerable. MIT settles it, and the two questions turn out to be one:

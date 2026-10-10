@@ -277,6 +277,12 @@ export interface SessionOptions {
   mic_device: string | null;
   record_system_audio: boolean;
   mic_sidecar_16k: boolean;
+  /**
+   * Delete any segment that covered a stretch with no keyboard or mouse input,
+   * once the idle stretch has run longer than this many seconds. `0` keeps
+   * everything. Windows-only; ignored on other platforms.
+   */
+  drop_idle_after_seconds: number;
 }
 
 /** Mirrors `commands::DisplayOutputInfo` (a flattened `recorder::DisplayOutput`). */

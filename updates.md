@@ -3,6 +3,47 @@
 > Terse log of every task: what was asked → what was done. Newest first.
 > Older entries: `updates-archive.md` (created once this passes ~300 lines).
 
+## 2026-08-01 — Inactivity trimming for the session recorder
+User wanted the continuous recorder to stop keeping footage of idle time —
+"delete that part in real time" once there's been no keyboard/mouse input for a
+while. Confirmed scope with the user: **session recorder only** (not interval
+clips), **keyboard/mouse only** (`GetLastInputInfo`, no "audio playing"
+exception), **drop everything idle** (video and audio alike).
+Implementation, all in `recorder.rs`: a background `idle_poll_loop` samples the
+system-wide last-input time (`poll_last_input_ms`, Win32 `GetLastInputInfo` +
+`GetTickCount`) into `Inner.last_input_ms` every 2s. When a closed segment is
+about to be indexed (`index_output_segment`), if its whole span had no input and
+the idle stretch already exceeded the threshold (`should_drop_idle`), the file is
+`remove_file`d and never added to the manifest; ffmpeg keeps running untouched.
+Consecutive dropped segments collapse into one `IdleTail`, flushed by the next
+kept segment as a single "idle — no keyboard or mouse activity" gap; that kept
+segment chains across the hole via a new `chain_override` arg to `index_segment`
+so the drift path doesn't also invent a "dropped time" gap. Delete failure falls
+back to keeping the segment (never orphans a file). Config: new
+`SessionOptions.drop_idle_after_seconds` (default 60, 0 = off), Windows-only
+(forced 0 elsewhere — no poller means no false mass-deletion). Frontend: field
+added to `types.ts` + `DEFAULT_OPTIONS`, and an "Inactivity" dropdown (Keep
+everything / 1 / 2 / 5 min) in `SessionSettings`. Tests: `should_drop_idle`
+cases + payload/default coverage. `cargo test --lib` (72) + `tsc` green.
+
+## 2026-07-28 — Diagnosed "system audio recorded nothing" (session 09-29-11)
+User reported sysaudio empty for a 1h session while webcam/mic were fine.
+Forensics: the track is healthy (8 segments, full wall-clock duration, 0
+restarts) but contains **only short app-notification blips** (0.31s/0.48s/a
+recurring 1.204s ping, plus one 6.8s clip at −4.3dB); everything else is the
+writer's deliberate silence padding. A new `#[ignore]`d live diagnostic
+(`sysaudio::tests::live_loopback_probe`, run with
+`cargo test --lib live_loopback_probe -- --ignored --nocapture`) proved WASAPI
+loopback on the current default endpoint (AirPods Pro A2DP) captures real audio
+correctly. Conclusion: **not a capture bug** — the loopback taps only the
+default *console* render endpoint, and this machine plays audio to several
+endpoints (default comms = Dell monitor speakers, 8 active render devices,
+per-app routing overrides for Chrome/VLC/Steam games). Whatever the user
+listened to played on a non-default endpoint, so the recorder never saw it.
+Follow-ups proposed, not built: show the captured device name + a live level
+meter in SessionPane track health; optionally capture the comms endpoint as a
+second loopback track.
+
 ## 2026-07-27 — MIT license + first-run FFmpeg install
 Four settled calls from the user, on top of the release pipeline below.
 **MIT `LICENSE`** added (Sal Aiello, 2026) and referenced from the README. The

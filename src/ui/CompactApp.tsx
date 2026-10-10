@@ -59,6 +59,7 @@ const DEFAULT_OPTIONS: SessionOptions = {
   mic_device: null,
   record_system_audio: true,
   mic_sidecar_16k: true,
+  drop_idle_after_seconds: 60,
 };
 
 const IDLE_SESSION: SessionStatus = {
@@ -948,6 +949,27 @@ function SessionSettings({
             ))}
           </select>
         </div>
+        <div className="flex items-center gap-2">
+          <span className="text-[12px] text-slate-600 w-16 shrink-0">Inactivity</span>
+          <select
+            className={FIELD}
+            disabled={disabled}
+            value={options.drop_idle_after_seconds}
+            onChange={(e) =>
+              onChange({ ...options, drop_idle_after_seconds: Number(e.target.value) })
+            }
+          >
+            <option value={0}>Keep everything</option>
+            {[60, 120, 300].map((s) => (
+              <option key={s} value={s}>Drop after {s / 60} min idle</option>
+            ))}
+          </select>
+        </div>
+        {options.drop_idle_after_seconds > 0 && (
+          <div className="text-[10px] text-slate-400 leading-snug">
+            Footage with no keyboard or mouse activity for this long is deleted as it records.
+          </div>
+        )}
       </div>
 
       {/* Output */}

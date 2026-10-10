@@ -1,7 +1,7 @@
 # ChirpTime — CliffNotes
 
 > Living map of the project. Read this before any coding session.
-> Last updated: 2026-07-27. Visual language → `ui.md` · verification → `verify.md`
+> Last updated: 2026-08-01. Visual language → `ui.md` · verification → `verify.md`
 
 ## What this is
 
@@ -284,6 +284,25 @@ playhead and clock readout) and `subscribeState` (5Hz, for React). The **inter-t
 spread** — max minus min of where each element believes it is — is the metric
 that says the burned-in timecodes agree; the Sync panel shows it live.
 
+### Inactivity trimming — `recorder.rs` (session recorder only)
+
+The continuous recorder can delete footage of idle time as it records. A
+background `idle_poll_loop` samples the **system-wide** last keyboard/mouse input
+(`poll_last_input_ms` → Win32 `GetLastInputInfo` + `GetTickCount`) into
+`Inner.last_input_ms` every 2s. When a closed segment is about to be indexed,
+`index_output_segment` asks `should_drop_idle(last_input, seg_start, threshold)`:
+if the whole segment span had no input **and** the idle stretch already exceeded
+the threshold before the segment began, the file is `remove_file`d and never
+added to the manifest — ffmpeg is left running untouched (the cost being cut is
+disk, not CPU). Up to one threshold's worth of footage after the last activity is
+always kept. Consecutive drops collapse into one `IdleTail`, flushed by the next
+kept segment as a single `"idle — no keyboard or mouse activity"` gap; that
+segment chains across the hole via `index_segment`'s `chain_override` so the
+drift path doesn't also record a "dropped time" gap. A failed delete falls back
+to keeping the segment. Threshold: `SessionOptions.drop_idle_after_seconds`
+(default 60, 0 = off); the **interval-clip flow in `capture.rs` is unaffected**.
+See decisions.md (2026-08-01) for why delete-on-close beats pause/resume.
+
 ### Settings + first run — `settings.rs`, `commands.rs`, `CompactApp.tsx`
 
 `run()` calls `settings::load()` **before** the state, the file server thread or
@@ -483,6 +502,15 @@ from that window is denied.
 - **`list_display_outputs` refines `capturable` itself.** `enumerate_dxgi_outputs`
   always reports `true` (enumeration cannot know which encoders exist), so never
   read that flag straight off the recorder's own enumeration.
+- **Idle gaps in a session manifest are intentional, not failures.** With
+  inactivity trimming on (default), the session recorder deletes segments that
+  covered a stretch with no keyboard/mouse input and records an `"idle — no
+  keyboard or mouse activity"` gap. So a manifest hole can mean "the user was
+  away," not "a device died" or "time was lost" — any coverage/health check must
+  treat that reason as expected. Trimming is **session-only, Windows-only**, and
+  keyboard/mouse-only: passive viewing (video, a call) with no input reads as
+  idle and *will* be dropped. Toggle/threshold: the "Inactivity" control in
+  `SessionSettings` → `SessionOptions.drop_idle_after_seconds` (0 disables).
 
 ## Status
 
