@@ -213,3 +213,22 @@ Touchpoints: `commands.rs::delete_entry`, `ViewerApp.tsx`, `CompactApp.tsx`
    files for that timestamp are gone from `output/<date>/`.
 
 Use a throwaway capture you just took, never an archive day.
+
+## Viewer in a browser (no Tauri, no recording)
+Cheap check. Fixtures only; it never reads `C:\Users\dested\Videos\ChirpTime`.
+1. `bun scripts/make-fixture.ts` builds `G:\code\chirptime\fixtures\sessions\` (gitignored): 2 sessions, about 196 MB. `--force` rebuilds it.
+2. `bun scripts/fixture-server.ts` serves `/files` (with Range) and `/thumb/<sid>/<track>/<epoch>.jpg?w=` on 9120. It refuses to start if 9120 is taken, which means the real app is up.
+3. `bun run vite:dev` starts Vite on 7460.
+4. Open http://localhost:7460/?mode=viewer&mock=1#/session/2026-08-01_10-30-12. `?mock=1` (DEV only) answers invoke() from the fixtures: list/get session, status, environment, start/stop, and delete_range/undo_cut with a 12 s finalize. The compact widget is at http://localhost:7460/?mock=1.
+5. `bun scripts/check-log.ts` checks the day-log rules against the fixture, with no browser. It should exit 0.
+6. Stop Vite and the fixture server when you're done.
+
+What the fixture covers:
+- Idle 11:10–11:30 on every picture track.
+- Screen 4 down 11:45–12:10 ("stopped reporting", which shows as "The display went dark").
+- Screens 1–3 down 11:52–12:10 ("Display was locked or asleep").
+- Marks at 10:52 (no label) and 12:18 ("Bug repro").
+
+bx pins 1280×800. For 1920×1080 use a playwright viewport, and `window.__chirpEngine` (DEV only) to seek.
+
+> The "Delete" and media-viewer recipes above predate the redesign: the interval-clip viewer is gone.
