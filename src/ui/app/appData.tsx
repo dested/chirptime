@@ -9,9 +9,10 @@
  */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import type { EnvironmentInfo, SessionManifest, SessionStatus, SessionSummary } from "../types";
+import type { EnvironmentInfo, SessionManifest, SessionStatus, SessionSummary, SessionTrashReceipt } from "../types";
 import { listen } from "@tauri-apps/api/event";
-import { countExports, fetchSession, getEnvironment, getSessionStatus, listSessions, startSession, stopSession } from "../hooks/useApi";
+import { countExports, fetchSession, getEnvironment, getSessionStatus, listSessions, undoDeleteSession } from "../hooks/useApi";
+import { getRecorderControl, resumeSession, startRecording, stopRecording, type RecorderControl } from "../recorder/api";
 
 export function errorText(e: unknown): string {
   if (e instanceof Error) return e.message;
@@ -35,10 +36,16 @@ interface AppData {
   exportCount: number | null;
   status: SessionStatus | null;
   env: EnvironmentInfo | null;
+  /** when the open session was paused, or null when it is not paused */
+  pausedSince: number | null;
   recorderBusy: boolean;
   recorderError: string | null;
+  /** set when Stop discarded a session under a minute; it can still be undone */
+  discarded: SessionTrashReceipt | null;
   start: () => Promise<void>;
   stop: () => Promise<void>;
+  resume: () => Promise<void>;
+  undoDiscard: () => Promise<void>;
 }
 
 const Ctx = createContext<AppData | null>(null);
@@ -63,6 +70,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const [env, setEnv] = useState<EnvironmentInfo | null>(null);
   const [recorderBusy, setRecorderBusy] = useState(false);
   const [recorderError, setRecorderError] = useState<string | null>(null);
+  const [discarded, setDiscarded] = useState<SessionTrashReceipt | null>(null);
   const [manifests, setManifests] = useState<ReadonlyMap<string, SessionManifest>>(() => new Map());
   const [manifestsReady, setManifestsReady] = useState(false);
   /** the summary each cached manifest was read against */
@@ -91,15 +99,19 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     void refreshEnv();
   }, [refreshSessions, refreshEnv]);
 
-  // Recorder status: polled, so a start or stop from the widget shows up here.
+  // Recorder status: polled, so a start or stop from the widget shows up here,
+  // and read again at once whenever the recorder announces a change.
   const wasRecording = useRef<boolean | null>(null);
+  const [pausedSince, setPausedSince] = useState<number | null>(null);
+  const applyControl = (c: RecorderControl | null) => setPausedSince(c?.recording ? c.paused_since_epoch_ms : null);
   useEffect(() => {
     let alive = true;
     const poll = async () => {
       try {
-        const s = await getSessionStatus();
+        const [s, c] = await Promise.all([getSessionStatus(), getRecorderControl().catch(() => null)]);
         if (!alive) return;
         setStatus(s);
+        applyControl(c);
         if (wasRecording.current !== null && wasRecording.current !== s.recording) {
           void refreshSessions();
           void refreshEnv();
@@ -111,9 +123,15 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     };
     void poll();
     const t = window.setInterval(poll, STATUS_POLL_MS);
+    const off = listen<RecorderControl>("recorder-changed", (e) => {
+      if (!alive) return;
+      applyControl(e.payload);
+      void poll();
+    });
     return () => {
       alive = false;
       window.clearInterval(t);
+      void off.then((f) => f()).catch(() => {});
     };
   }, [refreshSessions, refreshEnv]);
 
@@ -199,7 +217,9 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     setRecorderBusy(true);
     setRecorderError(null);
     try {
-      setStatus(await startSession());
+      setDiscarded(null);
+      setStatus(await startRecording());
+      setPausedSince(null);
       wasRecording.current = true;
       void refreshSessions();
     } catch (e) {
@@ -213,7 +233,10 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     setRecorderBusy(true);
     setRecorderError(null);
     try {
-      setStatus(await stopSession());
+      const out = await stopRecording();
+      setStatus(out.status);
+      setPausedSince(null);
+      setDiscarded(out.discarded);
       wasRecording.current = false;
       void refreshSessions();
       void refreshEnv();
@@ -223,6 +246,39 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       setRecorderBusy(false);
     }
   }, [refreshSessions, refreshEnv]);
+
+  const resume = useCallback(async () => {
+    setRecorderBusy(true);
+    setRecorderError(null);
+    try {
+      applyControl(await resumeSession());
+    } catch (e) {
+      setRecorderError(errorText(e));
+    } finally {
+      setRecorderBusy(false);
+    }
+  }, []);
+
+  const undoDiscard = useCallback(async () => {
+    if (!discarded) return;
+    setRecorderError(null);
+    try {
+      await undoDeleteSession(discarded.id);
+      setDiscarded(null);
+      void refreshSessions();
+      void refreshEnv();
+    } catch (e) {
+      setDiscarded(null);
+      setRecorderError(errorText(e));
+    }
+  }, [discarded, refreshSessions, refreshEnv]);
+
+  // The undo is only good until the trash is emptied.
+  useEffect(() => {
+    if (!discarded) return;
+    const t = window.setTimeout(() => setDiscarded(null), Math.max(0, discarded.undo_until_epoch_ms - Date.now()));
+    return () => window.clearTimeout(t);
+  }, [discarded]);
 
   const value = useMemo<AppData>(
     () => ({
@@ -236,12 +292,35 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       exportCount,
       status,
       env,
+      pausedSince,
       recorderBusy,
       recorderError,
+      discarded,
       start,
       stop,
+      resume,
+      undoDiscard,
     }),
-    [sessions, sessionsError, refreshSessions, manifests, manifestsReady, patchMark, markCount, exportCount, status, env, recorderBusy, recorderError, start, stop],
+    [
+      sessions,
+      sessionsError,
+      refreshSessions,
+      manifests,
+      manifestsReady,
+      patchMark,
+      markCount,
+      exportCount,
+      status,
+      env,
+      pausedSince,
+      recorderBusy,
+      recorderError,
+      discarded,
+      start,
+      stop,
+      resume,
+      undoDiscard,
+    ],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

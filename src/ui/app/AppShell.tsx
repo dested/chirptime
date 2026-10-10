@@ -105,8 +105,9 @@ function Sidebar({ items, active }: { items: NavItem[]; active: RouteName }) {
 }
 
 function Rail({ items, active }: { items: NavItem[]; active: RouteName }) {
-  const { status, recorderBusy, start, stop } = useAppData();
+  const { status, pausedSince, recorderBusy, start, stop, resume } = useAppData();
   const recording = status?.recording ?? false;
+  const paused = recording && pausedSince !== null;
   return (
     <aside
       className="flex shrink-0 flex-col items-center gap-1.5 border-r border-line bg-rail pb-3.5 pt-4"
@@ -134,12 +135,14 @@ function Rail({ items, active }: { items: NavItem[]; active: RouteName }) {
       <div className="flex-1" />
       <button
         className="grid h-9 w-9 place-items-center rounded-[9px] hover:bg-card/60 disabled:opacity-50"
-        title={recording ? "Recording · Stop" : "Not recording · Start"}
-        aria-label={recording ? "Stop recording" : "Start recording"}
+        title={paused ? "Paused · Resume" : recording ? "Recording · Stop" : "Not recording · Start"}
+        aria-label={paused ? "Resume recording" : recording ? "Stop recording" : "Start recording"}
         disabled={recorderBusy || status === null}
-        onClick={() => void (recording ? stop() : start())}
+        onClick={() => void (paused ? resume() : recording ? stop() : start())}
       >
-        {recording ? (
+        {paused ? (
+          <span className="h-3 w-3 rounded-full bg-amber" />
+        ) : recording ? (
           <span className="dot-active h-3 w-3 rounded-full bg-rec" />
         ) : (
           <span className="h-3 w-3 rounded-full border-2 border-ink-3" />
@@ -150,36 +153,51 @@ function Rail({ items, active }: { items: NavItem[]; active: RouteName }) {
 }
 
 function RecorderCard() {
-  const { status, env, sessions, recorderBusy, recorderError, start, stop } = useAppData();
+  const { status, env, sessions, pausedSince, recorderBusy, recorderError, discarded, start, stop, resume, undoDiscard } = useAppData();
   const recording = status?.recording ?? false;
+  const paused = recording && pausedSince !== null;
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (!recording) return;
+    if (!recording || paused) return;
     const t = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(t);
-  }, [recording]);
+  }, [recording, paused]);
 
   const recBytes = sessions?.reduce((a, s) => a + s.bytes, 0) ?? null;
   const total = env?.disk_total_bytes ?? null;
   const free = env?.disk_free_bytes ?? null;
   const recPct = total && recBytes !== null ? Math.min(100, (recBytes / total) * 100) : 0;
   const otherPct = total && free !== null ? Math.max(0, 100 - (free / total) * 100 - recPct) : 0;
-  const elapsed = recording && status?.started_epoch_ms ? now - status.started_epoch_ms : null;
+  // paused: the clock stops where the pause began
+  const elapsed = recording && status?.started_epoch_ms ? (pausedSince ?? now) - status.started_epoch_ms : null;
+  const busy = recorderBusy || status === null;
+  const action = "text-[12px] font-bold transition-opacity duration-150 hover:opacity-75 disabled:opacity-40";
 
   return (
     <div className="rounded-[10px] border border-line bg-card p-3">
       <div className="flex items-center gap-2">
-        <span className={`h-2 w-2 shrink-0 rounded-full ${recording ? "dot-active bg-rec" : "bg-ink-4"}`} />
-        <span className="text-[12.5px] font-semibold">{recording ? "Recording" : "Not recording"}</span>
+        <span className={`h-2 w-2 shrink-0 rounded-full ${paused ? "bg-amber" : recording ? "dot-active bg-rec" : "bg-ink-4"}`} />
+        <span className="text-[12.5px] font-semibold">{paused ? "Paused" : recording ? "Recording" : "Not recording"}</span>
         {elapsed !== null && <span className="num text-[11px] text-ink-3">{fmtHms(elapsed)}</span>}
-        <button
-          className="ml-auto text-[12px] font-bold text-rec transition-opacity duration-150 hover:opacity-75 disabled:opacity-40"
-          disabled={recorderBusy || status === null}
-          onClick={() => void (recording ? stop() : start())}
-        >
-          {recording ? "Stop" : "Start"}
-        </button>
+        <span className="ml-auto flex items-center gap-2.5">
+          {paused && (
+            <button className={`${action} text-ink`} disabled={busy} onClick={() => void resume()}>
+              Resume
+            </button>
+          )}
+          <button className={`${action} text-rec`} disabled={busy} onClick={() => void (recording ? stop() : start())}>
+            {recording ? "Stop" : "Start"}
+          </button>
+        </span>
       </div>
+      {discarded && (
+        <div className="mt-2 flex items-center gap-2 text-[11.5px] leading-snug text-ink-2">
+          <span>Under a minute, so it was not kept</span>
+          <button className={`${action} ml-auto text-ink`} onClick={() => void undoDiscard()}>
+            Undo
+          </button>
+        </div>
+      )}
       <div className="mt-3 flex h-1.5 overflow-hidden rounded-[3px] bg-sunk">
         <span className="bg-ink" style={{ width: `${recPct}%` }} />
         <span className="bg-ink-4" style={{ width: `${otherPct}%` }} />
