@@ -3,7 +3,7 @@ mod commands;
 // Recorder actions shared by the widget, the tray and the hotkeys (S3).
 mod controls;
 pub mod cursor;
-mod export;
+pub mod export;
 // Public so the cut / undo / finalize paths can be exercised on synthetic
 // sessions in `tests/edit_cuts.rs`.
 pub mod edit;
