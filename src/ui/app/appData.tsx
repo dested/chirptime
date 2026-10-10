@@ -13,7 +13,7 @@ import type { EnvironmentInfo, SessionManifest, SessionStatus, SessionSummary, S
 import { listen } from "@tauri-apps/api/event";
 import { countExports, fetchSession, getEnvironment, getSessionStatus, listSessions, undoDeleteSession } from "../hooks/useApi";
 import { EXPORTS_CHANGED } from "../export/api";
-import { getRecorderControl, resumeSession, startRecording, stopRecording, type RecorderControl } from "../recorder/api";
+import { DISCARDED_EVENT, getRecorderControl, resumeSession, startRecording, stopRecording, type RecorderControl } from "../recorder/api";
 
 export function errorText(e: unknown): string {
   if (e instanceof Error) return e.message;
@@ -239,7 +239,12 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       const out = await stopRecording();
       setStatus(out.status);
       setPausedSince(null);
-      setDiscarded(out.discarded);
+      if (out.discarded) {
+        const r = out.discarded;
+        setDiscarded((prev) => (prev && prev.id === r.id ? prev : r));
+      } else {
+        setDiscarded(null);
+      }
       wasRecording.current = false;
       void refreshSessions();
       void refreshEnv();
@@ -275,6 +280,23 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       setRecorderError(errorText(e));
     }
   }, [discarded, refreshSessions, refreshEnv]);
+
+  // A stop from the widget, tray or a hotkey that discarded a short session:
+  // offer the same Undo here, once (the card's own stop already set it).
+  useEffect(() => {
+    let alive = true;
+    const off = listen<SessionTrashReceipt>(DISCARDED_EVENT, (e) => {
+      if (!alive) return;
+      const r = e.payload;
+      setDiscarded((prev) => (prev && prev.id === r.id ? prev : r));
+      void refreshSessions();
+      void refreshEnv();
+    });
+    return () => {
+      alive = false;
+      void off.then((f) => f()).catch(() => {});
+    };
+  }, [refreshSessions, refreshEnv]);
 
   // The undo is only good until the trash is emptied.
   useEffect(() => {

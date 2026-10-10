@@ -695,8 +695,36 @@ pub fn finalize_cuts(session_dir: &Path) -> Result<SessionManifest, String> {
 /// Finalize the `Pending` cuts whose undo window has passed. This is what the
 /// scheduled task runs, so a timer from one delete never cuts short the undo
 /// window of a later one. A cut whose undo failed is left alone.
+///
+/// Finalizing trims files an export may be copying, so while an export reads
+/// this session it waits, looking again every `EXPORT_RECHECK_MS`. Callers run
+/// it off the async runtime (a blocking task or its own thread).
 pub fn finalize_due_cuts(session_dir: &Path) -> Result<SessionManifest, String> {
-    finalize_due_cuts_at(session_dir, session::now_epoch_ms())
+    finalize_due_cuts_when_free(session_dir, crate::export::is_exporting, std::thread::sleep)
+}
+
+/// How often a finalize held back by an export looks again.
+pub const EXPORT_RECHECK_MS: u64 = 3_000;
+
+/// `finalize_due_cuts` with the export check and the wait passed in (the test
+/// seam). The check is repeated under the edit lock, so an export that starts
+/// while it waits still holds it back.
+pub fn finalize_due_cuts_when_free(
+    session_dir: &Path,
+    exporting: impl Fn(&str) -> bool,
+    wait: impl Fn(std::time::Duration),
+) -> Result<SessionManifest, String> {
+    let id = session_dir.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+    loop {
+        if !exporting(&id) {
+            let _g = edit_lock();
+            if !exporting(&id) {
+                let now = session::now_epoch_ms();
+                return finalize_where(session_dir, |c| is_due(session_dir, c, now));
+            }
+        }
+        wait(std::time::Duration::from_millis(EXPORT_RECHECK_MS));
+    }
 }
 
 /// `finalize_due_cuts` as if the clock read `now_ms`.
@@ -1630,5 +1658,41 @@ mod tests {
         let stopped = Some((id, RecorderPhase::StoppedItself));
         assert_eq!(editable_dir(root, stopped, Some(id), id).unwrap_err(), STOPPING_SESSION_ERR);
         assert_eq!(editable_dir(root, stopped, None, id).unwrap(), root.join(id));
+    }
+
+    #[test]
+    fn a_finalize_waits_while_an_export_reads_the_session() {
+        use std::cell::Cell;
+        let dir = std::env::temp_dir()
+            .join(format!("chirptime-edit-wait-{}", std::process::id()))
+            .join("2026-08-01_10-30-12");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut m = manifest(vec![uniform("screen-0", 1, 60_000)]);
+        m.id = "2026-08-01_10-30-12".to_string();
+        session::write_manifest(&dir, &m).unwrap();
+
+        let busy_checks = Cell::new(0);
+        let waits = Cell::new(0);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let out = finalize_due_cuts_when_free(
+            &dir,
+            |id| {
+                asked.borrow_mut().push(id.to_string());
+                busy_checks.set(busy_checks.get() + 1);
+                busy_checks.get() <= 3
+            },
+            |d| {
+                assert_eq!(d, std::time::Duration::from_millis(EXPORT_RECHECK_MS));
+                waits.set(waits.get() + 1);
+            },
+        )
+        .unwrap();
+        // busy, busy, busy (each a wait), then free twice: outside and under the lock
+        assert_eq!(waits.get(), 3);
+        assert_eq!(busy_checks.get(), 5);
+        assert!(asked.borrow().iter().all(|id| id == "2026-08-01_10-30-12"));
+        assert_eq!(out.id, m.id);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 }

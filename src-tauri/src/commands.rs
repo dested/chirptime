@@ -792,33 +792,27 @@ fn sessions_root_for(config: &CaptureConfig) -> PathBuf {
     crate::recorder::sessions_root(&capture::get_output_dir(config))
 }
 
+/// Kept for older callers: the same serialised start as `start_recording`
+/// (controls.rs). Options passed here become the saved ones first, as
+/// `set_session_options` would make them.
 #[tauri::command]
 pub async fn start_session(
     app: tauri::AppHandle,
     state: tauri::State<'_, State>,
-    options: Option<crate::recorder::SessionOptions>,
+    options: Option<serde_json::Value>,
 ) -> Result<SessionStatus, String> {
-    let state_inner = state.inner().clone();
-
-    let root = {
-        let s = state_inner.lock().await;
-        if let Some(rec) = &s.recorder {
-            if !rec.is_stopping() {
-                return Err("A session is already recording".to_string());
-            }
-        }
-        sessions_root_for(&s.config)
-    };
-    std::fs::create_dir_all(&root).map_err(|e| format!("create {}: {}", root.display(), e))?;
-
-    let env = crate::recorder::RecorderEnv::from_app(&app);
-    let recorder = crate::recorder::Recorder::start(env, &root, options.unwrap_or_default())?;
-
-    let status = SessionStatus::from_recorder(&recorder);
-    state_inner.lock().await.recorder = Some(recorder);
-    Ok(status)
+    if let Some(v) = options {
+        serde_json::from_value::<crate::recorder::SessionOptions>(v.clone())
+            .map_err(|e| format!("invalid session options: {e}"))?;
+        let mut s = state.lock().await;
+        s.session_options = v;
+        persist(&s);
+    }
+    crate::controls::start(&app).await
 }
 
+/// Stop the recorder and wait for it to finish. This is the raw stop; the
+/// serialised one (short-session discard, announce) is `controls::stop`.
 #[tauri::command]
 pub async fn stop_session(state: tauri::State<'_, State>) -> Result<SessionStatus, String> {
     let recorder = {
