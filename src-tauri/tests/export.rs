@@ -4,14 +4,14 @@
 //!
 //!     cargo test --test export
 //!
-//! Everything but the last test is pure. The real one writes a 10 s
+//! Everything but the file tests and the last one is pure. The real one writes a 10 s
 //! `testsrc2` session into a temp dir; nothing here touches the real
 //! recordings folder, opens a device, or records.
 
 use chirptime_lib::cursor::CursorSample;
 use chirptime_lib::export::{
-    self, CameraOpts, Corner, ExportRequest, InputKind, JobCtl, Layout, OutMap, RunError, ScreenRect,
-    Shape, SizeMode, SoundOpts, Span, Speed,
+    self, CameraOpts, ConcatEntry, Corner, ExportRecord, ExportRequest, InputKind, JobCtl, Layout, OutMap,
+    RunError, ScreenRect, Shape, SizeMode, SoundOpts, Span, Speed,
 };
 use chirptime_lib::recorder::EncoderCaps;
 use chirptime_lib::session::{
@@ -217,8 +217,9 @@ fn concat_places_segments_at_their_wall_clock() {
     assert_eq!(files, vec!["screen-0/a.mp4", "screen-0/b.mp4", "screen-0/c2.mp4"]);
     // a is trimmed where b starts, and b starts 58 s in.
     assert_eq!((e[0].outpoint_ms, e[0].duration_ms), (Some(58_000), 58_000));
-    // b plays whole, then the clock jumps over the gap to c's real start.
-    assert_eq!((e[1].outpoint_ms, e[1].duration_ms), (None, 142_000));
+    // b plays to its own end (an outpoint whenever another entry follows), then
+    // the clock jumps over the gap to c's real start.
+    assert_eq!((e[1].outpoint_ms, e[1].duration_ms), (Some(60_000), 142_000));
     assert_eq!((e[2].outpoint_ms, e[2].duration_ms), (None, 50_000));
 
     let text = export::concat_list_text(std::path::Path::new("C:\\rec\\s"), &e);
@@ -230,6 +231,184 @@ fn concat_places_segments_at_their_wall_clock() {
     assert_eq!(r.len(), 2);
     assert_eq!((r[0].inpoint_ms, r[0].outpoint_ms, r[0].duration_ms), (Some(30_000), Some(58_000), 28_000));
     assert_eq!((r[1].inpoint_ms, r[1].outpoint_ms, r[1].duration_ms), (None, Some(12_000), 12_000));
+}
+
+#[test]
+fn raw_in_points_after_a_cut_move_forward_to_a_keyframe() {
+    let e = |start: i64, inp: Option<i64>, dur: i64| ConcatEntry {
+        file: "screen-0/b.mp4".into(),
+        start_epoch_ms: T0 + start,
+        inpoint_ms: inp,
+        outpoint_ms: None,
+        duration_ms: dur,
+    };
+    let holes = [sp(6_000, 8_000)];
+    let kf = |_: &str| Some(vec![0, 2_000, 4_000, 6_000]);
+    // Starts where the cut ends, 3 s into the file: keyframe 4 s, one second later.
+    let out = export::snap_after_cuts(vec![e(8_000, Some(3_000), 10_000)], &holes, kf);
+    assert_eq!(out, vec![e(9_000, Some(4_000), 9_000)]);
+    // Not after a cut, or no in point: untouched.
+    let keep = vec![e(1_000, Some(3_000), 5_000), e(8_000, None, 5_000)];
+    assert_eq!(export::snap_after_cuts(keep.clone(), &holes, kf), keep);
+    // No keyframe left (or none known): dropped rather than leak.
+    assert!(export::snap_after_cuts(vec![e(8_000, Some(6_500), 3_000)], &holes, kf).is_empty());
+    assert!(export::snap_after_cuts(vec![e(8_000, Some(3_000), 3_000)], &holes, |_: &str| None).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Live sessions, pending deletes, disk space
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_live_session_stops_where_every_running_track_has_written() {
+    let mut m = manifest();
+    m.ended_epoch_ms = None;
+    m.cuts.clear();
+    // screen-0 has written only 30 s of its last minute; the rest reach minute 10.
+    if let Some(s) = m.tracks[0].segments.last_mut() {
+        s.duration_ms = 30_000;
+    }
+    // A track that stopped long ago (an outage) doesn't hold the export back.
+    m.tracks[1].segments.retain(|s| s.start_epoch_ms < T0 + 5 * MIN);
+    let r = ExportRequest { to_ms: T0 + 60 * MIN, ..req(Layout::Devlog) };
+    assert_eq!(export::live_end(&m, &r), Some(T0 + 9 * MIN + 30_000));
+    let plan = export::build_plan(&m, &r, &[], None).unwrap();
+    assert_eq!(plan.out.total_ms, 9 * MIN + 30_000);
+    assert!(plan.notes.iter().any(|n| n.starts_with("Still recording: the export ends at")), "{:?}", plan.notes);
+    let est = export::estimate(&m, &r, &[], &EncoderCaps::default());
+    assert!(est.notes.iter().any(|n| n.starts_with("Still recording")), "{:?}", est.notes);
+    // A finished session is never clamped.
+    assert_eq!(export::live_end(&manifest(), &r), None);
+}
+
+#[test]
+fn raw_tracks_wait_for_a_pending_delete() {
+    let mut m = manifest();
+    m.cuts[0].state = CutState::Pending;
+    let raw = ExportRequest { raw_tracks: Some(vec!["screen-0".into()]), ..req(Layout::Devlog) };
+    let est = export::estimate(&m, &raw, &[], &EncoderCaps::default());
+    assert_eq!(est.error.as_deref(), Some(export::PENDING_CUT_ERR));
+    // A range that doesn't touch it is fine.
+    let early = ExportRequest { to_ms: T0 + 2 * MIN, ..raw.clone() };
+    assert_eq!(export::estimate(&m, &early, &[], &EncoderCaps::default()).error, None);
+    assert!(export::pending_cut_in(&m, T0 + 4 * MIN, T0 + 5 * MIN));
+    assert!(!export::pending_cut_in(&manifest(), T0, T0 + 10 * MIN));
+}
+
+#[test]
+fn exports_leave_room_for_recording() {
+    const GB: u64 = 1024 * 1024 * 1024;
+    let floor = chirptime_lib::recorder::MIN_FREE_BYTES + export::EXPORT_SPARE_BYTES;
+    assert!(export::space_check(floor + 2 * GB, GB).is_ok());
+    let e = export::space_check(floor + GB, GB).unwrap_err();
+    assert!(e.starts_with("Not enough free space: this export needs about 1.4 GB"), "{}", e);
+    assert!(export::space_check(0, 0).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// Files: paths, names, the index, leftovers
+// ---------------------------------------------------------------------------
+
+fn temp_rec(tag: &str) -> PathBuf {
+    let rec = std::env::temp_dir().join(format!("chirptime-export-{}-{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&rec);
+    std::fs::create_dir_all(rec.join("exports")).unwrap();
+    rec
+}
+
+fn record(id: &str, path: &str) -> ExportRecord {
+    ExportRecord {
+        id: id.into(),
+        session_id: "2026-08-01_10-00-00".into(),
+        from: T0,
+        to: T0 + MIN,
+        layout: "devlog".into(),
+        path: path.into(),
+        bytes: 1,
+        duration_ms: MIN,
+        created_epoch_ms: T0,
+        title: "Devlog".into(),
+        thumb: None,
+    }
+}
+
+#[test]
+fn index_paths_are_one_plain_name_under_exports() {
+    let rec = PathBuf::from("C:/rec");
+    assert_eq!(export::record_path(&rec, "exports/2026-08-01 12.10 Devlog.mp4").unwrap(), rec.join("exports").join("2026-08-01 12.10 Devlog.mp4"));
+    for bad in [
+        "", "exports", "exports/", "exports/.", "exports/..", "exports/./a.mp4", "exports/a/b.mp4",
+        "exports\\..\\sessions\\x", "exports/..\\sessions\\x", "exports/C:x.mp4", "exports/a.mp4:stream",
+        "C:/Windows/x.mp4", "/etc/x", "\\\\server\\share\\x", "sessions/x.mp4", "exports/.work",
+        "exports/index.jsonl", "exports/index.jsonl.tmp", "exports/a.mp4.", "exports/ a.mp4",
+    ] {
+        assert!(export::record_path(&rec, bad).is_err(), "accepted {:?}", bad);
+    }
+
+    // A record pointing outside exports/ is never deleted through.
+    let rec = temp_rec("paths");
+    let victim = rec.join("sessions").join("x");
+    std::fs::create_dir_all(&victim).unwrap();
+    export::add_to_index(&rec, record("evil", "exports\\..\\sessions\\x")).unwrap();
+    export::add_to_index(&rec, record("dot", "exports/.")).unwrap();
+    assert!(export::delete(&rec, "evil").is_err() && export::delete(&rec, "dot").is_err());
+    assert!(victim.is_dir() && rec.join("exports").is_dir());
+    // Play opens only a finished mp4/jpg or a raw folder.
+    std::fs::write(rec.join("exports").join("a.mp4"), b"x").unwrap();
+    std::fs::write(rec.join("exports").join("a.bat"), b"x").unwrap();
+    assert!(export::playable(&rec.join("exports").join("a.mp4")));
+    assert!(!export::playable(&rec.join("exports").join("a.bat")));
+    assert!(export::playable(&rec.join("exports")));
+    let _ = std::fs::remove_dir_all(&rec);
+}
+
+#[test]
+fn the_index_keeps_lines_it_cannot_read_and_refuses_one_it_cannot_open() {
+    let rec = temp_rec("index");
+    let idx = rec.join("exports").join("index.jsonl");
+    // No index yet: empty.
+    assert_eq!(export::list(&rec).unwrap(), vec![]);
+    std::fs::write(&idx, "{\"from a newer version\": true}\n").unwrap();
+    std::fs::write(rec.join("exports").join("a.mp4"), b"x").unwrap();
+    export::add_to_index(&rec, record("a", "exports/a.mp4")).unwrap();
+    export::add_to_index(&rec, record("b", "exports/gone.mp4")).unwrap();
+    export::delete(&rec, "b").unwrap();
+    let text = std::fs::read_to_string(&idx).unwrap();
+    assert!(text.starts_with("{\"from a newer version\": true}\n"), "{}", text);
+    assert_eq!(export::read_index(&rec).unwrap().records.len(), 1);
+    assert_eq!(export::list(&rec).unwrap().len(), 1);
+    // An index that can't be read (here: a folder) fails, and nothing rewrites it.
+    std::fs::remove_file(&idx).unwrap();
+    std::fs::create_dir_all(&idx).unwrap();
+    assert!(export::read_index(&rec).is_err() && export::list(&rec).is_err());
+    assert!(export::add_to_index(&rec, record("c", "exports/a.mp4")).is_err());
+    assert!(idx.is_dir());
+    let _ = std::fs::remove_dir_all(&rec);
+}
+
+#[test]
+fn two_exports_never_claim_the_same_name() {
+    let rec = temp_rec("names");
+    let dir = rec.join("exports");
+    std::fs::write(dir.join("S.mp4"), b"x").unwrap();
+    let (f1, p1) = export::reserve_file(&dir, "S").unwrap();
+    let (f2, p2) = export::reserve_file(&dir, "S").unwrap();
+    assert_eq!((f1.file_name().unwrap(), p1.file_name().unwrap()), (std::ffi::OsStr::new("S (2).mp4"), std::ffi::OsStr::new("S (2).mp4.part")));
+    assert_eq!(f2.file_name().unwrap(), "S (3).mp4");
+    assert!(p1.is_file() && p2.is_file());
+    let (d1, q1) = export::reserve_folder(&dir, "Raw").unwrap();
+    let (d2, _) = export::reserve_folder(&dir, "Raw").unwrap();
+    assert!(q1.is_dir() && d1 != d2);
+
+    // Leftovers of a crash go; finished files stay.
+    std::fs::create_dir_all(dir.join(".work").join("exp-9")).unwrap();
+    export::sweep_leftovers(&rec);
+    assert!(!p1.exists() && !p2.exists() && !q1.exists());
+    assert!(dir.join("S.mp4").is_file());
+    assert_eq!(std::fs::read_dir(dir.join(".work")).unwrap().count(), 0);
+    assert!(!export::is_exporting("2026-08-01_10-00-00"));
+    export::kill_all_jobs();
+    let _ = std::fs::remove_dir_all(&rec);
 }
 
 // ---------------------------------------------------------------------------
@@ -637,7 +816,7 @@ fn a_real_export_composes_lists_and_deletes() {
     // The work folder is gone, no partial is left, and the index has it.
     assert!(!rec.join("exports").join(".work").join("exp-1").exists());
     assert!(std::fs::read_dir(rec.join("exports")).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".part")));
-    assert_eq!(export::list(&rec), vec![out.clone()]);
+    assert_eq!(export::list(&rec).unwrap(), vec![out.clone()]);
 
     // Raw tracks: a folder with one copy per track.
     let raw = ExportRequest { raw_tracks: Some(vec!["screen-0".into(), "mic".into()]), title: None, ..r.clone() };
@@ -645,19 +824,19 @@ fn a_real_export_composes_lists_and_deletes() {
         .unwrap_or_else(|e| panic!("raw export failed: {:?}", e));
     let folder = rec.join(&rr.path);
     assert!(folder.join("screen-0.mp4").is_file() && folder.join("mic.mp4").is_file());
-    assert_eq!(export::list(&rec).len(), 2);
+    assert_eq!(export::list(&rec).unwrap().len(), 2);
 
     // A cancelled job stops and leaves nothing behind.
     let cancelled = JobCtl::default();
     cancelled.cancel();
     let e = export::run_export("ffmpeg", &rec, "exp-3", &r, &[], &EncoderCaps::default(), &cancelled, &mut |_| {});
     assert_eq!(e, Err(RunError::Cancelled));
-    assert_eq!(export::list(&rec).len(), 2);
+    assert_eq!(export::list(&rec).unwrap().len(), 2);
 
     export::delete(&rec, &out.id).unwrap();
     export::delete(&rec, &rr.id).unwrap();
     assert!(!file.exists() && !rec.join(&thumb).exists() && !folder.exists());
-    assert!(export::list(&rec).is_empty());
+    assert!(export::list(&rec).unwrap().is_empty());
     assert!(export::delete(&rec, &out.id).is_err());
     let _ = std::fs::remove_dir_all(&rec);
 }

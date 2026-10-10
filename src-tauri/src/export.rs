@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const EXPORTS_DIR: &str = "exports";
@@ -58,6 +58,14 @@ const SHARE_MAX_VIDEO_KBPS: u32 = 6_000;
 const SELECT_SLACK_MS: i64 = 5_000;
 
 const CANCELLED: &str = "Cancelled";
+/// Raw tracks are copied from the files as they are; a delete still in its
+/// undo window hasn't trimmed them yet.
+pub const PENDING_CUT_ERR: &str = "Wait a few seconds for the delete to finish";
+/// While a session records, a track whose last segment ended this long before
+/// the newest one has stopped (an outage), not merely lagged behind.
+const LIVE_LAG_MS: i64 = 120_000;
+/// Room kept free on top of the recorder's own floor.
+pub const EXPORT_SPARE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const NOTHING_LEFT: &str = "Nothing is left in this range once deleted time is taken out";
 const NOTHING_LEFT_IDLE: &str =
     "Nothing is left in this range once deleted time and idle stretches are taken out";
@@ -471,6 +479,69 @@ pub fn session_span(m: &SessionManifest) -> Span {
     Span::new(from, to.max(from))
 }
 
+/// The tracks an export reads.
+fn used_tracks<'a>(m: &'a SessionManifest, req: &ExportRequest) -> Vec<&'a Track> {
+    m.tracks
+        .iter()
+        .filter(|t| match &req.raw_tracks {
+            Some(ids) => ids.contains(&t.id),
+            None => match t.kind.as_str() {
+                "screen" => req.layout == Layout::Desk || req.screen.as_ref().map_or(true, |id| id == &t.id),
+                "webcam" => req.camera.enabled,
+                "mic" => req.sound.mic_db.is_some() && req.speed != Speed::Timelapse,
+                "system-audio" => req.sound.system_db.is_some() && req.speed != Speed::Timelapse,
+                _ => false,
+            },
+        })
+        .filter(|t| !t.segments.is_empty())
+        .collect()
+}
+
+/// While the session is still recording, footage is only finished up to where
+/// the tracks have written: the earliest end among the used tracks that are
+/// still running (those within `LIVE_LAG_MS` of the newest). None once the
+/// session has ended.
+pub fn live_end(m: &SessionManifest, req: &ExportRequest) -> Option<i64> {
+    if m.ended_epoch_ms.is_some() {
+        return None;
+    }
+    let ends: Vec<i64> = used_tracks(m, req).iter().filter_map(|t| t.end_epoch_ms()).collect();
+    let newest = *ends.iter().max()?;
+    ends.into_iter().filter(|e| *e >= newest - LIVE_LAG_MS).min()
+}
+
+/// `[from, to]` of the request inside the session, and the note when a live
+/// session cut `to` short.
+fn effective_range(m: &SessionManifest, req: &ExportRequest) -> (i64, i64, Option<String>) {
+    let whole = session_span(m);
+    let from = req.from_ms.max(whole.from);
+    let mut to = req.to_ms.min(whole.to);
+    let mut note = None;
+    if let Some(end) = live_end(m, req) {
+        if end < to {
+            to = end;
+            note = Some(format!("Still recording: the export ends at {}, as far as every track has written", clock(end)));
+        }
+    }
+    (from, to.max(from), note)
+}
+
+fn clock(ms: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|t| t.format("%-I:%M:%S %p").to_string())
+        .unwrap_or_default()
+}
+
+/// A delete still in its undo window that touches `[from, to]`.
+pub fn pending_cut_in(m: &SessionManifest, from: i64, to: i64) -> bool {
+    m.cuts
+        .iter()
+        .any(|c| c.state == CutState::Pending && c.from_epoch_ms <= to && c.to_epoch_ms >= from)
+}
+
 /// `screen-2` → 3.
 pub fn screen_number(t: &Track) -> u32 {
     let digits: String = t.id.chars().rev().take_while(|c| c.is_ascii_digit()).collect();
@@ -690,10 +761,10 @@ pub fn concat_entries(t: &Track, keep: &[Span]) -> Vec<ConcatEntry> {
     for (i, s) in dedup.iter().enumerate() {
         let gap_to_next = dedup.get(i + 1).map(|n| n.start_epoch_ms - s.start_epoch_ms);
         let duration_ms = gap_to_next.unwrap_or(s.duration_ms);
-        let outpoint_ms = match gap_to_next {
-            Some(g) if g < s.duration_ms => Some(g),
-            _ => None,
-        };
+        // Always stop where this segment's footage (or the next segment)
+        // ends: a file a little longer than its manifest duration must not
+        // run into the next entry's time.
+        let outpoint_ms = gap_to_next.map(|g| g.min(s.duration_ms));
         out.push(ConcatEntry {
             file: format!("{}/{}", t.dir, s.file),
             start_epoch_ms: s.start_epoch_ms,
@@ -734,6 +805,57 @@ pub fn raw_entries(t: &Track, pieces: &[Span]) -> Vec<ConcatEntry> {
         }
     }
     out
+}
+
+/// Raw `-c copy` starts at the keyframe at or before an in point, so a piece
+/// that starts where a delete ends would bring back up to a GOP of deleted
+/// frames. Move such in points forward to the next keyframe instead.
+/// `keyframes(file)` gives a file's keyframe times in ms from its start (None
+/// when unknown: the entry is dropped rather than risk the leak).
+pub fn snap_after_cuts(
+    entries: Vec<ConcatEntry>,
+    holes: &[Span],
+    mut keyframes: impl FnMut(&str) -> Option<Vec<i64>>,
+) -> Vec<ConcatEntry> {
+    let mut out = Vec::with_capacity(entries.len());
+    for mut e in entries {
+        let after_cut = holes.iter().any(|h| (h.to - e.start_epoch_ms).abs() <= 1);
+        let Some(inp) = e.inpoint_ms.filter(|_| after_cut) else {
+            out.push(e);
+            continue;
+        };
+        let Some(next) = keyframes(&e.file).and_then(|k| k.into_iter().find(|t| *t >= inp)) else {
+            continue;
+        };
+        let shift = next - inp;
+        if e.duration_ms - shift < MIN_PIECE_MS {
+            continue;
+        }
+        e.inpoint_ms = Some(next);
+        e.start_epoch_ms += shift;
+        e.duration_ms -= shift;
+        out.push(e);
+    }
+    out
+}
+
+/// Keyframe times of a file's first video stream, ms from its start.
+fn probe_keyframes(ffprobe: &str, path: &Path) -> Option<Vec<i64>> {
+    let out = crate::recorder::silent_command(ffprobe)
+        .args(["-v", "error", "-select_streams", "v:0", "-skip_frame", "nokey", "-show_entries", "frame=best_effort_timestamp_time", "-of", "csv=p=0"])
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut v: Vec<i64> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().trim_end_matches(',').parse::<f64>().ok())
+        .map(|s| (s * 1000.0).round() as i64)
+        .collect();
+    v.sort_unstable();
+    Some(v)
 }
 
 fn secs(ms: i64) -> String {
@@ -905,9 +1027,7 @@ pub fn build_plan(
     cursor: &[CursorSample],
     share_p: Option<u32>,
 ) -> Result<Plan, String> {
-    let whole = session_span(m);
-    let from = req.from_ms.max(whole.from);
-    let to = req.to_ms.min(whole.to);
+    let (from, to, live_note) = effective_range(m, req);
     if to - from < 1_000 {
         return Err("Pick at least a second of this session to export".into());
     }
@@ -916,7 +1036,7 @@ pub fn build_plan(
         return Err(if req.skip_idle { NOTHING_LEFT_IDLE } else { NOTHING_LEFT }.into());
     }
     let out = OutMap::new(pieces.clone());
-    let mut notes = Vec::new();
+    let mut notes: Vec<String> = live_note.into_iter().collect();
 
     let screens = screen_tracks(m);
     let cam = if req.camera.enabled {
@@ -1522,22 +1642,22 @@ pub fn estimate(m: &SessionManifest, req: &ExportRequest, cursor: &[CursorSample
         notes: Vec::new(),
         error: None,
     };
-    let whole = session_span(m);
-    let from = req.from_ms.max(whole.from);
-    let to = req.to_ms.min(whole.to);
-
     if let Some(tracks) = &req.raw_tracks {
+        let (from, to, live_note) = effective_range(m, req);
         let pieces = kept_pieces(m, from, to, false);
         est.source_ms = total_ms(&pieces);
         est.output_ms = est.source_ms;
         est.bytes = raw_bytes(m, tracks, &pieces);
         est.encoder = "copy".into();
+        est.notes = live_note.into_iter().collect();
         // Copying is disk-bound: about 200 MB/s.
         est.encode_seconds = (est.bytes / 200_000_000) as i64 + tracks.len() as i64;
         if tracks.is_empty() {
             est.error = Some("Pick at least one track".into());
         } else if pieces.is_empty() {
             est.error = Some(NOTHING_LEFT.into());
+        } else if pending_cut_in(m, from, to) {
+            est.error = Some(PENDING_CUT_ERR.into());
         }
         return est;
     }
@@ -1602,6 +1722,30 @@ pub fn estimate(m: &SessionManifest, req: &ExportRequest, cursor: &[CursorSample
     est
 }
 
+/// Refuse an export that would eat into the space recording needs: free space
+/// minus 1.3× the estimate must stay above the recorder's floor plus 2 GB.
+pub fn space_check(free: u64, estimate_bytes: u64) -> Result<(), String> {
+    let need = (estimate_bytes as f64 * 1.3) as u64;
+    let floor = crate::recorder::MIN_FREE_BYTES + EXPORT_SPARE_BYTES;
+    if free.saturating_sub(need) < floor {
+        return Err(format!(
+            "Not enough free space: this export needs about {} and the recordings drive has {} free, with {} kept for recording. Free some space or pick a smaller size",
+            gb(need),
+            gb(free),
+            gb(floor)
+        ));
+    }
+    Ok(())
+}
+
+fn gb(b: u64) -> String {
+    if b >= 1_000_000_000 {
+        format!("{:.1} GB", b as f64 / 1e9)
+    } else {
+        format!("{} MB", (b as f64 / 1e6).round() as u64)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Files: names, the index
 // ---------------------------------------------------------------------------
@@ -1629,15 +1773,50 @@ pub fn export_stem(range_start_ms: i64, title: &str) -> String {
     }
 }
 
-/// `<stem><ext>`, or `<stem> (2)<ext>`… whichever doesn't exist yet.
-fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
-    let mut p = dir.join(format!("{}{}", stem, ext));
-    let mut n = 2;
-    while p.exists() {
-        p = dir.join(format!("{} ({}){}", stem, n, ext));
-        n += 1;
+/// `<stem><ext>`, `<stem> (2)<ext>`, … in order.
+fn numbered(dir: &Path, stem: &str, ext: &str, n: u32) -> PathBuf {
+    if n < 2 {
+        dir.join(format!("{}{}", stem, ext))
+    } else {
+        dir.join(format!("{} ({}){}", stem, n, ext))
     }
-    p
+}
+
+/// Claim an output name: the first `<stem>[ (n)].mp4` that doesn't exist and
+/// whose `.mp4.part` this call created (`create_new`, so two exports started
+/// together can't both claim it). Returns (final, part).
+pub fn reserve_file(dir: &Path, stem: &str) -> Result<(PathBuf, PathBuf), String> {
+    for n in 1..10_000 {
+        let fin = numbered(dir, stem, ".mp4", n);
+        if fin.exists() {
+            continue;
+        }
+        let part = PathBuf::from(format!("{}.part", fin.to_string_lossy()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&part) {
+            Ok(_) => return Ok((fin, part)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {}", part.display(), e)),
+        }
+    }
+    Err("Could not find a free file name in the exports folder".into())
+}
+
+/// The folder version of `reserve_file`, for raw tracks: `<stem>[ (n)].part`
+/// made with `create_dir`, which fails if it exists.
+pub fn reserve_folder(dir: &Path, stem: &str) -> Result<(PathBuf, PathBuf), String> {
+    for n in 1..10_000 {
+        let fin = numbered(dir, stem, "", n);
+        if fin.exists() {
+            continue;
+        }
+        let part = PathBuf::from(format!("{}.part", fin.to_string_lossy()));
+        match std::fs::create_dir(&part) {
+            Ok(()) => return Ok((fin, part)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {}", part.display(), e)),
+        }
+    }
+    Err("Could not find a free folder name in the exports folder".into())
 }
 
 fn rel_to(root: &Path, p: &Path) -> String {
@@ -1650,23 +1829,43 @@ fn rel_to(root: &Path, p: &Path) -> String {
 /// Serializes index rewrites within this process.
 static INDEX_LOCK: Mutex<()> = Mutex::new(());
 
-pub fn read_index(recordings: &Path) -> Vec<ExportRecord> {
+/// The index as read: the records, and every line that didn't parse (a newer
+/// version's record, a hand edit), which rewrites carry through verbatim.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Index {
+    pub records: Vec<ExportRecord>,
+    pub unparsed: Vec<String>,
+}
+
+/// No index yet is an empty one; any other failure to read it is an error, so
+/// a rewrite never replaces an index it couldn't read.
+pub fn read_index(recordings: &Path) -> Result<Index, String> {
     let path = recordings.join(EXPORTS_DIR).join(INDEX_FILE);
-    let Ok(data) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+    let data = match std::fs::read_to_string(&path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Index::default()),
+        Err(e) => return Err(format!("Could not read the exports list: {}", e)),
     };
-    data.lines()
-        .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<ExportRecord>(l).ok())
-        .collect()
+    let mut idx = Index::default();
+    for l in data.lines().filter(|l| !l.trim().is_empty()) {
+        match serde_json::from_str::<ExportRecord>(l) {
+            Ok(r) => idx.records.push(r),
+            Err(_) => idx.unparsed.push(l.to_string()),
+        }
+    }
+    Ok(idx)
 }
 
 /// Rewrite the whole index through a temp file and a rename.
-fn write_index(recordings: &Path, records: &[ExportRecord]) -> Result<(), String> {
+fn write_index(recordings: &Path, idx: &Index) -> Result<(), String> {
     let dir = recordings.join(EXPORTS_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
     let mut text = String::new();
-    for r in records {
+    for l in &idx.unparsed {
+        text.push_str(l);
+        text.push('\n');
+    }
+    for r in &idx.records {
         text.push_str(&serde_json::to_string(r).map_err(|e| e.to_string())?);
         text.push('\n');
     }
@@ -1677,37 +1876,62 @@ fn write_index(recordings: &Path, records: &[ExportRecord]) -> Result<(), String
 
 pub fn add_to_index(recordings: &Path, rec: ExportRecord) -> Result<(), String> {
     let _g = INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut all = read_index(recordings);
-    all.retain(|r| r.id != rec.id);
-    all.push(rec);
-    write_index(recordings, &all)
+    let mut idx = read_index(recordings)?;
+    idx.records.retain(|r| r.id != rec.id);
+    idx.records.push(rec);
+    write_index(recordings, &idx)
 }
 
 /// Exports whose file is still there, newest first.
-pub fn list(recordings: &Path) -> Vec<ExportRecord> {
-    let mut v: Vec<ExportRecord> = read_index(recordings)
+pub fn list(recordings: &Path) -> Result<Vec<ExportRecord>, String> {
+    let mut v: Vec<ExportRecord> = read_index(recordings)?
+        .records
         .into_iter()
-        .filter(|r| recordings.join(&r.path).exists())
+        .filter(|r| record_path(recordings, &r.path).is_ok_and(|p| p.exists()))
         .collect();
     v.sort_by(|a, b| b.created_epoch_ms.cmp(&a.created_epoch_ms));
-    v
+    Ok(v)
 }
 
-fn record_path(recordings: &Path, rel: &str) -> Result<PathBuf, String> {
-    let p = recordings.join(rel);
-    let base = recordings.join(EXPORTS_DIR);
-    // Only ever touch what lives under exports/.
-    if rel.split('/').any(|c| c == ".." || c.is_empty()) || !p.starts_with(&base) {
-        return Err("That export is not in the exports folder".into());
+const NOT_IN_EXPORTS: &str = "That export is not in the exports folder";
+
+/// An index path, resolved only when it is exactly `exports/<one plain name>`:
+/// no other separator, no drive or stream colon, no `.`/`..` or other dot
+/// name (`.work`), not the index itself, nothing empty.
+/// The index is a file anyone can edit; nothing else it names is ever touched.
+pub fn record_path(recordings: &Path, rel: &str) -> Result<PathBuf, String> {
+    let mut parts = rel.split('/');
+    let (Some(dir), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(NOT_IN_EXPORTS.into());
+    };
+    let plain = !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['\\', ':', '\0'])
+        && name.trim() == name
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !name.starts_with(INDEX_FILE);
+    if dir != EXPORTS_DIR || !plain {
+        return Err(NOT_IN_EXPORTS.into());
     }
-    Ok(p)
+    Ok(recordings.join(EXPORTS_DIR).join(name))
+}
+
+/// What Play may open: a finished `.mp4`, a `.jpg`, or a raw-tracks folder.
+pub fn playable(p: &Path) -> bool {
+    if p.is_dir() {
+        return true;
+    }
+    let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
+    matches!(ext.as_deref(), Some("mp4") | Some("jpg")) && p.is_file()
 }
 
 /// Remove an export's file (or folder), its thumbnail and its record.
 pub fn delete(recordings: &Path, id: &str) -> Result<(), String> {
     let _g = INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut all = read_index(recordings);
-    let Some(rec) = all.iter().find(|r| r.id == id).cloned() else {
+    let mut idx = read_index(recordings)?;
+    let Some(rec) = idx.records.iter().find(|r| r.id == id).cloned() else {
         return Err("That export is already gone".into());
     };
     let p = record_path(recordings, &rec.path)?;
@@ -1721,8 +1945,8 @@ pub fn delete(recordings: &Path, id: &str) -> Result<(), String> {
             let _ = std::fs::remove_file(tp);
         }
     }
-    all.retain(|r| r.id != id);
-    write_index(recordings, &all)
+    idx.records.retain(|r| r.id != id);
+    write_index(recordings, &idx)
 }
 
 // ---------------------------------------------------------------------------
@@ -1935,8 +2159,7 @@ pub fn run_export(
         .unwrap_or_else(|| req.layout.name().to_string());
     std::fs::create_dir_all(&exports).map_err(|e| format!("{}: {}", exports.display(), e))?;
     let first_piece = plan.out.pieces.first().map(|p| p.from).unwrap_or(req.from_ms);
-    let final_path = unique_path(&exports, &export_stem(first_piece, &title), ".mp4");
-    let part = final_path.with_extension("mp4.part");
+    let (final_path, part) = reserve_file(&exports, &export_stem(first_piece, &title))?;
     let mut partial = Partial(Some(part.clone()));
     let out_ms = plan.output_ms();
     let out_t = secs(out_ms);
@@ -2026,7 +2249,7 @@ pub fn run_export(
         title,
         thumb: thumb_ok.then(|| rel_to(recordings, &thumb)),
     };
-    add_to_index(recordings, rec.clone())?;
+    add_to_index(recordings, rec.clone()).map_err(|e| not_listed(&final_path, &e))?;
     progress(1.0);
     Ok(rec)
 }
@@ -2047,16 +2270,19 @@ fn run_raw(
     if tracks.is_empty() {
         return Err(RunError::Failed("Pick at least one track".into()));
     }
-    let whole = session_span(m);
-    let pieces = kept_pieces(m, req.from_ms.max(whole.from), req.to_ms.min(whole.to), false);
+    let (from, to, _) = effective_range(m, req);
+    let pieces = kept_pieces(m, from, to, false);
     if pieces.is_empty() {
         return Err(RunError::Failed(NOTHING_LEFT.into()));
     }
+    if pending_cut_in(m, from, to) {
+        return Err(RunError::Failed(PENDING_CUT_ERR.into()));
+    }
+    let ffprobe = session::find_ffprobe();
     let exports = recordings.join(EXPORTS_DIR);
+    std::fs::create_dir_all(&exports).map_err(|e| format!("{}: {}", exports.display(), e))?;
     let title = req.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "Raw tracks".into());
-    let folder = unique_path(&exports, &export_stem(pieces[0].from, &title), "");
-    let part = PathBuf::from(format!("{}.part", folder.to_string_lossy()));
-    std::fs::create_dir_all(&part).map_err(|e| format!("{}: {}", part.display(), e))?;
+    let (folder, part) = reserve_folder(&exports, &export_stem(pieces[0].from, &title))?;
     let mut partial = Partial(Some(part.clone()));
     let n = tracks.len() as f64;
     for (i, id) in tracks.iter().enumerate() {
@@ -2066,8 +2292,14 @@ fn run_raw(
             .find(|t| &t.id == id)
             .ok_or_else(|| format!("This session has no track named {}", id))?;
         // Raw cuts only whole-session deletes and this track's own.
-        let keep = subtract_spans(&pieces, &track_holes(m, &t.id));
-        let entries = raw_entries(t, &keep);
+        let holes = track_holes(m, &t.id);
+        let keep = subtract_spans(&pieces, &holes);
+        let mut entries = raw_entries(t, &keep);
+        if is_video(t) {
+            entries = snap_after_cuts(entries, &holes, |file| {
+                ffprobe.as_deref().and_then(|fp| probe_keyframes(fp, &session_dir.join(file)))
+            });
+        }
         if entries.is_empty() {
             continue;
         }
@@ -2099,9 +2331,14 @@ fn run_raw(
         title,
         thumb: None,
     };
-    add_to_index(recordings, rec.clone())?;
+    add_to_index(recordings, rec.clone()).map_err(|e| not_listed(&folder, &e))?;
     progress(1.0);
     Ok(rec)
+}
+
+/// The file is finished and kept; only the Exports list missed it.
+fn not_listed(path: &Path, e: &str) -> String {
+    format!("Saved as {}, but it could not be added to the Exports list: {}", path.display(), e)
 }
 
 // ---------------------------------------------------------------------------
@@ -2110,10 +2347,59 @@ fn run_raw(
 
 type SharedState = Arc<tokio::sync::Mutex<crate::state::AppState>>;
 
-static JOBS: Mutex<Option<HashMap<String, Arc<JobCtl>>>> = Mutex::new(None);
+struct Running {
+    session_id: String,
+    ctl: Arc<JobCtl>,
+}
 
-fn jobs() -> std::sync::MutexGuard<'static, Option<HashMap<String, Arc<JobCtl>>>> {
+static JOBS: Mutex<Option<HashMap<String, Running>>> = Mutex::new(None);
+static JOB_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn jobs() -> std::sync::MutexGuard<'static, Option<HashMap<String, Running>>> {
     JOBS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Is an export reading this session right now? Finalizing a delete trims the
+/// files an export may be copying, so it waits while this is true.
+pub fn is_exporting(session_id: &str) -> bool {
+    jobs().as_ref().is_some_and(|j| j.values().any(|r| r.session_id == session_id))
+}
+
+/// Kill every running export's ffmpeg, now (app exit). Each job's thread then
+/// removes its partial file and work folder as it unwinds.
+pub fn kill_all_jobs() {
+    if let Some(j) = jobs().as_ref() {
+        for r in j.values() {
+            r.ctl.cancel();
+        }
+    }
+}
+
+/// Remove what a crash or a kill left in the exports folder: `.work/*` and
+/// partial outputs (`*.mp4.part` files, `*.part` raw folders). Skipped while
+/// an export runs, since those are its files.
+pub fn sweep_leftovers(recordings_dir: &Path) {
+    if jobs().as_ref().is_some_and(|j| !j.is_empty()) {
+        return;
+    }
+    let exports = recordings_dir.join(EXPORTS_DIR);
+    if let Ok(rd) = std::fs::read_dir(exports.join(WORK_DIR)) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(&exports) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            if p.is_file() && name.ends_with(".mp4.part") {
+                let _ = std::fs::remove_file(&p);
+            } else if p.is_dir() && name.ends_with(".part") {
+                let _ = std::fs::remove_dir_all(&p);
+            }
+        }
+    }
 }
 
 /// `find_ffmpeg` and `detect_encoders` each spawn a process; remember them.
@@ -2173,15 +2459,19 @@ pub async fn start_export(
         let q = req.clone();
         tokio::task::spawn_blocking(move || load(&r, &q)).await.map_err(|e| e.to_string())??
     };
-    if req.raw_tracks.is_none() {
-        let est = estimate(&m, &req, &cursor, &caps);
-        if let Some(e) = est.error {
-            return Err(e);
-        }
+    let est = estimate(&m, &req, &cursor, &caps);
+    if let Some(e) = est.error {
+        return Err(e);
     }
-    let job_id = format!("exp-{}", session::now_epoch_ms());
+    if let Some((free, _)) = crate::nativeui::disk_space(&recordings) {
+        space_check(free, est.bytes)?;
+    }
+    let job_id = format!("exp-{}-{}", session::now_epoch_ms(), JOB_SEQ.fetch_add(1, Ordering::SeqCst));
     let ctl = Arc::new(JobCtl::default());
-    jobs().get_or_insert_with(HashMap::new).insert(job_id.clone(), ctl.clone());
+    jobs().get_or_insert_with(HashMap::new).insert(
+        job_id.clone(),
+        Running { session_id: req.session_id.clone(), ctl: ctl.clone() },
+    );
 
     let id = job_id.clone();
     std::thread::spawn(move || {
@@ -2248,7 +2538,7 @@ pub async fn start_export(
 /// Stop a running export; its partial file is deleted.
 #[tauri::command]
 pub async fn cancel_export(job_id: String) -> Result<(), String> {
-    let ctl = jobs().as_ref().and_then(|j| j.get(&job_id).cloned());
+    let ctl = jobs().as_ref().and_then(|j| j.get(&job_id).map(|r| r.ctl.clone()));
     match ctl {
         Some(c) => {
             c.cancel();
@@ -2263,7 +2553,7 @@ pub async fn list_exports(state: tauri::State<'_, SharedState>) -> Result<Vec<Ex
     let recordings = recordings_dir(&state).await;
     tokio::task::spawn_blocking(move || list(&recordings))
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -2283,7 +2573,8 @@ pub async fn reveal_export(
     play: Option<bool>,
 ) -> Result<(), String> {
     let recordings = recordings_dir(&state).await;
-    let rec = read_index(&recordings)
+    let rec = read_index(&recordings)?
+        .records
         .into_iter()
         .find(|r| r.id == id)
         .ok_or("That export is gone")?;
@@ -2291,7 +2582,11 @@ pub async fn reveal_export(
     if !path.exists() {
         return Err("The file is no longer there".into());
     }
-    open_in_shell(&path, play.unwrap_or(false))
+    let play = play.unwrap_or(false);
+    if play && !playable(&path) {
+        return Err("That export can't be opened".into());
+    }
+    open_in_shell(&path, play)
 }
 
 #[cfg(target_os = "windows")]

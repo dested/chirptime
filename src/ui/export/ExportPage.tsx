@@ -19,7 +19,7 @@ import { errorText } from "../app/appData";
 import { href } from "../app/router";
 import { IconBack, IconCheck, IconDown } from "../app/icons";
 import { cancelExport, estimateExport, loadPreset, revealExport, savePreset, startExport } from "./api";
-import { addJob, useJobs } from "./jobs";
+import { addJob, ensureListening, useJobs } from "./jobs";
 import type { Job } from "./jobs";
 import { compose, largestScreen, layoutAspect } from "./compose";
 import { MAT_PAD, Preview } from "./Preview";
@@ -269,19 +269,27 @@ function Composer({ manifest, initialFrom, initialTo }: { manifest: SessionManif
   const [jobId, setJobId] = useState<string | null>(() => jobs.find((j) => j.sessionId === id && j.progress.state === "running")?.id ?? null);
   const job = jobs.find((j) => j.id === jobId) ?? null;
   const [startError, setStartError] = useState<string | null>(null);
-  const begin = useCallback(
-    async (r: ExportRequest, title: string) => {
-      setStartError(null);
-      try {
-        const jid = await startExport(r);
-        addJob({ id: jid, sessionId: r.sessionId, from: r.fromMs, to: r.toMs, title });
-        setJobId(jid);
-      } catch (e) {
-        setStartError(errorText(e));
-      }
-    },
-    [],
-  );
+  // true from the click until start_export answers: a second click can't start a twin
+  const [starting, setStarting] = useState(false);
+  const startingRef = useRef(false);
+  const begin = useCallback(async (r: ExportRequest, title: string) => {
+    if (startingRef.current) return;
+    startingRef.current = true;
+    setStarting(true);
+    setStartError(null);
+    // listening before the job exists, so even an instant failure is heard
+    ensureListening();
+    try {
+      const jid = await startExport(r);
+      addJob({ id: jid, sessionId: r.sessionId, from: r.fromMs, to: r.toMs, title });
+      setJobId(jid);
+    } catch (e) {
+      setStartError(errorText(e));
+    } finally {
+      startingRef.current = false;
+      setStarting(false);
+    }
+  }, []);
 
   /* ---- raw tracks ---- */
   const [rawOpen, setRawOpen] = useState(false);
@@ -507,6 +515,7 @@ function Composer({ manifest, initialFrom, initialTo }: { manifest: SessionManif
             estimate={estimate}
             estimateError={estimateError}
             startError={startError}
+            starting={starting}
             sourceMs={sourceMs}
             onExport={() => void begin(req, LAYOUTS.find((l) => l.value === layout)?.label ?? "Export")}
             onSavePreset={() => {
@@ -558,7 +567,7 @@ function Composer({ manifest, initialFrom, initialTo }: { manifest: SessionManif
                   </div>
                   <button
                     className="mt-2.5 flex h-8 w-full items-center justify-center rounded-ctl border border-line bg-card text-[12.5px] font-semibold transition-colors duration-150 hover:bg-paper disabled:opacity-50"
-                    disabled={rawPicked.size === 0 || (job?.progress.state === "running") || Boolean(rawEstimate?.error)}
+                    disabled={starting || rawPicked.size === 0 || job?.progress.state === "running" || Boolean(rawEstimate?.error)}
                     onClick={() => {
                       setRawOpen(false);
                       void begin(rawReq, "Raw tracks");
@@ -686,6 +695,7 @@ function Footer({
   estimate,
   estimateError,
   startError,
+  starting,
   sourceMs,
   onExport,
   onSavePreset,
@@ -697,6 +707,7 @@ function Footer({
   estimate: ExportEstimate | null;
   estimateError: string | null;
   startError: string | null;
+  starting: boolean;
   sourceMs: number;
   onExport: () => void;
   onSavePreset: () => void;
@@ -782,10 +793,10 @@ function Footer({
       <div className="mt-2.5 flex gap-2">
         <button
           className="flex h-10 flex-1 items-center justify-center whitespace-nowrap rounded-ctl border border-ink bg-ink text-[13.5px] font-semibold text-white transition-opacity duration-150 hover:opacity-90 disabled:opacity-40"
-          disabled={Boolean(blocked)}
+          disabled={Boolean(blocked) || starting}
           onClick={onExport}
         >
-          Export {lengthWords(sourceMs)}
+          {starting ? "Starting" : `Export ${lengthWords(sourceMs)}`}
         </button>
         <button
           className="flex h-10 items-center whitespace-nowrap rounded-ctl border border-line bg-card px-3 text-[12.5px] font-semibold transition-colors duration-150 hover:bg-paper"

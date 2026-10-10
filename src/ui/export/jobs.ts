@@ -21,24 +21,39 @@ export interface Job {
 let jobs: readonly Job[] = [];
 const subs = new Set<() => void>();
 let listening = false;
+/**
+ * Progress for jobs not registered yet: a job can fail (or finish) before
+ * `start_export`'s reply arrives, and its last word must not be lost.
+ */
+const early = new Map<string, ExportProgress>();
+const EARLY_MAX = 50;
 
 function set(next: readonly Job[]) {
   jobs = next;
   for (const f of subs) f();
 }
 
-function ensureListening() {
+/** Attach the window's one progress listener. Call before starting a job. */
+export function ensureListening() {
   if (listening) return;
   listening = true;
   onExportProgress((p) => {
-    if (!jobs.some((j) => j.id === p.jobId)) return;
+    if (!jobs.some((j) => j.id === p.jobId)) {
+      early.set(p.jobId, p);
+      if (early.size > EARLY_MAX) {
+        const oldest = early.keys().next().value;
+        if (oldest !== undefined) early.delete(oldest);
+      }
+      return;
+    }
     set(jobs.map((j) => (j.id === p.jobId ? { ...j, progress: p } : j)));
   });
 }
 
 export function addJob(j: Omit<Job, "progress" | "startedAt">) {
   ensureListening();
-  const progress: ExportProgress = { jobId: j.id, fraction: 0, etaSeconds: null, state: "running" };
+  const progress: ExportProgress = early.get(j.id) ?? { jobId: j.id, fraction: 0, etaSeconds: null, state: "running" };
+  early.delete(j.id);
   set([{ ...j, progress, startedAt: Date.now() }, ...jobs.filter((x) => x.id !== j.id)]);
 }
 
