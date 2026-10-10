@@ -5,7 +5,7 @@
   "identifier": "com.chirptime.app",
   "build": {
     "frontendDist": "../dist",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://localhost:7460",
     "beforeDevCommand": "bun run vite:dev",
     "beforeBuildCommand": "bun run vite:build"
   },

@@ -3,13 +3,6 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { listen } from "@tauri-apps/api/event";
 import {
-  startCapture,
-  stopCapture,
-  runSingleCapture,
-  getCaptureStatus,
-  fetchDates,
-  fetchDateEntries,
-  deleteEntry,
   openViewer,
   startSession,
   stopSession,
@@ -29,8 +22,6 @@ import {
   pickFfmpegDir,
 } from "./hooks/useApi";
 import type {
-  CaptureStatus,
-  CaptureEntry,
   DisplayOutputInfo,
   EnvironmentInfo,
   FfmpegProgress,
@@ -43,7 +34,6 @@ import { fmtBytes, fmtClock, fmtElapsed } from "./session/format";
 
 const appWindow = getCurrentWindow();
 
-type Mode = "clips" | "session";
 
 /** Mirrors `recorder::SessionOptions::default()`. */
 const DEFAULT_OPTIONS: SessionOptions = {
@@ -657,8 +647,8 @@ function FfmpegSetupCard({
 }
 
 /**
- * The persistent form of the above, above the mode switch so it applies to both
- * panes. Not dismissible — nothing records until it is resolved.
+ * The persistent form of the above, above the session pane. Not dismissible —
+ * nothing records until it is resolved.
  */
 function FfmpegBanner({ setup, onResolved }: { setup: FfmpegSetup; onResolved: () => void }) {
   return (
@@ -1263,247 +1253,9 @@ export function SessionPane({
   );
 }
 
-/* ---------------------------------------------------------------- clips --- */
-
-function ClipsPane({
-  status,
-  onChanged,
-}: {
-  status: CaptureStatus;
-  onChanged: (s: CaptureStatus) => void;
-}) {
-  const [countdown, setCountdown] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [recentCaptures, setRecentCaptures] = useState<CaptureEntry[]>([]);
-  const [todayDate, setTodayDate] = useState<string | null>(null);
-
-  const refreshRecent = useCallback(async () => {
-    try {
-      const dates = await fetchDates();
-      if (dates[0]) {
-        setTodayDate(dates[0]);
-        const entries = await fetchDateEntries(dates[0]);
-        setRecentCaptures(entries.entries.slice(-6).reverse());
-      } else {
-        setRecentCaptures([]);
-      }
-    } catch {}
-  }, []);
-
-  // Refresh recent captures when a new capture lands
-  useEffect(() => {
-    void refreshRecent();
-  }, [status.captures_today, refreshRecent]);
-
-  // Countdown timer
-  useEffect(() => {
-    if (!status.running || !status.next_capture_time) {
-      setCountdown(null);
-      return;
-    }
-    const update = () => {
-      const now = new Date();
-      const [h, m, s] = status.next_capture_time!.split(":").map(Number);
-      const target = new Date();
-      target.setHours(h, m, s, 0);
-      const diffMs = target.getTime() - now.getTime();
-      if (diffMs <= 0) {
-        setCountdown("now");
-        return;
-      }
-      const mins = Math.floor(diffMs / 60000);
-      const secs = Math.floor((diffMs % 60000) / 1000);
-      setCountdown(`${mins}:${secs.toString().padStart(2, "0")}`);
-    };
-    update();
-    const interval = setInterval(update, 1000);
-    return () => clearInterval(interval);
-  }, [status.running, status.next_capture_time]);
-
-  const handleStart = useCallback(async () => {
-    setBusy(true);
-    try {
-      await startCapture();
-      onChanged(await getCaptureStatus());
-    } catch {}
-    setBusy(false);
-  }, [onChanged]);
-
-  const handleStop = useCallback(async () => {
-    setBusy(true);
-    try {
-      await stopCapture();
-      onChanged(await getCaptureStatus());
-    } catch {}
-    setBusy(false);
-  }, [onChanged]);
-
-  const handleSingle = useCallback(async () => {
-    setBusy(true);
-    try {
-      await runSingleCapture();
-      onChanged(await getCaptureStatus());
-    } catch {}
-    setBusy(false);
-  }, [onChanged]);
-
-  const handleRecentClick = useCallback((entry: CaptureEntry) => {
-    if (todayDate) {
-      void openViewer({ date: todayDate, timestamp: entry.timestamp });
-    }
-  }, [todayDate]);
-
-  const handleRecentDelete = useCallback(async (e: React.MouseEvent, entry: CaptureEntry) => {
-    e.stopPropagation();
-    if (!todayDate) return;
-    if (!confirm(`Delete capture at ${entry.display_time}?`)) return;
-    await deleteEntry(todayDate, entry.timestamp);
-    void refreshRecent();
-  }, [todayDate, refreshRecent]);
-
-  return (
-    <>
-      {/* Status section */}
-      <div className="px-4 pt-3 pb-3">
-        <div className={`flex items-center gap-2 px-3.5 py-2 rounded-[10px] text-[13px] font-semibold ${
-          status.running ? "bg-red-50 text-red-600" : "bg-slate-50 text-slate-500"
-        }`}>
-          <span className={`w-2 h-2 rounded-full shrink-0 ${
-            status.running
-              ? "bg-red-600 shadow-[0_0_0_3px_rgba(220,38,38,0.15)] dot-active"
-              : "bg-slate-300"
-          }`} />
-          <span>{status.running ? "Recording" : "Idle"}</span>
-        </div>
-        {status.running && countdown && (
-          <div className="flex items-center justify-between mt-2 px-1">
-            <span className="text-xs text-slate-400">Next capture in</span>
-            <span className="text-sm font-bold tabular-nums font-mono text-slate-900">{countdown}</span>
-          </div>
-        )}
-      </div>
-
-      {/* Big action button */}
-      <div className="px-4 pb-3 flex flex-col gap-2">
-        {status.running ? (
-          <button
-            className="flex items-center justify-center gap-2.5 py-3.5 rounded-xl text-sm font-semibold tracking-tight cursor-pointer border-none bg-red-600 text-white shadow-[0_1px_3px_rgba(220,38,38,0.3),0_4px_12px_rgba(220,38,38,0.15)] hover:bg-red-700 hover:shadow-[0_2px_6px_rgba(220,38,38,0.4),0_6px_16px_rgba(220,38,38,0.2)] hover:-translate-y-px transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-            onClick={handleStop}
-            disabled={busy}
-          >
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
-              <rect x="4" y="4" width="12" height="12" rx="2" />
-            </svg>
-            <span>Stop Recording</span>
-          </button>
-        ) : (
-          <button
-            className="flex items-center justify-center gap-2.5 py-3.5 rounded-xl text-sm font-semibold tracking-tight cursor-pointer border-none bg-sky-500 text-white shadow-[0_1px_3px_rgba(14,165,233,0.3),0_4px_12px_rgba(14,165,233,0.15)] hover:bg-sky-600 hover:shadow-[0_2px_6px_rgba(14,165,233,0.4),0_6px_16px_rgba(14,165,233,0.2)] hover:-translate-y-px transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-            onClick={handleStart}
-            disabled={busy}
-          >
-            <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
-              <circle cx="10" cy="10" r="7" />
-            </svg>
-            <span>Start Recording</span>
-          </button>
-        )}
-
-        <button className={SECONDARY_BTN} onClick={handleSingle} disabled={busy}>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-            <circle cx="12" cy="12" r="10" />
-            <polyline points="12 6 12 12 16 14" />
-          </svg>
-          <span>Capture Now</span>
-        </button>
-      </div>
-
-      {/* Stats */}
-      <div className="flex items-center justify-center mx-4 py-2.5 border-t border-b border-slate-100 gap-4">
-        <div className="flex flex-col items-center gap-0.5">
-          <span className="text-[15px] font-bold text-slate-900 tabular-nums">{status.captures_today}</span>
-          <span className="text-[10px] font-medium text-slate-400 uppercase tracking-wide">Today</span>
-        </div>
-        <div className="w-px h-7 bg-slate-100" />
-        <div className="flex flex-col items-center gap-0.5">
-          <span className="text-[15px] font-bold text-slate-900 tabular-nums">{status.last_capture_time ?? "--:--"}</span>
-          <span className="text-[10px] font-medium text-slate-400 uppercase tracking-wide">Last capture</span>
-        </div>
-      </div>
-
-      {/* Recent captures */}
-      {recentCaptures.length > 0 && (
-        <div className="flex-1 min-h-0 flex flex-col px-4 pt-2.5">
-          <div className="flex items-center justify-between mb-1.5">
-            <Eyebrow>Recent</Eyebrow>
-            <span className="text-[11px] text-slate-300 font-mono">{todayDate}</span>
-          </div>
-          <div className="flex-1 overflow-y-auto">
-            {recentCaptures.map((entry) => (
-              <div
-                key={entry.timestamp}
-                className="group flex items-center gap-2.5 px-2 py-1.5 rounded-lg cursor-pointer hover:bg-slate-50 transition-colors"
-                onClick={() => handleRecentClick(entry)}
-              >
-                <div className="shrink-0 w-5 flex items-center justify-center">
-                  {entry.screen_video ? (
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#0EA5E9" strokeWidth="2.5">
-                      <polygon points="5 3 19 12 5 21 5 3" fill="#0EA5E9" opacity="0.2" />
-                    </svg>
-                  ) : (
-                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#64748B" strokeWidth="2.5">
-                      <rect x="3" y="3" width="18" height="18" rx="2" fill="#64748B" opacity="0.15" />
-                      <circle cx="8.5" cy="8.5" r="1.5" fill="#64748B" />
-                      <path d="M21 15l-5-5L5 21" />
-                    </svg>
-                  )}
-                </div>
-                <span className="text-[13px] font-medium text-slate-900 tabular-nums font-mono">{entry.display_time}</span>
-                <span className="ml-auto text-[11px] text-slate-400">
-                  {entry.screen_video ? "Video" : "Screenshot"}
-                </span>
-                <button
-                  className="shrink-0 w-5 h-5 flex items-center justify-center border-none bg-transparent text-slate-300 rounded cursor-pointer opacity-0 group-hover:opacity-100 hover:text-red-500 hover:bg-red-50 transition-all"
-                  onClick={(e) => handleRecentDelete(e, entry)}
-                  title="Delete"
-                >
-                  <svg width="10" height="10" viewBox="0 0 10 10">
-                    <line x1="2" y1="2" x2="8" y2="8" stroke="currentColor" strokeWidth="1.5" />
-                    <line x1="8" y1="2" x2="2" y2="8" stroke="currentColor" strokeWidth="1.5" />
-                  </svg>
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Browse button */}
-      <div className="mt-auto px-4 py-2.5 pb-3.5">
-        <button
-          className="flex items-center justify-center gap-2 w-full py-2.5 rounded-[10px] text-[13px] font-medium cursor-pointer border border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100 hover:border-slate-300 hover:text-slate-900 transition-all"
-          onClick={() => void openViewer()}
-        >
-          <span>Browse All Captures</span>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-            <path d="M5 12h14M12 5l7 7-7 7" />
-          </svg>
-        </button>
-      </div>
-    </>
-  );
-}
-
 /* ------------------------------------------------------------------ app --- */
 
 export function CompactApp() {
-  const [mode, setMode] = useState<Mode>("clips");
-  const [status, setStatus] = useState<CaptureStatus>({
-    running: false,
-    last_capture_time: null,
-    next_capture_time: null,
-    captures_today: 0,
-  });
   const [session, setSession] = useState<SessionStatus>(IDLE_SESSION);
   // null until settings have been read. The first-run panel is decided by the
   // persisted flag, so nothing else may render before it is known.
@@ -1536,20 +1288,6 @@ export function CompactApp() {
     void checkFfmpeg();
   }, [checkFfmpeg]);
 
-  // Both loops are polled from here regardless of which tab is showing, so the
-  // mode switch can always say which one is live. They are independent: interval
-  // clips and a continuous session can run at the same time.
-  useEffect(() => {
-    const poll = async () => {
-      try {
-        setStatus(await getCaptureStatus());
-      } catch {}
-    };
-    void poll();
-    const t = setInterval(poll, 3000);
-    return () => clearInterval(t);
-  }, []);
-
   useEffect(() => {
     const poll = async () => {
       try {
@@ -1568,11 +1306,6 @@ export function CompactApp() {
     appWindow.startDragging();
   }, []);
 
-  const tabCls = (active: boolean) =>
-    `flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-lg text-[13px] font-semibold cursor-pointer border-none transition-all ${
-      active ? "bg-white text-slate-900 shadow-sm" : "bg-transparent text-slate-500 hover:text-slate-900"
-    }`;
-
   return (
     <div className="flex flex-col h-screen bg-white rounded-xl overflow-hidden border border-slate-200">
       {/* Custom titlebar */}
@@ -1589,7 +1322,7 @@ export function CompactApp() {
           <span className="text-[13px] font-bold text-slate-900 tracking-tight">ChirpTime</span>
         </div>
         <div className="flex gap-1">
-          {/* Always reachable, both modes: the folder holding the recordings. */}
+          {/* Always reachable: the folder holding the recordings. */}
           <button
             className="w-6 h-6 flex items-center justify-center bg-transparent border-none text-slate-400 rounded-md hover:bg-slate-100 hover:text-slate-600 transition-all cursor-pointer"
             onClick={() => void openFolder().catch(() => {})}
@@ -1628,26 +1361,7 @@ export function CompactApp() {
             <FfmpegBanner setup={ffmpeg} onResolved={() => void checkFfmpeg()} />
           )}
 
-          {/* Mode switch. The red dot follows whichever mode is actually running,
-              so switching tabs never hides that something is recording. */}
-          <div className="px-4 pt-3">
-            <div className="flex gap-0.5 p-0.5 rounded-[10px] border border-slate-200 bg-slate-100">
-              <button className={tabCls(mode === "clips")} onClick={() => setMode("clips")}>
-                <span>Clips</span>
-                {status.running && <span className="w-1.5 h-1.5 rounded-full bg-red-500 dot-active" />}
-              </button>
-              <button className={tabCls(mode === "session")} onClick={() => setMode("session")}>
-                <span>Session</span>
-                {session.recording && <span className="w-1.5 h-1.5 rounded-full bg-red-500 dot-active" />}
-              </button>
-            </div>
-          </div>
-
-          {mode === "clips" ? (
-            <ClipsPane status={status} onChanged={setStatus} />
-          ) : (
-            <SessionPane status={session} onChanged={setSession} />
-          )}
+          <SessionPane status={session} onChanged={setSession} />
         </>
       )}
     </div>

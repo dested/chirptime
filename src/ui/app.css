@@ -1,5 +1,20 @@
 @import "tailwindcss";
 
+/* Paper: one light surface. The only dark thing is the footage mat.
+   Family names are the ones @fontsource-variable registers (imported in main.tsx). */
+@theme {
+  --font-sans: "Schibsted Grotesk Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", "Cascadia Mono", ui-monospace, monospace;
+  --color-paper: #F5F3EE; --color-rail: #EFECE5; --color-card: #FFFFFF; --color-sunk: #EEEBE4;
+  --color-ink: #1A1917; --color-ink-2: #55524B; --color-ink-3: #8C887F; --color-ink-4: #BCB7AC;
+  --color-line: #E3DFD5; --color-line-2: #ECE9E2; --color-mat: #0B0B0A;
+  --color-canary: #FFD84D; --color-canary-deep: #E8B800; --color-canary-ink: #2B2200;
+  --color-rec: #E5372B; --color-rec-line: #F2C4BF;
+  --color-amber: #C2680A; --color-amber-wash: #FFF3DF; --color-amber-line: #F3D9AE;
+  --radius-card: 12px; --radius-ctl: 8px; --radius-chip: 6px;
+  --ease-out-soft: cubic-bezier(.2,.7,.2,1);
+}
+
 @layer base {
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   html, body, #root {
@@ -7,25 +22,44 @@
     margin: 0;
   }
   body {
-    font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
-    -webkit-font-smoothing: antialiased;
+    @apply bg-paper text-ink font-sans text-[13px] antialiased;
+    line-height: 1.35;
     overflow: hidden;
   }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+  button:disabled { cursor: default; }
+  :focus:not(:focus-visible) { outline: none; }
+  :focus-visible { outline: 2px solid var(--color-canary-deep); outline-offset: 2px; }
+  /* Every number is Geist Mono with tabular figures. */
+  .num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
 }
 
 @layer components {
-  /* Pulse animation for recording dot */
-  @keyframes pulse-dot {
-    0%, 100% { opacity: 1; box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.15); }
-    50% { opacity: 0.7; box-shadow: 0 0 0 6px rgba(220, 38, 38, 0.08); }
+  /* The recorder dot breathes at 1.6s while recording */
+  @keyframes rec-breathe {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 3px rgba(229, 55, 43, 0.16); }
+    50% { opacity: 0.72; box-shadow: 0 0 0 5px rgba(229, 55, 43, 0.06); }
   }
   .dot-active {
-    animation: pulse-dot 1.5s ease-in-out infinite;
+    animation: rec-breathe 1.6s ease-in-out infinite;
   }
+
+  .kbd {
+    display: inline-flex; align-items: center; gap: 2px;
+    font-family: var(--font-mono); font-size: 10px; line-height: 1;
+    padding: 3px 5px; border-radius: 4px;
+    border: 1px solid var(--color-line); color: var(--color-ink-3); background: var(--color-card);
+  }
+
+  /* The undo toast's countdown: width set from the remaining fraction, animated
+     linearly to zero over the remaining time. */
+  @keyframes countdown { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  .toast-in { animation: toast-in 200ms var(--ease-out-soft); }
 }
 
 /* Thin scrollbars */
-::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #E2E8F0; border-radius: 4px; }
+::-webkit-scrollbar-thumb { background: rgba(26, 25, 23, 0.14); border-radius: 4px; }
 .dark-scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); }
