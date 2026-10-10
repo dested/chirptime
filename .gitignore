@@ -12,3 +12,5 @@ release-notes.md
 plans/*/mocks/assets/
 plans/*/canvas/project/assets/
 plans/*/shots/
+fixtures/
+plans/*/build-shots/
