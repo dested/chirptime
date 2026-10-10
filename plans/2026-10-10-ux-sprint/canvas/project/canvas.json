@@ -1,0 +1,147 @@
+{
+  "v": 3,
+  "createdOnFiles": {
+    "v": 1,
+    "at": "2026-10-10T19:19:15Z"
+  },
+  "title": "ChirpTime redesign",
+  "launch": {
+    "view": "canvas"
+  },
+  "pages": [
+    {
+      "id": "widget",
+      "name": "Widget"
+    },
+    {
+      "id": "viewer",
+      "name": "Viewer"
+    },
+    {
+      "id": "edit",
+      "name": "Edit + export"
+    }
+  ],
+  "boards": {
+    "Main.dc.html": {
+      "x": 0,
+      "y": 0,
+      "w": 1280,
+      "h": 800,
+      "title": "Player — playing, follow focus",
+      "page": "viewer"
+    },
+    "Library.dc.html": {
+      "x": 1360,
+      "y": 0,
+      "w": 1280,
+      "h": 800,
+      "title": "Library",
+      "page": "viewer"
+    },
+    "FirstRun.dc.html": {
+      "x": 2720,
+      "y": 0,
+      "w": 1280,
+      "h": 800,
+      "title": "First run",
+      "page": "viewer"
+    },
+    "Player1920.dc.html": {
+      "x": 0,
+      "y": 920,
+      "w": 1920,
+      "h": 1080,
+      "title": "Player at 1920×1080",
+      "page": "viewer"
+    },
+    "WidgetIdle.dc.html": {
+      "x": 0,
+      "y": 0,
+      "w": 320,
+      "h": 540,
+      "title": "Recorder — idle",
+      "page": "widget"
+    },
+    "WidgetRecording.dc.html": {
+      "x": 400,
+      "y": 0,
+      "w": 320,
+      "h": 540,
+      "title": "Recorder — recording",
+      "page": "widget"
+    },
+    "WidgetAlert.dc.html": {
+      "x": 800,
+      "y": 0,
+      "w": 320,
+      "h": 540,
+      "title": "Recorder — screens stopped",
+      "page": "widget"
+    },
+    "WidgetOptions.dc.html": {
+      "x": 1200,
+      "y": 0,
+      "w": 320,
+      "h": 540,
+      "title": "Recorder — options",
+      "page": "widget"
+    },
+    "WidgetPill.dc.html": {
+      "x": 1600,
+      "y": 0,
+      "w": 264,
+      "h": 52,
+      "title": "Recorder — pill",
+      "page": "widget"
+    },
+    "PlayerSelect.dc.html": {
+      "x": 0,
+      "y": 0,
+      "w": 1280,
+      "h": 800,
+      "title": "Delete — range selected",
+      "page": "edit"
+    },
+    "PlayerConfirm.dc.html": {
+      "x": 1360,
+      "y": 0,
+      "w": 1280,
+      "h": 800,
+      "title": "Delete — confirm",
+      "page": "edit"
+    },
+    "PlayerDeleted.dc.html": {
+      "x": 2720,
+      "y": 0,
+      "w": 1280,
+      "h": 800,
+      "title": "Delete — done, undo toast",
+      "page": "edit"
+    },
+    "Export.dc.html": {
+      "x": 4080,
+      "y": 0,
+      "w": 1280,
+      "h": 800,
+      "title": "Export composer",
+      "page": "edit"
+    }
+  },
+  "order": [
+    "Main.dc.html",
+    "Library.dc.html",
+    "FirstRun.dc.html",
+    "Player1920.dc.html",
+    "WidgetIdle.dc.html",
+    "WidgetRecording.dc.html",
+    "WidgetAlert.dc.html",
+    "WidgetOptions.dc.html",
+    "WidgetPill.dc.html",
+    "PlayerSelect.dc.html",
+    "PlayerConfirm.dc.html",
+    "PlayerDeleted.dc.html",
+    "Export.dc.html"
+  ],
+  "notes": {}
+}

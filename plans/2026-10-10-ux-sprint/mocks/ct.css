@@ -1,0 +1,96 @@
+/* ChirpTime redesign — shared tokens for every mock.
+   Two surfaces, one system: Paper (light, for recording + browsing) and
+   Darkroom (warm graphite, wherever footage is the subject). One brand accent,
+   Canary, used like a highlighter: selection, playhead, marks. Red means
+   recording or removal, nothing else. */
+
+@import url("https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:ital,wght@0,400;0,500;0,600;0,700;1,400&family=Geist+Mono:wght@400;500;600&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap");
+
+:root {
+  /* Paper */
+  --paper: #F5F3EE;
+  --card: #FFFFFF;
+  --sunk: #EEEBE4;
+  --ink: #1A1917;
+  --ink-2: #55524B;
+  --ink-3: #8C887F;
+  --ink-4: #BCB7AC;
+  --line: #E3DFD5;
+  --line-2: #ECE9E2;
+
+  /* Darkroom */
+  --dk: #121211;
+  --dk-1: #1A1A18;
+  --dk-2: #23231F;
+  --dk-3: #2E2D29;
+  --dk-line: rgba(255, 248, 230, 0.08);
+  --dk-line-2: rgba(255, 248, 230, 0.14);
+  --dk-t1: #F3F0E8;
+  --dk-t2: rgba(243, 240, 232, 0.64);
+  --dk-t3: rgba(243, 240, 232, 0.40);
+  --dk-t4: rgba(243, 240, 232, 0.22);
+  --mat: #0B0B0A;
+
+  /* Signal */
+  --canary: #FFD84D;
+  --canary-deep: #E8B800;
+  --canary-ink: #2B2200;
+  --canary-wash: rgba(255, 216, 77, 0.16);
+  --rec: #E5372B;
+  --rec-wash: rgba(229, 55, 43, 0.10);
+  --cut: #FF5A4E;
+  --amber: #C2680A;
+  --amber-wash: #FFF3DF;
+  --amber-line: #F3D9AE;
+
+  --r-win: 12px;
+  --r-card: 10px;
+  --r-ctl: 8px;
+  --r-sm: 6px;
+
+  --sans: "Schibsted Grotesk", "Segoe UI", system-ui, sans-serif;
+  --mono: "Geist Mono", ui-monospace, "Cascadia Mono", monospace;
+  --serif: "Newsreader", Georgia, serif;
+  --ease: cubic-bezier(.2, .7, .2, 1);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { background: #D9D6CF; }
+body {
+  font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
+  color: var(--ink);
+  font-size: 13px;
+  line-height: 1.35;
+  overflow: hidden;
+}
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+img { display: block; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.serif { font-family: var(--serif); }
+
+/* The window being mocked. Exactly the real size, pinned top-left so a
+   screenshot crop is the window and nothing else. */
+.win { position: absolute; left: 0; top: 0; overflow: hidden; }
+
+/* Shared atoms */
+.kbd {
+  display: inline-flex; align-items: center; gap: 2px;
+  font-family: var(--mono); font-size: 10px; line-height: 1;
+  padding: 3px 5px; border-radius: 4px;
+  border: 1px solid var(--line); color: var(--ink-3); background: var(--card);
+}
+.dk .kbd { border-color: var(--dk-line-2); color: var(--dk-t3); background: transparent; }
+
+.dot-rec { width: 8px; height: 8px; border-radius: 50%; background: var(--rec); box-shadow: 0 0 0 3px var(--rec-wash); }
+.hatch-cut {
+  background: repeating-linear-gradient(-45deg, rgba(255, 90, 78, 0.34) 0 4px, rgba(255, 90, 78, 0.12) 4px 8px);
+}
+.hatch-away {
+  background: repeating-linear-gradient(90deg, rgba(243, 240, 232, 0.10) 0 1px, transparent 1px 4px);
+}
+.hatch-dead {
+  background: repeating-linear-gradient(-45deg, rgba(243, 240, 232, 0.07) 0 3px, transparent 3px 7px);
+}
+.scroll-thin::-webkit-scrollbar { width: 4px; height: 4px; }
+.scroll-thin::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, .15); border-radius: 4px; }

@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Recorder · idle</title>
+<link rel="stylesheet" href="ct.css">
+<script src="data.js"></script>
+<script src="ct.js"></script>
+<style>
+  .win { width: 320px; height: 540px; background: #FBFAF7; border: 1px solid var(--line); border-radius: var(--r-win); display: flex; flex-direction: column; }
+  .tb { height: 40px; display: flex; align-items: center; gap: 8px; padding: 0 8px 0 12px; flex-shrink: 0; }
+  .tb .name { font-weight: 700; font-size: 13px; letter-spacing: -.01em; }
+  .ib { width: 28px; height: 28px; border-radius: 7px; display: grid; place-items: center; color: var(--ink-3); }
+  .ib:hover { background: var(--sunk); color: var(--ink); }
+  .body { flex: 1; min-height: 0; padding: 4px 16px 0; display: flex; flex-direction: column; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: var(--r-card); }
+  .desk { position: relative; }
+  .m { position: absolute; border-radius: 3px; overflow: hidden; }
+  .m img { width: 100%; height: 100%; object-fit: cover; }
+  .m .n { position: absolute; left: 3px; bottom: 2px; font: 600 9px var(--mono); color: var(--ink-3); }
+  .chip { display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 8px; border-radius: 7px; background: var(--paper); font-size: 11.5px; font-weight: 500; color: var(--ink-2); white-space: nowrap; min-width: 0; }
+  .chip .ck { width: 12px; height: 12px; border-radius: 3px; background: var(--ink); display: grid; place-items: center; flex-shrink: 0; }
+  .meter { display: flex; gap: 1.5px; align-items: flex-end; height: 10px; }
+  .meter i { width: 2px; border-radius: 1px; background: var(--ink-3); display: block; }
+  .primary { height: 48px; border-radius: 11px; background: var(--ink); color: #fff; font-size: 14px; font-weight: 700; display: flex; align-items: center; gap: 10px; padding: 0 14px; letter-spacing: -.01em; box-shadow: 0 1px 0 rgba(255,255,255,.12) inset, 0 6px 16px -6px rgba(26,25,23,.5); }
+  .muted { color: var(--ink-3); font-size: 11.5px; }
+  .foot { height: 44px; border-top: 1px solid var(--line-2); display: flex; align-items: center; padding: 0 16px; flex-shrink: 0; }
+  .sel { width: 100%; height: 32px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); display: flex; align-items: center; padding: 0 10px; font-size: 12.5px; color: var(--ink); gap: 6px; }
+  .sel svg { margin-left: auto; color: var(--ink-3); flex-shrink: 0; }
+  .h { font-size: 13px; font-weight: 700; letter-spacing: -.005em; }
+  .toggle { width: 30px; height: 18px; border-radius: 9px; background: var(--ink); position: relative; flex-shrink: 0; }
+  .toggle::after { content: ""; position: absolute; right: 2px; top: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; }
+  .toggle.off { background: var(--ink-4); }
+  .toggle.off::after { right: auto; left: 2px; }
+  @keyframes pulse { 0%,100% { box-shadow: 0 0 0 3px rgba(229,55,43,.18); } 50% { box-shadow: 0 0 0 6px rgba(229,55,43,.06); } }
+</style>
+</head>
+<body data-state="idle">
+<div class="win" id="win"></div>
+<script>
+(() => {
+  const st = document.body.dataset.state;   // idle | recording | alert | settings
+  const win = document.getElementById("win");
+  const rec = st === "recording" || st === "alert";
+  const I = {
+    lib: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 4v16"/></svg>`,
+    opts: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>`,
+    min: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M5 12h14"/></svg>`,
+    close: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`,
+    pill: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="9" width="18" height="7" rx="3.5"/><path d="M8 5h8"/></svg>`,
+    chev: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg>`,
+    down: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg>`,
+    check: `<svg width="8" height="8" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12l5 5L20 6"/></svg>`,
+    back: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg>`,
+  };
+
+  /* Titlebar */
+  let tb;
+  if (st === "settings") {
+    tb = `<div class="tb"><button class="ib" style="margin-left:-4px;color:var(--ink)">${I.back}</button><span class="name" style="margin-left:-2px">Recording options</span><div style="flex:1"></div><button class="ib">${I.min}</button><button class="ib">${I.close}</button></div>`;
+  } else {
+    tb = `<div class="tb">
+      <span style="display:flex">${CT.mark(18, rec ? "var(--rec)" : "var(--ink)", rec ? "rgba(229,55,43,.55)" : "var(--ink-3)")}</span>
+      <span class="name" style="${rec ? "color:var(--rec)" : ""}">${rec ? "Recording" : "ChirpTime"}</span>
+      <div style="flex:1"></div>
+      ${rec ? `<button class="ib" title="Shrink to pill">${I.pill}</button>` : `<button class="ib" title="Library">${I.lib}</button><button class="ib" title="Recording options">${I.opts}</button>`}
+      <button class="ib" title="Minimize">${I.min}</button><button class="ib" title="Close">${I.close}</button>
+    </div>`;
+  }
+
+  /* The desk map: the same picture of your monitors the player uses */
+  const desk = (w, mode) => {
+    const dk = window.DAY.desktop, sc = w / dk.w, h = dk.h * sc;
+    const mons = window.DAY.tracks.filter((t) => t.monitor);
+    const n = { "screen-0": 1, "screen-1": 2, "screen-2": 3, "screen-3": 4 };
+    const b = (x, y, ww, hh) => `left:${(x - dk.x) * sc}px;top:${(y - dk.y) * sc}px;width:${ww * sc}px;height:${hh * sc}px`;
+    let html = `<div class="desk" style="width:${w}px;height:${h}px">`;
+    for (const t of mons) {
+      const m = t.monitor, g = 1.5;
+      const r = { x: m.x + g / sc, y: m.y + g / sc, w: m.w - 2 * g / sc, h: m.h - 2 * g / sc };
+      if (mode === "idle" || mode === "settings") {
+        const off = mode === "settings" && t.id === "screen-3";
+        html += `<div class="m" style="${b(r.x, r.y, r.w, r.h)};background:${off ? "transparent" : "#ECE9E2"};box-shadow:inset 0 0 0 ${off ? "1px var(--ink-4)" : "1.5px var(--ink)"};${off ? "border:1px dashed var(--ink-4);box-shadow:none" : ""}"><span class="n" style="color:${off ? "var(--ink-4)" : "var(--ink-2)"}">${n[t.id]}</span></div>`;
+      } else {
+        const dead = mode === "alert" && t.id !== "screen-3";
+        const warn = mode === "recording" && t.id === "screen-3";
+        html += `<div class="m" style="${b(r.x, r.y, r.w, r.h)};background:#111;${warn || dead ? "box-shadow:0 0 0 1.5px #E39A3B" : ""}"><img src="assets/oct8-${t.id}.jpg" style="${dead ? "filter:grayscale(1) brightness(.45)" : ""}">${dead ? `<div class="hatch-dead" style="position:absolute;inset:0"></div>` : ""}</div>`;
+      }
+    }
+    // the camera sits in the empty corner above the left monitor, as in the player
+    const c = { x: -3840 + 300, y: -2160 + 200, w: 3500, h: 1969 };
+    if (mode === "idle" || mode === "settings") {
+      html += `<div class="m" style="${b(c.x, c.y, c.w, c.h)};background:#ECE9E2;box-shadow:inset 0 0 0 1.5px var(--ink);border-radius:5px;display:grid;place-items:center"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--ink-2)" stroke-width="2"><rect x="2" y="6" width="14" height="12" rx="2"/><path d="M16 10l6-3v10l-6-3"/></svg></div>`;
+    } else {
+      html += `<div class="m" style="${b(c.x, c.y, c.w, c.h)};border-radius:5px"><img src="assets/oct8-webcam.jpg"></div>`;
+    }
+    return html + `</div>`;
+  };
+  const meter = (vals, color = "var(--ink-3)") => `<span class="meter">${vals.map((v) => `<i style="height:${Math.max(2, v * 10)}px;background:${color}"></i>`).join("")}</span>`;
+
+  let body = "", foot = "";
+  if (st === "idle") {
+    body = `
+      <div style="padding-top:8px">
+        <div style="font-size:22px;font-weight:700;letter-spacing:-.02em">Not recording</div>
+        <div class="mono" style="font-size:11px;color:var(--ink-3);margin-top:4px">812 GB free · about 125 hours</div>
+      </div>
+      <div class="card" style="margin-top:14px;padding:12px">
+        <div style="display:flex;align-items:baseline"><span style="font-size:12.5px;font-weight:600">Records</span><button style="margin-left:auto;font-size:12px;font-weight:600;color:var(--ink-3)">Change</button></div>
+        <div style="margin-top:10px;display:flex;justify-content:center">${desk(262, "idle")}</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-top:10px">
+          <div class="chip"><span class="ck">${I.check}</span>Camera</div>
+          <div class="chip"><span class="ck">${I.check}</span>Mic ${meter([.3, .6, .4, .2, .5])}</div>
+          <div class="chip"><span class="ck">${I.check}</span>System</div>
+        </div>
+      </div>
+      <button class="primary" style="margin-top:14px">
+        <span style="width:12px;height:12px;border-radius:50%;background:var(--rec)"></span>Start recording
+        <span class="kbd" style="margin-left:auto;background:transparent;color:rgba(255,255,255,.5);border-color:rgba(255,255,255,.2)">Ctrl Alt R</span>
+      </button>
+      <div class="muted" style="margin-top:8px;text-align:center">Skips footage after 1 min with no keyboard or mouse</div>
+      <button class="card" style="margin-top:auto;margin-bottom:12px;display:flex;align-items:center;gap:10px;padding:8px;text-align:left">
+        <img src="assets/lib/2026-10-10_11-00-45_screen-0_2.jpg" style="width:64px;height:28px;object-fit:cover;border-radius:4px">
+        <div style="min-width:0"><div style="font-size:12.5px;font-weight:600;white-space:nowrap">Last session, today 11:00 AM</div><div class="mono" style="font-size:10.5px;color:var(--ink-3);margin-top:2px">10 min · 1.0 GB</div></div>
+        <span style="margin-left:auto;color:var(--ink-4)">${I.chev}</span>
+      </button>`;
+    foot = `<span class="mono" style="font-size:11px;color:var(--ink-3)">30 sessions · 174 GB</span><button style="margin-left:auto;font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:4px">Library ${I.chev}</button>`;
+  } else if (st === "recording" || st === "alert") {
+    const alert = st === "alert";
+    body = `
+      ${alert ? `
+      <div style="margin-top:4px;padding:10px 11px;border-radius:10px;background:var(--amber-wash);border:1px solid var(--amber-line)">
+        <div style="display:flex;gap:7px;align-items:center;font-size:12.5px;font-weight:700;color:#8A4A05"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 3l9.5 17h-19z"/><path d="M12 10v4M12 17.5v.5"/></svg>Screens 1–3 stopped 14 min ago</div>
+        <div style="font-size:11.5px;color:#7A4A12;margin-top:4px;line-height:1.4">The screen encoder stopped answering. Camera and audio are still recording.</div>
+        <div style="display:flex;gap:6px;margin-top:8px"><button style="height:26px;padding:0 10px;border-radius:7px;background:#8A4A05;color:#fff;font-size:11.5px;font-weight:700">Restart screens</button><button style="height:26px;padding:0 10px;border-radius:7px;font-size:11.5px;font-weight:600;color:#8A4A05">Details</button></div>
+      </div>` : ""}
+      <div style="padding-top:${alert ? 10 : 6}px;display:flex;align-items:baseline;gap:8px">
+        <div class="mono" style="font-size:${alert ? 30 : 42}px;font-weight:500;letter-spacing:-.05em;line-height:1">2:14:31</div>
+      </div>
+      <div style="font-size:11.5px;color:var(--ink-3);margin-top:6px">Since 11:48 AM <span style="color:var(--ink-4)">·</span> <span class="mono" style="font-size:11px">10.9 GB</span> written</div>
+      <div class="card" style="margin-top:12px;padding:10px 12px 12px">
+        <div style="display:flex;justify-content:center">${desk(262, alert ? "alert" : "recording")}</div>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:11.5px;color:var(--ink-2)">
+          <span style="flex:1;display:flex;align-items:center;gap:6px">Mic ${meter([.2, .7, .9, .6, .3, .5, .8, .4, .2, .1], "var(--ink)")}</span>
+          <span style="flex:1;display:flex;align-items:center;gap:6px">System ${meter([.5, .5, .4, .6, .5, .3, .4, .2, .1, .1], "var(--ink-3)")}</span>
+        </div>
+        ${alert ? "" : `<div style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:11.5px;color:#9A5A0C"><span style="width:6px;height:6px;border-radius:50%;background:#E39A3B"></span>Screen 4 restarting, try 2 of 20</div>`}
+      </div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button style="flex:1;height:44px;border-radius:11px;background:var(--canary);color:var(--canary-ink);font-weight:700;font-size:13.5px;display:flex;align-items:center;gap:8px;padding:0 12px">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M5 21V4h12l-2 4 2 4H5"/></svg>Mark
+          <span class="kbd" style="margin-left:auto;background:transparent;border-color:rgba(43,34,0,.25);color:rgba(43,34,0,.6)">Ctrl Alt M</span></button>
+        <button title="Pause" style="width:44px;height:44px;border-radius:11px;border:1px solid var(--line);background:var(--card);display:grid;place-items:center"><svg width="14" height="14" viewBox="0 0 24 24" fill="var(--ink)"><rect x="5" y="4" width="5" height="16" rx="1"/><rect x="14" y="4" width="5" height="16" rx="1"/></svg></button>
+        <button title="Stop" style="width:44px;height:44px;border-radius:11px;background:var(--rec);display:grid;place-items:center;box-shadow:0 6px 14px -6px rgba(229,55,43,.6)"><span style="width:13px;height:13px;border-radius:3px;background:#fff"></span></button>
+      </div>
+      ${alert ? `<div class="muted" style="margin-top:8px">2 marks · last at 1:52 PM</div>` : `
+      <div style="margin-top:12px;display:flex;align-items:center;gap:8px;height:34px;padding:0 10px;border-radius:9px;border:1px dashed var(--line);color:var(--ink-3);font-size:12px">
+        <span style="width:6px;height:6px;border-radius:50%;background:var(--canary-deep)"></span>Note for the 1:52 PM mark<span class="kbd" style="margin-left:auto">Tab</span></div>
+      <div class="muted" style="margin-top:8px">2 marks this session</div>`}`;
+    foot = `<span class="mono" style="font-size:11px;color:var(--ink-3)">7 tracks</span><button style="margin-left:auto;font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:4px">Open this session ${I.chev}</button>`;
+  } else if (st === "settings") {
+    const row = (label, ctl) => `<div style="display:flex;align-items:center;gap:10px;margin-top:8px"><span style="font-size:12.5px;color:var(--ink-2);width:78px;flex-shrink:0">${label}</span>${ctl}</div>`;
+    body = `<div class="scroll-thin" style="overflow:hidden;flex:1;min-height:0;padding-bottom:12px;-webkit-mask-image:linear-gradient(#000 88%,transparent)">
+      <div class="h" style="margin-top:6px">Screens</div>
+      <div class="muted" style="margin-top:2px">Click a monitor to leave it out</div>
+      <div style="margin-top:10px;display:flex;justify-content:center">${desk(262, "settings")}</div>
+      ${row("Frame rate", `<div class="sel">30 fps ${I.down}</div>`)}
+      <div class="h" style="margin-top:18px">Camera and sound</div>
+      ${row("Camera", `<div class="sel">Logitech BRIO ${I.down}</div>`)}
+      ${row("Microphone", `<div class="sel"><span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">BRIO · never Bluetooth</span>${I.down}</div>`)}
+      <div style="display:flex;align-items:center;margin-top:10px"><span style="font-size:12.5px;color:var(--ink-2)">System audio</span><span class="toggle" style="margin-left:auto"></span></div>
+      <div class="h" style="margin-top:18px">When you step away</div>
+      ${row("Skip after", `<div class="sel">1 minute idle ${I.down}</div>`)}
+      <div class="muted" style="margin-top:6px;line-height:1.4">With no keyboard or mouse input for this long, the footage is not kept. Watching a video counts as away.</div>
+      <div class="h" style="margin-top:18px">Recordings folder</div>
+      <div class="card" style="margin-top:8px;padding:9px 10px"><div class="mono" style="font-size:11px">C:\\Users\\dested\\Videos\\ChirpTime</div><div class="mono" style="font-size:10.5px;color:var(--ink-3);margin-top:3px">812 GB free · about 125 hours</div></div>
+    </div>`;
+    foot = `<span class="muted">Applies to the next recording</span><button style="margin-left:auto;font-size:12.5px;font-weight:600;display:flex;align-items:center;gap:4px">All settings ${I.chev}</button>`;
+  }
+  win.innerHTML = tb + `<div class="body">${body}</div><div class="foot">${foot}</div>`;
+})();
+</script>
+</body>
+</html>

@@ -8,3 +8,7 @@ src/viewer-ui/.build/
 # Staging dir the release workflow assembles installers into
 dist-release/
 release-notes.md
+# UX sprint mock stills (real footage, local only)
+plans/*/mocks/assets/
+plans/*/canvas/project/assets/
+plans/*/shots/

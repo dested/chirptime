@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Library</title>
+<link rel="stylesheet" href="ct.css">
+<script src="data.js"></script>
+<script src="ct.js"></script>
+<style>
+  .win { width: 1280px; height: 800px; background: var(--paper); display: flex; }
+  .side { width: 212px; flex-shrink: 0; background: #EFECE5; border-right: 1px solid var(--line); display: flex; flex-direction: column; padding: 14px 10px; }
+  .nav { display: flex; align-items: center; gap: 10px; height: 32px; padding: 0 10px; border-radius: 8px; color: var(--ink-2); font-weight: 500; font-size: 13px; }
+  .nav.on { background: var(--card); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+  .nav .c { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+  .main { flex: 1; min-width: 0; position: relative; }
+  .blk { position: absolute; height: 20px; border-radius: 4px; overflow: hidden; background: var(--ink-2); display: flex; }
+  .blk img { height: 100%; flex: 1; min-width: 0; object-fit: cover; filter: saturate(.7) contrast(1.05); }
+  .blk.short { background: var(--ink-4); }
+  .blk.sel { box-shadow: 0 0 0 2px var(--paper), 0 0 0 4px var(--ink); }
+  .warn-dot { position: absolute; width: 8px; height: 8px; border-radius: 50%; background: #E39A3B; box-shadow: 0 0 0 2px var(--paper); }
+  .btn { height: 34px; padding: 0 14px; border-radius: 9px; border: 1px solid var(--line); background: var(--card); font-weight: 600; display: inline-flex; align-items: center; justify-content: center; gap: 7px; color: var(--ink); }
+  .seg { display: flex; padding: 2px; border-radius: 9px; background: var(--sunk); }
+  .seg button { height: 28px; padding: 0 12px; border-radius: 7px; font-size: 12.5px; font-weight: 600; color: var(--ink-3); }
+  .seg button.on { background: var(--card); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+</style>
+</head>
+<body>
+<div class="win">
+  <aside class="side">
+    <div style="display:flex;align-items:center;gap:8px;padding:2px 8px 18px"><span id="mk"></span><span style="font-weight:700;font-size:14px;letter-spacing:-.01em">ChirpTime</span></div>
+    <div class="nav on"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 4v16"/></svg>Library<span class="c" id="nSess"></span></div>
+    <div class="nav"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 21V4h12l-2 4 2 4H5"/></svg>Marks<span class="c">1</span></div>
+    <div class="nav"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3M7 8l5-5 5 5"/><path d="M5 14v5a2 2 0 002 2h10a2 2 0 002-2v-5"/></svg>Exports<span class="c">0</span></div>
+    <div class="nav"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>Settings</div>
+    <div style="flex:1"></div>
+    <div style="padding:12px;border-radius:10px;background:var(--card);border:1px solid var(--line)">
+      <div style="display:flex;align-items:center;gap:8px"><span style="width:8px;height:8px;border-radius:50%;background:var(--ink-4)"></span><span style="font-weight:600;font-size:12.5px">Not recording</span><button style="margin-left:auto;font-size:12px;font-weight:700;color:var(--rec)">Start</button></div>
+      <div style="height:6px;border-radius:3px;background:var(--sunk);margin-top:12px;overflow:hidden;display:flex"><span style="width:4.4%;background:var(--ink)"></span><span style="width:75%;background:var(--ink-4)"></span></div>
+      <div class="mono" style="font-size:10.5px;color:var(--ink-3);margin-top:7px;line-height:1.5">174 GB in recordings<br>812 GB free · about 125 h</div>
+    </div>
+  </aside>
+  <main class="main" id="main"></main>
+</div>
+<script>
+(() => {
+  document.getElementById("mk").innerHTML = CT.mark(18);
+  const S = window.SESSIONS.slice().sort((a, b) => b.start - a.start);
+  document.getElementById("nSess").textContent = S.length;
+  const main = document.getElementById("main");
+  const add = (html) => { const n = CT.el(html); main.appendChild(n); return n; };
+  const totalMs = S.reduce((a, s) => a + s.dur, 0), totalB = S.reduce((a, s) => a + s.bytes, 0);
+  const tiny = S.filter((s) => s.dur < 120000);
+  const tinyB = tiny.reduce((a, s) => a + s.bytes, 0);
+
+  add(`<div style="position:absolute;left:32px;top:24px;right:32px;display:flex;align-items:center;gap:14px">
+    <div><div style="font-size:24px;font-weight:700;letter-spacing:-.02em">Library</div>
+    <div class="mono" style="font-size:11px;color:var(--ink-3);margin-top:4px">${S.length} sessions · ${Math.round(totalMs / 3600000)} hours · 174 GB on disk</div></div>
+    <div style="flex:1"></div>
+    <div style="width:280px;height:34px;border-radius:9px;background:var(--card);border:1px solid var(--line);display:flex;align-items:center;gap:8px;padding:0 10px;color:var(--ink-3);font-size:12.5px">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></svg><span style="white-space:nowrap">Search marks, screens, speech</span><span class="kbd" style="margin-left:auto;white-space:nowrap">Ctrl K</span></div>
+    <div class="seg"><button class="on">Days</button><button>List</button></div>
+  </div>`);
+
+  add(`<div style="position:absolute;left:32px;top:86px;width:676px;height:38px;border-radius:9px;background:var(--card);border:1px solid var(--line);display:flex;align-items:center;gap:10px;padding:0 6px 0 12px;font-size:12.5px;color:var(--ink-2)">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--ink-3)" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16v.5"/></svg>
+    <span><b style="color:var(--ink);font-weight:600">${tiny.length} sessions are under two minutes</b> <span class="mono" style="font-size:11px;color:var(--ink-3)">· ${CT.gb(tinyB)}</span>, most of them a start pressed twice.</span>
+    <button style="margin-left:auto;height:28px;padding:0 10px;border-radius:7px;font-size:12px;font-weight:600;color:var(--ink)">Review</button></div>`);
+
+  /* ---- the time map: one row per day, one column per hour ---- */
+  const mapL = 32, labW = 96, mapTop = 146, H0 = 7, H1 = 24, hrsW = 676 - labW;
+  const X = (ms) => { const d = new Date(ms); const h = d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600; return mapL + labW + ((h - H0) / (H1 - H0)) * hrsW; };
+  for (let h = 8; h <= 22; h += 2) {
+    const x = mapL + labW + ((h - H0) / (H1 - H0)) * hrsW;
+    const lab = h === 12 ? "noon" : h < 12 ? `${h}a` : `${h - 12}p`;
+    add(`<div style="position:absolute;left:${x}px;top:${mapTop - 6}px;width:1px;height:${800 - mapTop - 18}px;background:var(--line-2)"></div>`);
+    add(`<div class="mono" style="position:absolute;left:${x - 20}px;width:40px;text-align:center;top:${mapTop - 22}px;font-size:10.5px;color:var(--ink-3)">${lab}</div>`);
+  }
+  const days = [];
+  for (const s of S) {
+    const k = new Date(s.start).toDateString();
+    let d = days.find((x) => x.k === k);
+    if (!d) days.push((d = { k, date: new Date(s.start), list: [] }));
+    d.list.push(s);
+  }
+  let y = mapTop + 4, lastMonth = -1;
+  const MON = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  const WD = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  for (const d of days) {
+    if (d.date.getMonth() !== lastMonth) {
+      lastMonth = d.date.getMonth();
+      add(`<div style="position:absolute;left:${mapL}px;top:${y + 6}px;font-size:12.5px;font-weight:700;background:var(--paper);padding-right:8px">${MON[lastMonth]}</div>`);
+      y += 28;
+    }
+    add(`<div style="position:absolute;left:${mapL}px;top:${y + 4}px;font-size:12.5px;color:var(--ink-2);white-space:nowrap"><span style="display:inline-block;width:30px;color:var(--ink-3)">${WD[d.date.getDay()]}</span>${d.date.getDate()}</div>`);
+    for (const s of d.list) {
+      const x0 = X(s.start), x1 = Math.max(X(s.start + s.dur), x0 + 4), w = x1 - x0;
+      const sel = s.id === "2026-08-01_10-30-12";
+      const n = s.thumbs.webcam ? Math.max(1, Math.min(6, Math.floor(w / 22))) : 0;
+      const imgs = w > 26 && n ? Array.from({ length: n }, (_, i) => `<img src="assets/lib/${s.id}_webcam_${Math.floor((i * 6) / n)}.jpg">`).join("") : "";
+      add(`<div class="blk ${s.dur < 120000 ? "short" : ""} ${sel ? "sel" : ""}" style="left:${x0}px;top:${y + 2}px;width:${w}px" title="${s.id}">${imgs}</div>`);
+      if (s.failed.length) add(`<div class="warn-dot" style="left:${x1 - 5}px;top:${y - 1}px"></div>`);
+    }
+    y += 30;
+  }
+
+  /* ---- inspector: the selected session ---- */
+  const s = S.find((x) => x.id === "2026-08-01_10-30-12");
+  add(`<div style="position:absolute;left:740px;top:86px;width:308px;bottom:24px;border-radius:12px;background:var(--card);border:1px solid var(--line);overflow:hidden;display:flex;flex-direction:column">
+    <div style="position:relative;height:130px;background:var(--mat)">
+      <img src="assets/hero-screen-0-6.jpg" style="width:100%;height:100%;object-fit:cover;opacity:.95">
+      <img src="assets/hero-webcam-6.jpg" style="position:absolute;right:10px;bottom:10px;width:92px;height:52px;object-fit:cover;border-radius:5px;box-shadow:0 0 0 2px rgba(0,0,0,.5)">
+    </div>
+    <div style="padding:16px 18px;display:flex;flex-direction:column;flex:1;min-height:0">
+      <div style="font-size:17px;font-weight:700;letter-spacing:-.01em">Saturday, August 1</div>
+      <div class="mono" style="font-size:11.5px;color:var(--ink-3);margin-top:4px">10:30 AM – 7:02 PM</div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:16px">
+        ${[["8h 32m", "long"], ["48.6 GB", "on disk"], ["7", "tracks"]].map(([v, l]) => `<div><div class="mono" style="font-size:15px;font-weight:600">${v}</div><div style="font-size:11.5px;color:var(--ink-3);margin-top:2px">${l}</div></div>`).join("")}
+      </div>
+      <div style="margin-top:16px;padding:10px 12px;border-radius:9px;background:var(--amber-wash);border:1px solid var(--amber-line);font-size:12px;line-height:1.45;color:#7A4A12">
+        <b style="color:#8A4A05">Screens stopped at 2:02 PM.</b> The last five hours are camera and sound only.</div>
+      <div style="display:flex;gap:2px;margin-top:16px;border-radius:6px;overflow:hidden">
+        ${[0, 1, 2, 3, 4, 5].map((i) => `<img src="assets/lib/${s.id}_webcam_${i}.jpg" style="flex:1;min-width:0;height:34px;object-fit:cover">`).join("")}
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-top:5px" class="mono"><span style="font-size:10px;color:var(--ink-3)">10:30</span><span style="font-size:10px;color:var(--ink-3)">7:02</span></div>
+      <div style="margin-top:16px;border-top:1px solid var(--line-2)">
+        ${[["Screen 1", "5120×2160 · AV1", "3h 32m", 1], ["Screens 2, 3", "4K", "3h 32m", 1], ["Screen 4", "4K · iGPU", "3h 15m", 1], ["Camera", "1080p", "8h 32m", 0], ["Mic, system", "two tracks", "8h 32m", 0]].map(([a, b, c, w]) => `<div style="display:flex;align-items:center;gap:8px;height:30px;border-bottom:1px solid var(--line-2);font-size:12px"><span style="width:6px;height:6px;border-radius:50%;background:${w ? "#E39A3B" : "var(--ink-4)"}"></span><span style="font-weight:600">${a}</span><span style="color:var(--ink-3)">${b}</span><span class="mono" style="margin-left:auto;font-size:11px;color:var(--ink-2)">${c}</span></div>`).join("")}
+      </div>
+      <div style="flex:1"></div>
+      <div style="display:flex;gap:8px">
+        <button class="btn" style="flex:1;background:var(--ink);color:#fff;border-color:var(--ink)">Open</button>
+        <button class="btn">Export</button>
+        <button class="btn" title="Delete session" style="width:34px;padding:0;color:var(--ink-3)"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg></button>
+      </div>
+    </div>
+  </div>`);
+})();
+</script>
+</body>
+</html>

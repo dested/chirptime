@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Session player</title>
+<link rel="stylesheet" href="ct.css">
+<script src="data.js"></script>
+<script src="ct.js"></script>
+<style>
+  .win { background: var(--paper); color: var(--ink); }
+  .rail { position: absolute; left: 0; top: 0; bottom: 0; background: #EFECE5; border-right: 1px solid var(--line); }
+  .nav { display: flex; align-items: center; gap: 10px; height: 32px; padding: 0 10px; border-radius: 8px; color: var(--ink-2); font-weight: 500; font-size: 13px; }
+  .nav.on { background: var(--card); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+  .nav .c { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+  .ricon { width: 36px; height: 36px; border-radius: 9px; display: grid; place-items: center; color: var(--ink-3); }
+  .ricon.on { background: var(--card); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+  .btn { height: 32px; padding: 0 12px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); font-weight: 600; font-size: 12.5px; display: inline-flex; align-items: center; gap: 7px; color: var(--ink); white-space: nowrap; }
+  .btn.ink { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .btn.ghost { background: transparent; border-color: transparent; color: var(--ink-2); }
+  .seg { display: flex; padding: 2px; border-radius: 9px; background: var(--sunk); }
+  .seg button { height: 26px; padding: 0 10px; border-radius: 7px; font-size: 12px; font-weight: 600; color: var(--ink-3); white-space: nowrap; }
+  .seg button.on { background: var(--card); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+  .mat { position: absolute; background: var(--mat); border-radius: 12px; overflow: hidden; }
+  .shot { position: absolute; overflow: hidden; border-radius: 4px; background: #000; }
+  .shot img { width: 100%; height: 100%; object-fit: cover; }
+  .log { position: absolute; background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; }
+  .entry { display: grid; grid-template-columns: 62px 1fr; gap: 10px; padding: 9px 14px; border-top: 1px solid var(--line-2); }
+  .entry .w { font-family: var(--mono); font-size: 11px; color: var(--ink-3); padding-top: 2px; white-space: nowrap; }
+  .entry .t { font-size: 13px; line-height: 1.38; color: var(--ink); }
+  .entry .s { font-size: 12px; color: var(--ink-3); margin-top: 2px; line-height: 1.38; }
+  .mini { height: 24px; padding: 0 9px; border-radius: 7px; border: 1px solid var(--line); background: var(--card); font-size: 11.5px; font-weight: 600; color: var(--ink); margin-top: 7px; display: inline-flex; align-items: center; gap: 6px; }
+  .tick { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); position: absolute; white-space: nowrap; }
+</style>
+</head>
+<body data-state="play" data-w="1920" data-h="1080">
+<div class="win" id="win"></div>
+<script>
+(() => {
+  const B = document.body.dataset;
+  const st = B.state;                                   // play | select | confirm | deleted
+  const W = Number(B.w || 1280), H = Number(B.h || 800), wide = W >= 1600;
+  const win = document.getElementById("win");
+  win.style.width = W + "px"; win.style.height = H + "px";
+  const add = (html, parent = win) => { const n = CT.el(html); parent.appendChild(n); return n; };
+  const D = window.DAY, S = D.start, E = D.end;
+  const T = (h, m, s = 0) => new Date(2026, 7, 1, h, m, s).getTime();
+  const sel = [T(13, 38), T(15, 21)], away2 = [T(17, 0), T(18, 20)];
+  const cut = st === "deleted" ? sel : null;
+  const cutMs = cut ? cut[1] - cut[0] : 0;
+  const play = st === "play" ? T(11, 31, 4) : T(13, 38);
+  const k = st === "play" ? 6 : 19;                      // hero frame index (10 min steps from 10:30)
+  const I = {
+    back: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M15 18l-6-6 6-6"/></svg>`,
+    lib: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 4v16"/></svg>`,
+    flag: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M5 21V4h12l-2 4 2 4H5"/></svg>`,
+    up: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V3M7 8l5-5 5 5"/><path d="M5 14v5a2 2 0 002 2h10a2 2 0 002-2v-5"/></svg>`,
+    gear: `<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>`,
+    layers: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5"/></svg>`,
+    vol: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 9v6h4l5 4V5L8 9z"/><path d="M17 9l4 6M21 9l-4 6"/></svg>`,
+    trash: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>`,
+    x: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>`,
+    down: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg>`,
+    warn: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 3l9.5 17h-19z"/><path d="M12 10v4M12 17.5v.5"/></svg>`,
+  };
+
+  /* ---- shell: the Library's sidebar, as a rail at 1280 ---- */
+  const railW = wide ? 212 : 60;
+  if (wide) {
+    add(`<aside class="rail" style="width:${railW}px;padding:14px 10px;display:flex;flex-direction:column">
+      <div style="display:flex;align-items:center;gap:8px;padding:2px 8px 18px">${CT.mark(18)}<span style="font-weight:700;font-size:14px;letter-spacing:-.01em">ChirpTime</span></div>
+      <div class="nav on">${I.lib}Library<span class="c">30</span></div>
+      <div class="nav">${I.flag}Marks<span class="c">1</span></div>
+      <div class="nav">${I.up}Exports<span class="c">0</span></div>
+      <div class="nav">${I.gear}Settings</div>
+      <div style="flex:1"></div>
+      <div style="padding:12px;border-radius:10px;background:var(--card);border:1px solid var(--line)">
+        <div style="display:flex;align-items:center;gap:8px"><span style="width:8px;height:8px;border-radius:50%;background:var(--ink-4)"></span><span style="font-weight:600;font-size:12.5px">Not recording</span><button style="margin-left:auto;font-size:12px;font-weight:700;color:var(--rec)">Start</button></div>
+        <div style="height:6px;border-radius:3px;background:var(--sunk);margin-top:12px;overflow:hidden;display:flex"><span style="width:4.4%;background:var(--ink)"></span><span style="width:75%;background:var(--ink-4)"></span></div>
+        <div class="mono" style="font-size:10.5px;color:var(--ink-3);margin-top:7px;line-height:1.5">174 GB in recordings<br>812 GB free · about 125 h</div>
+      </div></aside>`);
+  } else {
+    add(`<aside class="rail" style="width:${railW}px;display:flex;flex-direction:column;align-items:center;padding:16px 0 14px;gap:6px">
+      <div style="margin-bottom:12px">${CT.mark(20)}</div>
+      <button class="ricon on" title="Library">${I.lib}</button>
+      <button class="ricon" title="Marks">${I.flag}</button>
+      <button class="ricon" title="Exports">${I.up}</button>
+      <button class="ricon" title="Settings">${I.gear}</button>
+      <div style="flex:1"></div>
+      <button class="ricon" title="Not recording · Start"><span style="width:12px;height:12px;border-radius:50%;border:2px solid var(--ink-3)"></span></button>
+    </aside>`);
+  }
+
+  /* ---- header ---- */
+  const cx = railW + 24, cw = W - railW - 48;
+  const durTxt = cut ? "6h 49m · 42.4 GB" : "8h 32m · 48.6 GB";
+  add(`<div style="position:absolute;left:${cx}px;top:0;width:${cw}px;height:64px;display:flex;align-items:center;gap:12px">
+    <button class="btn ghost" style="padding:0 8px 0 4px;margin-left:-6px">${I.back}Library</button>
+    <div style="width:1px;height:20px;background:var(--line)"></div>
+    <div style="font-size:${wide ? 22 : 20}px;font-weight:700;letter-spacing:-.02em;white-space:nowrap">Saturday, August 1</div>
+    <div class="mono" style="font-size:11.5px;color:var(--ink-3);white-space:nowrap">10:30 AM – 7:02 PM · ${durTxt}</div>
+    <button style="height:26px;padding:0 10px;border-radius:13px;background:var(--amber-wash);border:1px solid var(--amber-line);color:#8A4A05;font-size:12px;font-weight:600;display:flex;align-items:center;gap:6px;white-space:nowrap">${I.warn}Screens stopped at 2:02 PM</button>
+    <div style="flex:1"></div>
+    <button class="btn">${I.layers}Tracks</button>
+    <button class="btn ink">${I.up}Export</button>
+  </div>`);
+
+  /* ---- stage: the only dark thing ---- */
+  const logW = wide ? 400 : 300, gap = 20;
+  const stW = cw - logW - gap, pad = 10;
+  const mW = stW - pad * 2, mH = Math.round(mW * 2160 / 5120);
+  const rowH = wide ? 110 : 78;
+  const stTop = 72, stH = pad + mH + pad + rowH + pad;
+  const mat = add(`<div class="mat" style="left:${cx}px;top:${stTop}px;width:${stW}px;height:${stH}px"></div>`);
+  add(`<div class="shot" style="left:${pad}px;top:${pad}px;width:${mW}px;height:${mH}px;box-shadow:0 0 0 1.5px rgba(255,216,77,.9)"><img src="assets/hero-screen-0-${k}.jpg"></div>`, mat);
+  // under the screen: camera, the desk in miniature, the view switch
+  const y2 = pad + mH + pad;
+  const camW = Math.round(rowH * 16 / 9);
+  add(`<div class="shot" style="left:${pad}px;top:${y2}px;width:${camW}px;height:${rowH}px;border-radius:6px"><img src="assets/hero-webcam-${k}.jpg"><span style="position:absolute;left:6px;bottom:5px;font:600 10px var(--sans);color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.8)">Camera</span></div>`, mat);
+  const dk = D.desktop, dmH = rowH - 8, dsc = dmH / dk.h, dmW = dk.w * dsc, dmX = pad + camW + 16;
+  const n = { "screen-0": 1, "screen-1": 2, "screen-2": 3, "screen-3": 4 };
+  for (const t of D.tracks.filter((t) => t.monitor)) {
+    const m = t.monitor, g = 1.5, on = t.id === "screen-0";
+    const src = k === 6 && t.id === "screen-3" ? "assets/oct8-screen-3.jpg" : `assets/hero-${t.id}-${k}.jpg`;
+    add(`<div class="shot" style="left:${dmX + (m.x - dk.x) * dsc + g}px;top:${y2 + 4 + (m.y - dk.y) * dsc + g}px;width:${m.w * dsc - 2 * g}px;height:${m.h * dsc - 2 * g}px;border-radius:2px;${on ? "box-shadow:0 0 0 1.5px var(--canary)" : "opacity:.75"}"><img src="${src}"><span style="position:absolute;left:3px;bottom:1px;font:600 9px var(--mono);color:${on ? "var(--canary)" : "rgba(255,255,255,.7)"}">${n[t.id]}</span></div>`, mat);
+  }
+  add(`<div style="position:absolute;left:${dmX + dmW + 14}px;top:${y2}px;height:${rowH}px;display:flex;flex-direction:column;justify-content:center;gap:4px;color:rgba(243,240,232,.6);font-size:12px;white-space:nowrap">
+      <span style="color:#F3F0E8;font-weight:600">Following your mouse</span><span>Screen 1 · press 1–4 to pin, D for the desk</span></div>`, mat);
+  add(`<div style="position:absolute;right:${pad}px;top:${y2 + rowH / 2 - 15}px;display:flex;padding:2px;border-radius:9px;background:rgba(255,255,255,.08)">
+      <button style="height:26px;padding:0 10px;border-radius:7px;font-size:12px;font-weight:600;color:#1A1917;background:#F3F0E8">Focus</button>
+      <button style="height:26px;padding:0 10px;border-radius:7px;font-size:12px;font-weight:600;color:rgba(243,240,232,.6)">Desk</button></div>`, mat);
+
+  /* ---- the day log (B's idea), beside the stage ---- */
+  const lgH = stH + 12 + 40;
+  const log = add(`<div class="log" style="left:${cx + stW + gap}px;top:${stTop}px;width:${logW}px;height:${lgH}px"></div>`);
+  add(`<div style="display:flex;align-items:center;padding:12px 14px 10px"><span style="font-size:14px;font-weight:700">Log</span><span style="margin-left:8px;font-size:12px;color:var(--ink-3)">click a line to jump</span>
+    <div class="seg" style="margin-left:auto"><button class="on">All</button><button>Marks</button></div></div>`, log);
+  const delBtn = (txt) => `<button class="mini">${I.trash}${txt}</button>`;
+  const entries = [
+    ["10:30 AM", `Started recording`, `4 screens, camera, mic and system audio`],
+    st === "play" ? ["11:31 AM", `<b style="font-weight:600">Now</b>`, `Writing the walkthrough page`, "now"] : null,
+    ["12:14 PM", `Mark`, `<span style="color:var(--ink-4)">Add a note</span>`, "mark"],
+    cut ? ["1:38 PM", `<span style="color:var(--ink-3)">Cut 1h 43m</span>`, `Left the desk · Undo for 8 s`, "cut"]
+        : ["1:38 PM", `Left the desk for 1h 43m`, `Empty chair, no input` + (st === "play" ? `<br>${delBtn("Delete 1h 43m")}` : ""), st === "play" ? "" : "sel"],
+    cut ? null : ["1:45 PM", `<span style="color:#8A4A05">Screen 4 stopped recording</span>`, ``, "warn"],
+    cut ? null : ["2:02 PM", `<span style="color:#8A4A05">Screens 1–3 stopped recording</span>`, `The encoder stalled, restarted 20 times, then gave up. Camera and sound kept going.`, "warn"],
+    ["3:21 PM", `Back at the desk, with company`, ``],
+    ["5:00 PM", `Left the desk for 1h 20m`, `Empty chair, no input<br>${delBtn("Delete 1h 20m")}`],
+    ["6:20 PM", `Back at the desk`, ``],
+    ["7:02 PM", `Stopped recording`, ``],
+  ].filter(Boolean);
+  const list = add(`<div style="flex:1;min-height:0;overflow:hidden;-webkit-mask-image:linear-gradient(#000 90%,transparent)"></div>`, log);
+  for (const [w, t, s, kind] of entries) {
+    const bg = kind === "now" ? "background:var(--canary-wash);box-shadow:inset 3px 0 0 var(--canary-deep)" : kind === "sel" ? "background:var(--canary-wash);box-shadow:inset 3px 0 0 var(--canary-deep)" : "";
+    const dot = kind === "mark" ? `<span style="display:inline-block;width:7px;height:7px;border-radius:2px;background:var(--canary-deep);margin-right:7px;vertical-align:1px"></span>` : kind === "warn" ? `<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:#E39A3B;margin-right:7px;vertical-align:1px"></span>` : kind === "cut" ? `<span style="display:inline-block;width:7px;height:2px;background:var(--rec);margin-right:7px;vertical-align:3px"></span>` : "";
+    add(`<div class="entry" style="${bg}"><div class="w">${w}</div><div><div class="t">${dot}${t}</div>${s ? `<div class="s">${s}</div>` : ""}</div></div>`, list);
+  }
+
+  /* ---- transport, or the selection bar, or the confirm row ---- */
+  const tTop = stTop + stH + 12;
+  const pClock = CT.clock(play);
+  if (st === "play" || st === "deleted") {
+    add(`<div style="position:absolute;left:${cx}px;top:${tTop}px;width:${stW}px;height:40px;display:flex;align-items:center;gap:10px">
+      <button style="width:38px;height:38px;border-radius:50%;background:var(--ink);color:#fff;display:grid;place-items:center">${st === "play" ? `<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="4" width="5" height="16" rx="1"/><rect x="14" y="4" width="5" height="16" rx="1"/></svg>` : `<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4l13 8-13 8z"/></svg>`}</button>
+      <div style="display:flex;align-items:baseline;gap:8px;margin-left:4px"><span class="mono" style="font-size:19px;font-weight:600;letter-spacing:-.03em">${pClock}</span>
+      <span class="mono" style="font-size:11.5px;color:var(--ink-3)">${st === "play" ? "1:00:51" : "3:07:47"} / ${cut ? "6:49:35" : "8:32:35"}</span></div>
+      <div class="seg" style="margin-left:8px"><button>½×</button><button class="on">1×</button><button>2×</button><button>4×</button><button>16×</button></div>
+      <div style="flex:1"></div>
+      <button class="btn ghost">${I.flag}Mark<span class="kbd">M</span></button>
+      <button class="btn ghost" title="Muted">${I.vol}</button>
+    </div>`);
+  } else if (st === "select") {
+    add(`<div style="position:absolute;left:${cx}px;top:${tTop}px;width:${stW}px;height:40px;display:flex;align-items:center;gap:8px;padding:0 6px 0 8px;border-radius:10px;background:var(--card);border:1px solid var(--line);box-shadow:0 1px 2px rgba(0,0,0,.04)">
+      <span style="height:24px;padding:0 9px;border-radius:6px;background:var(--canary);color:var(--canary-ink);font-weight:700;font-size:12.5px;display:flex;align-items:center" class="mono">1h 43m</span>
+      <span style="font-size:12.5px;color:var(--ink-2);white-space:nowrap">1:38 PM – 3:21 PM <span style="color:var(--ink-4)">·</span> <span class="mono" style="font-size:11.5px">6.2 GB</span></span>
+      <button class="btn ghost" style="height:28px;padding:0 8px">All tracks${I.down}</button>
+      <div style="flex:1"></div>
+      <button class="btn ghost" style="height:28px">Export<span class="kbd">E</span></button>
+      <button class="btn" style="height:28px;color:var(--rec);border-color:#F2C4BF">${I.trash}Delete<span class="kbd" style="color:#C9524A;border-color:#F2C4BF">X</span></button>
+      <button class="btn ghost" style="height:28px;width:28px;padding:0;justify-content:center" title="Clear (Esc)">${I.x}</button>
+    </div>`);
+  } else if (st === "confirm") {
+    add(`<div style="position:absolute;left:${cx}px;top:${tTop}px;width:${stW}px;height:40px;display:flex;align-items:center;gap:8px;padding:0 6px 0 12px;border-radius:10px;background:var(--card);border:1px solid #F2C4BF;box-shadow:0 1px 2px rgba(0,0,0,.04)">
+      <span style="color:var(--rec);display:flex">${I.trash}</span>
+      <span style="font-size:12.5px;color:var(--ink);white-space:nowrap"><b style="font-weight:700">Delete 1h 43m?</b> <span style="color:var(--ink-2)">Frees 6.2 GB now. Undo for 10 seconds.</span></span>
+      <div style="flex:1"></div>
+      <button class="btn ghost" style="height:28px">Cancel<span class="kbd">Esc</span></button>
+      <button class="btn" style="height:28px;background:var(--rec);border-color:var(--rec);color:#fff">Delete<span class="kbd" style="background:transparent;color:rgba(255,255,255,.75);border-color:rgba(255,255,255,.35)">↵</span></button>
+    </div>`);
+  }
+
+  /* ---- the day ribbon: one calm strip of the whole day ---- */
+  const rTop = tTop + 40 + (wide ? 22 : 16), thH = wide ? 60 : 50;
+  const span = E - S - cutMs;
+  const RX = (t) => { let v = t - S; if (cut && t > cut[0]) v -= Math.min(t, cut[1]) - cut[0]; return cx + (v / span) * cw; };
+  // hour labels
+  for (let h = 11; h <= 19; h++) {
+    const t = T(h, 0); if (cut && t > cut[0] && t < cut[1]) continue;
+    const end = RX(t) > cx + cw - 30; // the last hour hangs inside the ribbon's right edge
+    add(`<div class="tick" style="left:${RX(t) - 1}px;top:${rTop}px${end ? ";transform:translateX(-100%)" : ""}">${h === 12 ? "noon" : h < 12 ? h + " am" : h - 12 + " pm"}</div>`);
+  }
+  const ry = rTop + 24;
+  const strip = add(`<div style="position:absolute;left:${cx}px;top:${ry}px;width:${cw}px;height:${thH}px;border-radius:8px;overflow:hidden;background:var(--sunk)"></div>`);
+  for (let f = 0; f <= 51; f += 3) {
+    const a = S + f * 600000, b = Math.min(E, a + 1800000);
+    // skip what was cut
+    const pieces = cut ? [[a, Math.min(b, cut[0])], [Math.max(a, cut[1]), b]].filter(([p, q]) => q > p) : [[a, b]];
+    for (const [p, q] of pieces) {
+      const x0 = RX(p) - cx, x1 = RX(q) - cx;
+      add(`<div style="position:absolute;left:${x0}px;top:0;width:${Math.max(0, x1 - x0 - 1)}px;height:${thH}px;overflow:hidden"><img src="assets/day/webcam-${CT.p2(f)}.jpg" style="width:${(RX(a + 1800000) - RX(a)) || x1 - x0}px;height:100%;object-fit:cover;margin-left:${RX(a) - RX(p)}px"></div>`, strip);
+    }
+  }
+  // away stretches: veiled, labelled in place
+  const awayList = cut ? [away2] : [sel, away2];
+  for (const [a, b] of awayList) {
+    const isSel = (st === "select" || st === "confirm") && a === sel[0];
+    if (isSel) continue;
+    add(`<div style="position:absolute;left:${RX(a) - cx}px;top:0;width:${RX(b) - RX(a)}px;height:${thH}px;background:rgba(245,243,238,.62);display:grid;place-items:center"><span style="font-size:11.5px;font-weight:600;color:var(--ink-2);white-space:nowrap">Away ${CT.dur(b - a)}</span></div>`, strip);
+  }
+  if (st === "select" || st === "confirm") {
+    // everything outside the selection rests under a veil; the range is a highlighter box
+    const red = st === "confirm";
+    add(`<div style="position:absolute;left:0;top:0;width:${RX(sel[0]) - cx}px;height:${thH}px;background:rgba(245,243,238,.55)"></div>`, strip);
+    add(`<div style="position:absolute;left:${RX(sel[1]) - cx}px;top:0;width:${cx + cw - RX(sel[1])}px;height:${thH}px;background:rgba(245,243,238,.55)"></div>`, strip);
+    add(`<div style="position:absolute;left:${RX(sel[0]) - 2}px;top:${ry - 3}px;width:${RX(sel[1]) - RX(sel[0]) + 4}px;height:${thH + 6}px;border-radius:9px;border:2.5px solid ${red ? "var(--rec)" : "var(--canary-deep)"};background:${red ? "rgba(229,55,43,.14)" : "transparent"}"></div>`);
+    if (!red) add(`<div style="position:absolute;left:${RX(away2[0])}px;top:${ry - 3}px;width:${RX(away2[1]) - RX(away2[0])}px;height:${thH + 6}px;border-radius:9px;border:1.5px dashed var(--canary-deep);display:grid;place-items:center"><span style="height:22px;padding:0 8px;border-radius:11px;background:var(--card);border:1px solid var(--line);font-size:11.5px;font-weight:600;display:flex;align-items:center;gap:6px;white-space:nowrap">Add away 1h 20m<span class="kbd">⇧A</span></span></div>`);
+  }
+  if (cut) {
+    const sx = RX(cut[0]);
+    add(`<div style="position:absolute;left:${sx - 1}px;top:${ry - 4}px;width:2px;height:${thH + 8}px;background:var(--rec);border-radius:1px"></div>`);
+    add(`<div class="mono" style="position:absolute;left:${sx - 30}px;top:${ry + thH + 6}px;width:60px;text-align:center;font-size:10.5px;font-weight:600;color:var(--rec)">−1h 43m</div>`);
+  }
+  // landmarks under the strip
+  const lmY = ry + thH + 6;
+  const landmark = (t, color, label, shape) => add(`<div style="position:absolute;left:${RX(t) - 4}px;top:${lmY}px;display:flex;align-items:center;gap:5px;white-space:nowrap;font-size:11px;font-weight:600;color:${color === "amber" ? "#9A5A0C" : "var(--ink-2)"}"><span style="width:8px;height:8px;border-radius:${shape === "sq" ? "2px" : "50%"};background:${color === "amber" ? "#E39A3B" : "var(--canary-deep)"}"></span>${label}</div>`);
+  landmark(T(12, 14), "canary", "Mark", "sq");
+  if (!cut) landmark(T(14, 2), "amber", "Screens stopped");
+  // zoom bracket and playhead
+  const zoom = st === "play" ? [T(11, 0), T(13, 0)] : cut ? [T(12, 50), T(16, 10)] : [T(13, 10), T(15, 50)];
+  if (st === "play" || cut) add(`<div style="position:absolute;left:${RX(zoom[0]) - 2}px;top:${ry - 3}px;width:${RX(zoom[1]) - RX(zoom[0]) + 4}px;height:${thH + 6}px;border-radius:9px;border:2px solid var(--ink);"></div>`);
+  const phx = RX(play);
+  add(`<div style="position:absolute;left:${phx - 1}px;top:${ry - 6}px;width:2px;height:${thH + 12}px;background:var(--ink)"></div>`);
+  add(`<div style="position:absolute;left:${phx - 5}px;top:${ry - 11}px;width:10px;height:10px;border-radius:50%;background:var(--canary);box-shadow:0 0 0 2px var(--ink)"></div>`);
+
+  /* ---- zoom strip: the region you're in, screen frames ---- */
+  const zTop = lmY + (wide ? 34 : 26), zH = wide ? 52 : 40;
+  const zspan = zoom[1] - zoom[0] - (cut ? cutMs : 0);
+  const ZX = (t) => { let v = t - zoom[0]; if (cut && t > cut[0]) v -= Math.min(t, cut[1]) - cut[0]; return cx + (v / zspan) * cw; };
+  const zs = add(`<div style="position:absolute;left:${cx}px;top:${zTop}px;width:${cw}px;height:${zH}px;border-radius:7px;overflow:hidden;background:var(--sunk)"></div>`);
+  for (let f = 0; f <= 51; f++) {
+    const a = S + f * 600000, b = a + 600000;
+    if (b <= zoom[0] || a >= zoom[1]) continue;
+    const pieces = cut ? [[a, Math.min(b, cut[0])], [Math.max(a, cut[1]), b]].filter(([p, q]) => q > p) : [[a, b]];
+    const screens = f <= 21;
+    for (const [p, q] of pieces) {
+      const x0 = Math.max(0, ZX(Math.max(p, zoom[0])) - cx), x1 = Math.min(cw, ZX(Math.min(q, zoom[1])) - cx);
+      if (x1 - x0 < 1) continue;
+      add(`<div style="position:absolute;left:${x0}px;top:0;width:${x1 - x0 - 1}px;height:${zH}px;overflow:hidden"><img src="assets/day/${screens ? "screen-0" : "webcam"}-${CT.p2(f)}.jpg" style="position:absolute;left:${ZX(a) - cx - x0}px;width:${ZX(b) - ZX(a)}px;height:100%;object-fit:cover;${screens ? "" : "opacity:.55"}"></div>`, zs);
+    }
+  }
+  if (!cut && zoom[1] > T(14, 2)) {
+    add(`<div style="position:absolute;left:${ZX(T(14, 2)) - cx}px;top:0;width:${cw - (ZX(T(14, 2)) - cx)}px;height:${zH}px;display:flex;align-items:center;padding-left:10px"><span style="font-size:11.5px;font-weight:600;color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.7);white-space:nowrap">Camera only after 2:02 PM</span></div>`, zs);
+  }
+  for (let t = Math.ceil(zoom[0] / 600000) * 600000; t <= zoom[1]; t += 600000) {
+    if (cut && t > cut[0] && t < cut[1]) continue;
+    const d = new Date(t); if (d.getMinutes() % (wide ? 10 : 20)) continue;
+    if (ZX(t) > cx + cw - 40) continue;
+    if ((st === "select" || st === "confirm") && (Math.abs(ZX(t) - ZX(sel[0])) < 52 || Math.abs(ZX(t) - ZX(sel[1])) < 52)) continue;
+    if (cut && Math.abs(ZX(t) - (cx + cw / 2)) < 215) continue;
+    add(`<div class="tick" style="left:${ZX(t) + 3}px;top:${zTop + zH + 4}px">${CT.clock(t, false).replace(" AM", "").replace(" PM", "")}</div>`);
+  }
+  if (st === "select" || st === "confirm") {
+    const red = st === "confirm";
+    const a = ZX(sel[0]), b = ZX(sel[1]);
+    add(`<div style="position:absolute;left:${cx}px;top:${zTop}px;width:${a - cx}px;height:${zH}px;background:rgba(245,243,238,.55);border-radius:7px 0 0 7px"></div>`);
+    add(`<div style="position:absolute;left:${b}px;top:${zTop}px;width:${cx + cw - b}px;height:${zH}px;background:rgba(245,243,238,.55);border-radius:0 7px 7px 0"></div>`);
+    add(`<div style="position:absolute;left:${a - 2}px;top:${zTop - 3}px;width:${b - a + 4}px;height:${zH + 6}px;border-radius:8px;border:2.5px solid ${red ? "var(--rec)" : "var(--canary-deep)"};background:${red ? "rgba(229,55,43,.14)" : "transparent"}"></div>`);
+    for (const [x, lab] of [[a, "1:38:00 PM"], [b, "3:21:00 PM"]]) {
+      add(`<div class="mono" style="position:absolute;left:${x - 38}px;top:${zTop + zH + 6}px;width:76px;height:20px;border-radius:6px;background:${red ? "var(--rec)" : "var(--canary)"};color:${red ? "#fff" : "var(--canary-ink)"};font-size:11px;font-weight:600;display:grid;place-items:center">${lab}</div>`);
+    }
+    if (!red) add(`<div style="position:absolute;left:${a - 38}px;top:${zTop + zH + 31}px;font-size:11.5px;color:var(--ink-3);white-space:nowrap">Snapped to when you left the desk</div>`);
+  } else {
+    const zp = ZX(play);
+    add(`<div style="position:absolute;left:${zp - 1}px;top:${zTop - 4}px;width:2px;height:${zH + 8}px;background:var(--ink)"></div>`);
+    if (st === "play") add(`<div style="position:absolute;left:${ZX(T(12, 14)) - 1}px;top:${zTop - 4}px;width:2px;height:${zH + 8}px;background:var(--canary-deep)"></div>`);
+    if (st === "play") add(`<div style="position:absolute;left:${ZX(T(12, 14)) + 4}px;top:${zTop + 4}px;height:18px;padding:0 6px;border-radius:5px;background:var(--canary);color:var(--canary-ink);font-size:11px;font-weight:700;display:flex;align-items:center">Mark · 12:14 PM</div>`);
+    if (cut) add(`<div style="position:absolute;left:${ZX(cut[0]) - 1}px;top:${zTop - 4}px;width:2px;height:${zH + 8}px;background:var(--rec)"></div>`);
+  }
+
+  /* ---- the undo toast ---- */
+  if (cut) {
+    add(`<div style="position:absolute;left:${cx + cw / 2 - 190}px;top:${H - 50}px;width:380px;height:42px;border-radius:12px;background:var(--ink);color:#fff;display:flex;align-items:center;gap:10px;padding:0 8px 0 16px;box-shadow:0 12px 30px -10px rgba(26,25,23,.55);overflow:hidden">
+      <span style="font-size:13px;font-weight:600;white-space:nowrap">Deleted 1h 43m</span><span class="mono" style="font-size:11.5px;color:rgba(255,255,255,.6);white-space:nowrap">freed 6.2 GB</span>
+      <div style="flex:1"></div>
+      <button style="height:30px;padding:0 12px;border-radius:8px;background:rgba(255,255,255,.1);color:var(--canary);font-weight:700;font-size:13px;display:flex;align-items:center;gap:8px">Undo<span class="kbd" style="background:transparent;color:rgba(255,255,255,.55);border-color:rgba(255,255,255,.25)">Ctrl Z</span></button>
+      <span style="position:absolute;left:0;bottom:0;height:2px;width:62%;background:var(--canary)"></span>
+    </div>`);
+  }
+})();
+</script>
+</body>
+</html>

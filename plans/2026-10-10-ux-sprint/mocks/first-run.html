@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>First run</title>
+<link rel="stylesheet" href="ct.css">
+<script src="data.js"></script>
+<script src="ct.js"></script>
+<style>
+  .win { width: 1280px; height: 800px; background: var(--paper); display: flex; }
+  .left { width: 470px; flex-shrink: 0; padding: 56px 48px; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: #EFECE5; }
+  .right { flex: 1; padding: 40px 56px; display: flex; flex-direction: column; gap: 12px; }
+  .step { background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+  .step.done { padding: 14px 18px; display: flex; align-items: center; gap: 12px; }
+  .num { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font: 600 11px var(--mono); flex-shrink: 0; }
+  .sel { height: 34px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); display: flex; align-items: center; padding: 0 10px; font-size: 12.5px; gap: 8px; }
+  .sel svg { margin-left: auto; color: var(--ink-3); flex-shrink: 0; }
+  .m { position: absolute; border-radius: 4px; display: grid; place-items: center; font: 600 11px var(--mono); }
+  .meter { display: flex; gap: 2px; align-items: flex-end; height: 12px; }
+  .meter i { width: 3px; border-radius: 1px; background: var(--ink); display: block; }
+</style>
+</head>
+<body>
+<div class="win">
+  <div class="left">
+    <div id="mk"></div>
+    <h1 style="font-size:34px;line-height:1.08;letter-spacing:-.03em;font-weight:700;margin-top:28px">Record the whole day. Keep the parts that matter</h1>
+    <p style="text-wrap:pretty;font-size:14.5px;line-height:1.55;color:var(--ink-2);margin-top:18px">ChirpTime records every screen, your camera and your sound in the background, in one-minute pieces. When you step away it stops keeping footage. Later you scrub the day, cut what you don't need and export what you do.</p>
+    <div style="margin-top:28px;display:flex;flex-direction:column;gap:12px">
+      <div style="display:flex;gap:12px;font-size:13px;color:var(--ink-2)"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--ink)" stroke-width="2" stroke-linecap="round" style="flex-shrink:0"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 018 0v3"/></svg><span><b style="color:var(--ink)">Nothing leaves this PC.</b> No account, no upload.</span></div>
+      <div style="display:flex;gap:12px;font-size:13px;color:var(--ink-2)"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--ink)" stroke-width="2" stroke-linecap="round" style="flex-shrink:0"><path d="M3 12a9 9 0 1018 0 9 9 0 00-18 0"/><path d="M12 7v5l3 2"/></svg><span><b style="color:var(--ink)">A chirp before it starts</b>, so you always know.</span></div>
+      <div style="display:flex;gap:12px;font-size:13px;color:var(--ink-2)"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--ink)" stroke-width="2" stroke-linecap="round" style="flex-shrink:0"><path d="M4 7h16M4 12h10M4 17h6"/></svg><span><b style="color:var(--ink)">About 6 GB an hour</b> with four screens.</span></div>
+    </div>
+    <div style="flex:1"></div>
+    <div class="mono" style="font-size:11px;color:var(--ink-3)">ChirpTime 1.0 · Windows 11</div>
+  </div>
+  <div class="right" id="right"></div>
+</div>
+<script>
+(() => {
+  document.getElementById("mk").innerHTML = CT.mark(40);
+  const R = document.getElementById("right");
+  const add = (html) => { const n = CT.el(html); R.appendChild(n); return n; };
+  const down = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 9l6 6 6-6"/></svg>`;
+  const check = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12l5 5L20 6"/></svg>`;
+
+  add(`<div style="display:flex;align-items:baseline"><div style="font-size:20px;font-weight:700;letter-spacing:-.02em">Set up in three steps</div><div style="margin-left:auto;font-size:12.5px;color:var(--ink-3)">About a minute</div></div>`);
+
+  add(`<div class="step done"><span class="num" style="background:var(--ink)">${check}</span>
+    <div><div style="font-weight:600;font-size:13.5px">Video engine installed</div><div class="mono" style="font-size:11px;color:var(--ink-3);margin-top:2px">FFmpeg 7.1 · downloaded 84 MB · NVENC, AV1 and Quick Sync found</div></div>
+    <button style="margin-left:auto;font-size:12px;font-weight:600;color:var(--ink-3)">Use my own</button></div>`);
+
+  // step 2: the desk map, the same picture the recorder and player use
+  const dk = window.DAY.desktop, W = 520, sc = W / dk.w, H = dk.h * sc;
+  const mons = window.DAY.tracks.filter((t) => t.monitor);
+  const n = { "screen-0": 1, "screen-1": 2, "screen-2": 3, "screen-3": 4 };
+  const meta = { "screen-0": "5120×2160", "screen-1": "3840×2160", "screen-2": "3840×2160", "screen-3": "3840×2160" };
+  const b = (x, y, w, h) => `left:${(x - dk.x) * sc}px;top:${(y - dk.y) * sc}px;width:${w * sc}px;height:${h * sc}px`;
+  let map = "";
+  for (const t of mons) {
+    const m = t.monitor, g = 3 / sc;
+    const on = true;
+    map += `<div class="m" style="${b(m.x + g, m.y + g, m.w - 2 * g, m.h - 2 * g)};background:#ECE9E2;box-shadow:inset 0 0 0 2px var(--ink);color:var(--ink)">
+      <span style="text-align:center;line-height:1.3">${n[t.id]}<br><span style="font-weight:400;color:var(--ink-3);font-size:10px">${meta[t.id]}</span></span>
+      <span style="position:absolute;right:6px;top:6px;width:14px;height:14px;border-radius:4px;background:var(--ink);display:grid;place-items:center">${check}</span></div>`;
+  }
+  add(`<div class="step" style="padding:16px 18px 18px">
+    <div style="display:flex;align-items:center;gap:12px"><span class="num" style="background:var(--canary);color:var(--canary-ink)">2</span><div style="font-weight:700;font-size:14.5px">Choose what to record</div>
+    <div style="margin-left:auto;font-size:12px;color:var(--ink-3)">Click a screen to leave it out</div></div>
+    <div style="display:flex;justify-content:center;margin-top:16px">
+      <div style="position:relative;width:${W}px;height:${H}px;flex-shrink:0">${map}</div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 16px;margin-top:18px;padding-left:34px">
+      <div><div style="font-size:12px;color:var(--ink-3);margin-bottom:5px">Camera</div><div class="sel"><img src="assets/oct8-webcam.jpg" style="width:30px;height:18px;object-fit:cover;border-radius:3px">Logitech BRIO${down}</div></div>
+      <div><div style="font-size:12px;color:var(--ink-3);margin-bottom:5px">Microphone</div><div class="sel"><span class="meter">${[.3, .7, 1, .6, .4, .2].map((v) => `<i style="height:${v * 12}px"></i>`).join("")}</span>BRIO microphone${down}</div></div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ink-2);grid-column:1 / -1"><span style="width:16px;height:16px;border-radius:4px;background:var(--ink);display:grid;place-items:center">${check}</span>Also record what the PC plays (system audio)</label>
+    </div>
+  </div>`);
+
+  add(`<div class="step done" style="color:var(--ink-3)"><span class="num" style="border:1.5px solid var(--ink-4);color:var(--ink-3)">3</span>
+    <div><div style="font-weight:600;font-size:13.5px;color:var(--ink-2)">Where recordings go</div><div class="mono" style="font-size:11px;margin-top:2px">C:\\Users\\dested\\Videos\\ChirpTime · 812 GB free</div></div></div>`);
+
+  add(`<div style="flex:1"></div>`);
+  add(`<div style="display:flex;align-items:center;gap:12px">
+    <span style="font-size:12.5px;color:var(--ink-3)">You can change all of this later in Settings</span>
+    <button style="margin-left:auto;height:44px;padding:0 18px;border-radius:11px;font-weight:600;color:var(--ink-2)">Set up later</button>
+    <button style="height:44px;padding:0 20px;border-radius:11px;background:var(--ink);color:#fff;font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px">Continue<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M9 6l6 6-6 6"/></svg></button>
+  </div>`);
+})();
+</script>
+</body>
+</html>

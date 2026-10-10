@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Recorder · pill</title>
+<link rel="stylesheet" href="ct.css">
+<script src="ct.js"></script>
+<style>
+  body { background: #3a3a38; }
+  .win { width: 264px; height: 52px; border-radius: 26px; background: #161615; color: #F3F0E8; display: flex; align-items: center; gap: 10px; padding: 0 8px 0 16px; box-shadow: 0 0 0 1px rgba(255,255,255,.08) inset; }
+  .ticks { display: flex; gap: 3px; }
+  .ticks i { width: 4px; height: 12px; border-radius: 2px; background: rgba(243,240,232,.45); display: block; }
+  .b { width: 36px; height: 36px; border-radius: 18px; display: grid; place-items: center; }
+</style>
+</head>
+<body>
+<div class="win">
+  <span style="width:10px;height:10px;border-radius:50%;background:var(--rec);box-shadow:0 0 0 4px rgba(229,55,43,.22)"></span>
+  <span class="mono" style="font-size:16px;font-weight:500;letter-spacing:-.03em">2:14:31</span>
+  <span class="ticks" title="Screens 1–4, camera"><i></i><i></i><i></i><i style="background:#E39A3B"></i><i style="margin-left:3px;height:12px;width:7px"></i></span>
+  <div style="flex:1"></div>
+  <button class="b" style="background:var(--canary);color:var(--canary-ink)" title="Mark (Ctrl Alt M)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M5 21V4h12l-2 4 2 4H5"/></svg></button>
+  <button class="b" style="background:var(--rec)" title="Stop"><span style="width:11px;height:11px;border-radius:2px;background:#fff"></span></button>
+</div>
+</body>
+</html>
