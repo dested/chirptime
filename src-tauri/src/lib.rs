@@ -73,6 +73,7 @@ pub fn run() {
         content_protected: std::sync::atomic::AtomicBool::new(saved.content_protection),
     };
     let app_state = Arc::new(Mutex::new(AppState::from_settings(saved)));
+    let recordings = capture::get_output_dir(&app_state.blocking_lock().config);
 
     // Start file server in background
     let server_state = app_state.clone();
@@ -105,6 +106,8 @@ pub fn run() {
                 eprintln!("[chirptime] tray not created: {e}");
             }
             hotkeys::register(&handle, &hotkeys);
+            // Partial exports a crash or a kill left behind.
+            std::thread::spawn(move || export::sweep_leftovers(&recordings));
             Ok(())
         })
         // Closing the recorder while a session runs hides it to the tray; the
@@ -198,7 +201,7 @@ pub fn run() {
         .run(|app, event| {
             // Quitting (tray, last window, Windows logging off) never cuts a
             // session short: hold the exit until it has stopped and written.
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if let tauri::RunEvent::ExitRequested { api, .. } = &event {
                 if controls::busy(app) && !controls::EXIT_READY.load(std::sync::atomic::Ordering::SeqCst) {
                     api.prevent_exit();
                     if !controls::EXITING.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -210,6 +213,10 @@ pub fn run() {
                         });
                     }
                 }
+            }
+            // The exit is going ahead: no export may outlive the app.
+            if matches!(event, tauri::RunEvent::Exit) {
+                export::kill_all_jobs();
             }
         });
 }
