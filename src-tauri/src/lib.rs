@@ -95,6 +95,7 @@ pub fn run() {
         )
         .manage(app_state)
         .manage(window_prefs)
+        .manage(controls::ActionLock::default())
         .manage(hotkeys::HotkeyState::default())
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -113,13 +114,8 @@ pub fn run() {
                 return;
             }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                let state = window.app_handle().state::<Arc<Mutex<AppState>>>();
-                // Contended means something is mid-change: keep it running.
-                let recording = state
-                    .try_lock()
-                    .map(|s| s.recorder.as_ref().is_some_and(|r| !r.is_stopping()))
-                    .unwrap_or(true);
-                if recording {
+                // A session open, or a stop still writing: keep it running.
+                if controls::busy(window.app_handle()) {
                     api.prevent_close();
                     let _ = window.hide();
                 }
@@ -197,6 +193,23 @@ pub fn run() {
             export::delete_export,
             export::reveal_export,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Quitting (tray, last window, Windows logging off) never cuts a
+            // session short: hold the exit until it has stopped and written.
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                if controls::busy(app) && !controls::EXIT_READY.load(std::sync::atomic::Ordering::SeqCst) {
+                    api.prevent_exit();
+                    if !controls::EXITING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            controls::shutdown(&app).await;
+                            controls::EXIT_READY.store(true, std::sync::atomic::Ordering::SeqCst);
+                            app.exit(0);
+                        });
+                    }
+                }
+            }
+        });
 }

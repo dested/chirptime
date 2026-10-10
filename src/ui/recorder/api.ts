@@ -45,6 +45,8 @@ export interface RecorderPrefs {
 
 export const CHANGED_EVENT = "recorder-changed";
 export const MARK_EVENT = "recorder-mark";
+/** A stop discarded a session under a minute; the payload is its receipt, for Undo. */
+export const DISCARDED_EVENT = "recorder-discarded";
 
 export const DEFAULT_HOTKEYS: Hotkeys = { record: "Ctrl+Alt+R", mark: "Ctrl+Alt+M", pause: "Ctrl+Alt+P" };
 

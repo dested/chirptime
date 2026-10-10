@@ -5,7 +5,13 @@
 //!
 //! Every action that changes the recorder emits `recorder-changed` with the new
 //! [`RecorderControl`]; a mark emits `recorder-mark` with the marker, so the
-//! widget can offer the note whichever surface made it.
+//! widget can offer the note whichever surface made it; a stop that discarded a
+//! short session emits `recorder-discarded` with its receipt, for the Undo.
+//!
+//! Start, stop, pause, resume and Restart screens run one at a time under
+//! [`ActionLock`]. A toggle (hotkey, tray) that arrives while another action
+//! is under way is dropped rather than queued, so a double press never starts
+//! and then stops.
 
 use crate::state::AppState;
 use serde::Serialize;
@@ -18,6 +24,7 @@ type State = Arc<Mutex<AppState>>;
 
 pub const CHANGED_EVENT: &str = "recorder-changed";
 pub const MARK_EVENT: &str = "recorder-mark";
+pub const DISCARDED_EVENT: &str = "recorder-discarded";
 /// Shorter than this, and a session counts as a misfire for the discard setting.
 pub const SHORT_SESSION_MS: i64 = 60_000;
 
@@ -43,6 +50,46 @@ pub struct StopOutcome {
 #[derive(Debug)]
 pub struct WindowPrefs {
     pub content_protected: AtomicBool,
+}
+
+/// Set once an exit has been asked for and [`shutdown`] is running.
+pub static EXITING: AtomicBool = AtomicBool::new(false);
+/// Set when [`shutdown`] is done (or gave up waiting): the exit may proceed.
+pub static EXIT_READY: AtomicBool = AtomicBool::new(false);
+
+/// Held for the whole of every recorder-changing action. Managed by lib.rs.
+#[derive(Default)]
+pub struct ActionLock(Mutex<()>);
+
+/// Whether quitting now would cut a session short: one is open (recording,
+/// paused, or stopped by itself and not yet finalised) or a stop is still
+/// writing. Contended state counts as busy. Safe from window and run events.
+pub fn busy(app: &tauri::AppHandle) -> bool {
+    match app.state::<State>().try_lock() {
+        Ok(s) => s.recorder.is_some() || s.stopping_id.is_some(),
+        Err(_) => true,
+    }
+}
+
+/// Finish whatever is recording before the app exits: stop an open session
+/// (a self-stopped one too, so its manifest gets its end), and wait out a stop
+/// already under way. Bounded, so a wedged ffmpeg cannot keep the app alive.
+pub async fn shutdown(app: &tauri::AppHandle) {
+    let open = app.state::<State>().lock().await.recorder.is_some();
+    if open {
+        let al = app.state::<ActionLock>();
+        let _g = al.0.lock().await;
+        if let Err(e) = stop_locked(app).await {
+            eprintln!("[chirptime] stop before exit: {e}");
+        }
+    }
+    for _ in 0..600 {
+        if app.state::<State>().lock().await.stopping_id.is_none() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    eprintln!("[chirptime] exiting with a stop still under way");
 }
 
 pub async fn control_state(state: &State) -> RecorderControl {
@@ -95,15 +142,51 @@ fn live_recorder(s: &AppState) -> Result<Arc<crate::recorder::Recorder>, String>
 // Actions (the tray and hotkeys call these directly)
 // ---------------------------------------------------------------------------
 
+/// Start with the saved options. A session already open makes this a no-op
+/// that returns its status.
 pub async fn start(app: &tauri::AppHandle) -> Result<crate::commands::SessionStatus, String> {
+    let al = app.state::<ActionLock>();
+    let _g = al.0.lock().await;
+    start_locked(app).await
+}
+
+async fn start_locked(app: &tauri::AppHandle) -> Result<crate::commands::SessionStatus, String> {
     let state = app.state::<State>();
-    let options = saved_options(&*state.lock().await);
-    let out = crate::commands::start_session(app.clone(), state, Some(options)).await;
+    let (root, options) = {
+        let s = state.lock().await;
+        if s.recorder.as_ref().is_some_and(|r| !r.is_stopping()) {
+            drop(s);
+            return crate::commands::get_session_status(app.state::<State>()).await;
+        }
+        if s.stopping_id.is_some() {
+            return Err("Still finishing the last session; try again in a moment".to_string());
+        }
+        (
+            crate::recorder::sessions_root(&crate::capture::get_output_dir(&s.config)),
+            saved_options(&s),
+        )
+    };
+    std::fs::create_dir_all(&root).map_err(|e| format!("create {}: {}", root.display(), e))?;
+    // Probing monitors and encoders and spawning every ffmpeg blocks.
+    let handle = app.clone();
+    let recorder = tokio::task::spawn_blocking(move || {
+        let env = crate::recorder::RecorderEnv::from_app(&handle);
+        crate::recorder::Recorder::start(env, &root, options)
+    })
+    .await
+    .map_err(|e| format!("start panicked: {e}"))??;
+    state.lock().await.recorder = Some(recorder);
     announce(app).await;
-    out
+    crate::commands::get_session_status(app.state::<State>()).await
 }
 
 pub async fn stop(app: &tauri::AppHandle) -> Result<StopOutcome, String> {
+    let al = app.state::<ActionLock>();
+    let _g = al.0.lock().await;
+    stop_locked(app).await
+}
+
+async fn stop_locked(app: &tauri::AppHandle) -> Result<StopOutcome, String> {
     let status = crate::commands::stop_session(app.state::<State>()).await?;
     let discard = app.state::<State>().lock().await.discard_short_sessions;
     let mut discarded = None;
@@ -116,19 +199,34 @@ pub async fn stop(app: &tauri::AppHandle) -> Result<StopOutcome, String> {
         }
     }
     announce(app).await;
+    // Whatever stopped it (widget, tray, hotkey), the widget offers the Undo.
+    if let Some(r) = &discarded {
+        let _ = app.emit(DISCARDED_EVENT, r.clone());
+    }
     Ok(StopOutcome { status, discarded })
 }
 
+/// Start or stop. Dropped while another action is under way.
 pub async fn toggle_recording(app: &tauri::AppHandle) -> Result<(), String> {
+    let al = app.state::<ActionLock>();
+    let Ok(_g) = al.0.try_lock() else {
+        return Ok(());
+    };
     let recording = control_state(app.state::<State>().inner()).await.recording;
     if recording {
-        stop(app).await.map(|_| ())
+        stop_locked(app).await.map(|_| ())
     } else {
-        start(app).await.map(|_| ())
+        start_locked(app).await.map(|_| ())
     }
 }
 
 pub async fn pause(app: &tauri::AppHandle) -> Result<RecorderControl, String> {
+    let al = app.state::<ActionLock>();
+    let _g = al.0.lock().await;
+    pause_locked(app).await
+}
+
+async fn pause_locked(app: &tauri::AppHandle) -> Result<RecorderControl, String> {
     let rec = live_recorder(&*app.state::<State>().lock().await)?;
     tokio::task::spawn_blocking(move || rec.pause())
         .await
@@ -138,6 +236,12 @@ pub async fn pause(app: &tauri::AppHandle) -> Result<RecorderControl, String> {
 }
 
 pub async fn resume(app: &tauri::AppHandle) -> Result<RecorderControl, String> {
+    let al = app.state::<ActionLock>();
+    let _g = al.0.lock().await;
+    resume_locked(app).await
+}
+
+async fn resume_locked(app: &tauri::AppHandle) -> Result<RecorderControl, String> {
     let rec = live_recorder(&*app.state::<State>().lock().await)?;
     let out = tokio::task::spawn_blocking(move || rec.resume())
         .await
@@ -147,16 +251,33 @@ pub async fn resume(app: &tauri::AppHandle) -> Result<RecorderControl, String> {
     Ok(control_state(app.state::<State>().inner()).await)
 }
 
+/// Pause or resume. Dropped while another action is under way.
 pub async fn toggle_pause(app: &tauri::AppHandle) -> Result<(), String> {
+    let al = app.state::<ActionLock>();
+    let Ok(_g) = al.0.try_lock() else {
+        return Ok(());
+    };
     let c = control_state(app.state::<State>().inner()).await;
     if !c.recording {
         return Err("No session is recording".to_string());
     }
     if c.paused_since_epoch_ms.is_some() {
-        resume(app).await.map(|_| ())
+        resume_locked(app).await.map(|_| ())
     } else {
-        pause(app).await.map(|_| ())
+        pause_locked(app).await.map(|_| ())
     }
+}
+
+/// Retry every screen that is waiting out an outage or gave up.
+pub async fn restart_screens_now(app: &tauri::AppHandle) -> Result<usize, String> {
+    let al = app.state::<ActionLock>();
+    let _g = al.0.lock().await;
+    let rec = live_recorder(&*app.state::<State>().lock().await)?;
+    let n = tokio::task::spawn_blocking(move || rec.restart_screens())
+        .await
+        .map_err(|e| format!("restart panicked: {e}"))??;
+    announce(app).await;
+    Ok(n)
 }
 
 /// Mark this instant. While paused there is no footage to mark, so it refuses.
@@ -268,12 +389,7 @@ pub async fn resume_session(app: tauri::AppHandle) -> Result<RecorderControl, St
 /// Retry every screen that is waiting out an outage or gave up.
 #[tauri::command]
 pub async fn restart_screens(app: tauri::AppHandle) -> Result<usize, String> {
-    let rec = live_recorder(&*app.state::<State>().lock().await)?;
-    let n = tokio::task::spawn_blocking(move || rec.restart_screens())
-        .await
-        .map_err(|e| format!("restart panicked: {e}"))??;
-    announce(&app).await;
-    Ok(n)
+    restart_screens_now(&app).await
 }
 
 #[tauri::command]

@@ -185,10 +185,7 @@ fn on_menu(app: &AppHandle, id: &str) {
             "open" => controls::open_app_at(&app, "#/library"),
             "show" => controls::show_recorder(&app),
             "quit" => {
-                // Finish the segments in flight before leaving.
-                if controls::control_state(app.state::<State>().inner()).await.recording {
-                    let _ = controls::stop(&app).await;
-                }
+                // The exit handler in lib.rs stops an open session first.
                 app.exit(0);
                 Ok(())
             }

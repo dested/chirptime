@@ -13,8 +13,9 @@ import { useCallback, useEffect, useState, type MouseEvent, type ReactNode } fro
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { fetchSession, listSessions, undoDeleteSession } from "./hooks/useApi";
 import { fmtSize } from "./session/format";
-import type { SessionMarker, SessionSummary } from "./types";
+import type { SessionMarker, SessionSummary, SessionTrashReceipt } from "./types";
 import {
+  DISCARDED_EVENT,
   MARK_EVENT,
   markNow,
   openApp,
@@ -25,7 +26,7 @@ import {
   startRecording,
   stopRecording,
 } from "./recorder/api";
-import { IdleView, lengthLabel } from "./recorder/IdleView";
+import { IdleView } from "./recorder/IdleView";
 import { useLive, useTauriEvent } from "./recorder/live";
 import { OptionsView } from "./recorder/OptionsView";
 import { PillView } from "./recorder/PillView";
@@ -170,17 +171,11 @@ export function CompactApp() {
       await startRecording();
       setView("main");
     });
-  const stop = () =>
-    act("stop", async () => {
-      const out = await stopRecording();
-      if (out.discarded) {
-        setToast({
-          text: `Discarded a ${lengthLabel(out.status.elapsed_ms)} session`,
-          undoId: out.discarded.id,
-          until: out.discarded.undo_until_epoch_ms,
-        });
-      }
-    });
+  const stop = () => act("stop", () => stopRecording());
+  // The Undo for a discarded short session, whichever surface stopped it.
+  useTauriEvent<SessionTrashReceipt>(DISCARDED_EVENT, (r) =>
+    setToast({ text: "Discarded a session under a minute", undoId: r.id, until: r.undo_until_epoch_ms }),
+  );
   const pauseToggle = () => act("pause", () => (paused ? resumeSession() : pauseSession()));
   const mark = () => act("mark", () => markNow());
   const restart = () => act("restart", () => restartScreens());

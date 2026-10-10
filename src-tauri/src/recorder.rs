@@ -1616,6 +1616,10 @@ struct Inner {
     /// Bumped by "Restart screens": every screen waiting out an outage retries
     /// at once. See [`wait_for_retry`].
     retry_asked: AtomicI64,
+    /// Track ids with a supervisor running (or about to). Claimed before the
+    /// thread is spawned and released when it ends, so Restart screens never
+    /// starts a second supervisor for a track that has one.
+    live_supervisors: Mutex<std::collections::HashSet<String>>,
     logs: Mutex<std::collections::HashMap<String, RingLog>>,
     warnings: Mutex<Vec<String>>,
     fatal: Mutex<Option<String>>,
@@ -2078,6 +2082,7 @@ impl Recorder {
             stop: AtomicBool::new(false),
             pausing: AtomicBool::new(false),
             retry_asked: AtomicI64::new(0),
+            live_supervisors: Mutex::new(Default::default()),
             logs: Mutex::new(Default::default()),
             warnings: Mutex::new(warnings),
             fatal: Mutex::new(None),
@@ -2089,7 +2094,14 @@ impl Recorder {
         });
         inner.flush();
 
-        let joins = spawn_workers(&inner, &specs, None)?;
+        let mut joins = Vec::new();
+        if let Err(e) = spawn_workers(&inner, &specs, None, &mut joins) {
+            inner.stop.store(true, Ordering::SeqCst);
+            for h in joins {
+                let _ = h.join();
+            }
+            return Err(e);
+        }
 
         Ok(Arc::new(Recorder {
             inner,
@@ -2172,10 +2184,26 @@ impl Recorder {
         self.inner.flush();
         // Pressing Resume was input; the poller's reading is up to 2 s stale.
         self.inner.last_input_ms.fetch_max(now, Ordering::Relaxed);
+        // Restarting until footage shows, from before any thread exists.
+        for spec in &self.specs {
+            for o in &spec.outputs {
+                set_track_status(&self.inner, &o.track_id, TrackStatus::Restarting, None);
+            }
+        }
         self.inner.pausing.store(false, Ordering::SeqCst);
-        let joins = spawn_workers(&self.inner, &self.specs, Some(&edges))?;
+        let mut joins = Vec::new();
+        if let Err(e) = spawn_workers(&self.inner, &self.specs, Some(&edges), &mut joins) {
+            // Still paused: wind down whatever did start.
+            self.inner.pausing.store(true, Ordering::SeqCst);
+            for h in joins {
+                let _ = h.join();
+            }
+            self.inner.flush();
+            return Err(e);
+        }
         *self.joins.lock().unwrap() = joins;
         *self.paused_since.lock().unwrap() = None;
+        self.inner.flush();
         Ok(())
     }
 
@@ -2208,25 +2236,23 @@ impl Recorder {
             let Some(spec) = self.specs.iter().find(|s| s.id == *id).cloned() else {
                 continue;
             };
+            let Some(claim) = claim_supervisor(&self.inner, &spec.id) else {
+                continue;
+            };
             let mut outs: Vec<OutputState> = spec
                 .outputs
                 .iter()
                 .map(|o| OutputState::new(&self.inner.session_dir, o))
                 .collect();
+            let carried = carried_downtime(last_gap.as_ref());
             for o in outs.iter_mut() {
-                // Pick the gap back up rather than starting a second one.
-                o.downtime = last_gap.as_ref().map(|g| Downtime {
-                    from: g.from_epoch_ms,
-                    reason: g.reason.clone(),
-                });
+                o.downtime = carried.clone();
             }
             self.inner.clear_health(&outs);
             set_all_status(&self.inner, &outs, TrackStatus::Restarting, None);
-            let inner = self.inner.clone();
-            let h = std::thread::Builder::new()
-                .name(format!("rec-{}", spec.id))
-                .spawn(move || supervise_outputs(inner, spec, outs))
-                .map_err(|e| format!("spawn supervisor: {}", e))?;
+            let h = spawn_supervisor(claim, spec, move |inner, spec| {
+                supervise_outputs(inner, spec, outs, true)
+            })?;
             self.joins.lock().unwrap().push(h);
         }
         self.inner.flush();
@@ -2254,6 +2280,20 @@ impl Recorder {
         }
         self.manifest()
     }
+}
+
+/// The outage gap a restarted screen picks back up, so it does not start a
+/// second one. A pause or an idle stretch is its own story and is not stretched
+/// over the outage that follows.
+fn carried_downtime(last_gap: Option<&Gap>) -> Option<Downtime> {
+    let g = last_gap?;
+    if g.reason == PAUSED_GAP_REASON || g.reason == IDLE_GAP_REASON {
+        return None;
+    }
+    Some(Downtime {
+        from: g.from_epoch_ms,
+        reason: g.reason.clone(),
+    })
 }
 
 /// Where each recorded track's pause begins: the later of its footage's end and
@@ -2286,29 +2326,69 @@ fn close_pause(m: &mut SessionManifest, now: i64) -> Vec<(String, i64)> {
     edges
 }
 
+/// Releases a track's claim in [`Inner::live_supervisors`] when its
+/// supervisor ends, however it ends.
+struct SupervisorClaim {
+    inner: Arc<Inner>,
+    id: String,
+}
+
+impl Drop for SupervisorClaim {
+    fn drop(&mut self) {
+        self.inner.live_supervisors.lock().unwrap().remove(&self.id);
+    }
+}
+
+/// Claim `id` for a new supervisor; `None` when one already runs.
+fn claim_supervisor(inner: &Arc<Inner>, id: &str) -> Option<SupervisorClaim> {
+    if !inner.live_supervisors.lock().unwrap().insert(id.to_string()) {
+        return None;
+    }
+    Some(SupervisorClaim {
+        inner: inner.clone(),
+        id: id.to_string(),
+    })
+}
+
+/// Spawn one supervisor thread holding `claim` for its whole life.
+fn spawn_supervisor(
+    claim: SupervisorClaim,
+    spec: TrackSpec,
+    run: impl FnOnce(Arc<Inner>, TrackSpec) + Send + 'static,
+) -> Result<JoinHandle<()>, String> {
+    let inner = claim.inner.clone();
+    std::thread::Builder::new()
+        .name(format!("rec-{}", spec.id))
+        .spawn(move || {
+            let _claim = claim;
+            run(inner, spec)
+        })
+        .map_err(|e| format!("spawn supervisor: {}", e))
+}
+
 /// Start a run's workers: one supervisor per spec, the disk guard, the idle
 /// poller (when trimming is on) and the cursor sampler. `resumed` carries each
 /// track's pause edge on a resume.
+///
+/// Each handle lands in `joins` as it is spawned, so on an error the caller
+/// can wind down and join what did start.
 fn spawn_workers(
     inner: &Arc<Inner>,
     specs: &[TrackSpec],
     resumed: Option<&[(String, i64)]>,
-) -> Result<Vec<JoinHandle<()>>, String> {
+    joins: &mut Vec<JoinHandle<()>>,
+) -> Result<(), String> {
     // Spawn every supervisor as close together as possible; each records its
     // own measured start instant, so a few ms of skew here is recovered later.
-    let mut joins = Vec::new();
     for spec in specs.iter().cloned() {
-        let inner = inner.clone();
+        let Some(claim) = claim_supervisor(inner, &spec.id) else {
+            continue;
+        };
         let edges: Option<Vec<(String, i64)>> = resumed.map(|r| r.to_vec());
-        joins.push(
-            std::thread::Builder::new()
-                .name(format!("rec-{}", spec.id))
-                .spawn(move || match edges {
-                    None => supervise_track(inner, spec),
-                    Some(edges) => supervise_resumed(inner, spec, &edges),
-                })
-                .map_err(|e| format!("spawn supervisor: {}", e))?,
-        );
+        joins.push(spawn_supervisor(claim, spec, move |inner, spec| match edges {
+            None => supervise_track(inner, spec),
+            Some(edges) => supervise_resumed(inner, spec, &edges),
+        })?);
     }
 
     // Disk-space guard.
@@ -2344,7 +2424,7 @@ fn spawn_workers(
         );
     }
 
-    Ok(joins)
+    Ok(())
 }
 
 /// Sample the cursor every [`crate::cursor::SAMPLE_MS`] into a new run file
@@ -2983,7 +3063,7 @@ fn supervise_track(inner: Arc<Inner>, spec: TrackSpec) {
         .iter()
         .map(|o| OutputState::new(&inner.session_dir, o))
         .collect();
-    supervise_outputs(inner, spec, outs);
+    supervise_outputs(inner, spec, outs, false);
 }
 
 /// [`supervise_track`] after a resume: each output that had recorded starts
@@ -3003,13 +3083,19 @@ fn supervise_resumed(inner: Arc<Inner>, spec: TrackSpec, edges: &[(String, i64)]
             });
         }
     }
-    supervise_outputs(inner, spec, outs);
+    // The outputs may have been renumbered while paused: find the monitor
+    // before the first launch, from the session-start identity.
+    supervise_outputs(inner, spec, outs, true);
 }
 
 /// [`supervise_track`] with its outputs already built, so a microphone split
 /// out of the webcam pair keeps the open downtime and idle tail it had inside
 /// it. See [`split_pair`].
-fn supervise_outputs(inner: Arc<Inner>, spec: TrackSpec, mut outs: Vec<OutputState>) {
+///
+/// `relocate_first`: a supervisor that starts mid-session (resume, Restart
+/// screens) cannot trust the session-start output index, so a screen locates
+/// its monitor before its first launch as it would before a relaunch.
+fn supervise_outputs(inner: Arc<Inner>, spec: TrackSpec, mut outs: Vec<OutputState>, relocate_first: bool) {
     // The source can change under us: a shared webcam+mic process that cannot run
     // gives up the pairing and continues as a solo capture (see `split_pair`), and
     // a screen follows its monitor to a new output index (see `relocate_screen`).
@@ -3018,7 +3104,7 @@ fn supervise_outputs(inner: Arc<Inner>, spec: TrackSpec, mut outs: Vec<OutputSta
     // already shown it works.
     let recorded = outs.iter().any(|o| track_end(&inner, &o.track_id).is_some());
     let mut sup = Supervision::new(recorded);
-    let mut relaunch = false;
+    let mut relaunch = relocate_first;
 
     // Screens are launched a few hundred ms apart; see SCREEN_STAGGER_MS.
     if spec.launch_delay_ms > 0 && !sleep_unless_stopping(&inner, spec.launch_delay_ms) {
@@ -3330,6 +3416,15 @@ fn give_up(
 /// track, or when DXGI cannot be enumerated at all, in which case the old index
 /// is simply tried again.
 fn locate_screen(inner: &Inner, source: &TrackSource) -> Option<Located> {
+    if !matches!(source, TrackSource::Screen { .. }) {
+        return None;
+    }
+    let outputs = enumerate_dxgi_outputs().ok().filter(|o| !o.is_empty())?;
+    locate_in(source, &inner.screen_identities, &outputs)
+}
+
+/// [`locate_screen`] against a given enumeration. Pure, for the tests.
+fn locate_in(source: &TrackSource, others: &[ScreenIdentity], outputs: &[DisplayOutput]) -> Option<Located> {
     let TrackSource::Screen {
         adapter,
         home_idx,
@@ -3339,12 +3434,10 @@ fn locate_screen(inner: &Inner, source: &TrackSource) -> Option<Located> {
     else {
         return None;
     };
-    let outputs = enumerate_dxgi_outputs().ok().filter(|o| !o.is_empty())?;
-    let others = &inner.screen_identities;
     Some(Located {
-        found: relocate_screen(identity, *adapter, *home_idx, others, &outputs),
+        found: relocate_screen(identity, *adapter, *home_idx, others, outputs),
         home_idx: *home_idx,
-        home_taken: home_is_anothers(identity, *adapter, *home_idx, others, &outputs),
+        home_taken: home_is_anothers(identity, *adapter, *home_idx, others, outputs),
     })
 }
 
@@ -3358,15 +3451,16 @@ fn point_screen_at(inner: &Arc<Inner>, id: &str, source: &mut TrackSource, idx: 
     else {
         return;
     };
-    if idx == *output_idx {
-        return;
+    if idx != *output_idx {
+        inner.warn(format!(
+            "{}: the monitor that was {} at session start is now DXGI output {} (was {}); \
+             the outputs were renumbered and the track follows its monitor",
+            id, identity.device_name, idx, output_idx
+        ));
+        *output_idx = idx;
     }
-    inner.warn(format!(
-        "{}: the monitor that was {} at session start is now DXGI output {} (was {}); \
-         the outputs were renumbered and the track follows its monitor",
-        id, identity.device_name, idx, output_idx
-    ));
-    *output_idx = idx;
+    // A supervisor started mid-session holds the session-start index, while the
+    // manifest may still name where the last one followed the monitor to.
     let mut m = inner.manifest.lock().unwrap();
     if let Some(mon) = m.track_mut(id).and_then(|t| t.monitor.as_mut()) {
         mon.output_idx = idx;
@@ -3538,7 +3632,7 @@ fn split_pair(
     match std::thread::Builder::new()
         .name("rec-mic".into())
         .spawn(move || match mic_out {
-            Some(out) => supervise_outputs(inner2, mic_spec, vec![out]),
+            Some(out) => supervise_outputs(inner2, mic_spec, vec![out], false),
             None => supervise_track(inner2, mic_spec),
         })
     {
@@ -6228,6 +6322,7 @@ mod tests {
             stop: AtomicBool::new(false),
             pausing: AtomicBool::new(false),
             retry_asked: AtomicI64::new(0),
+            live_supervisors: Mutex::new(Default::default()),
             logs: Mutex::new(Default::default()),
             warnings: Mutex::new(Vec::new()),
             fatal: Mutex::new(None),
@@ -6421,5 +6516,59 @@ mod tests {
         assert!(asked, "an asked-for retry starts the schedule over");
         assert!(took < Duration::from_secs(5), "took {took:?}");
         let _ = std::fs::remove_dir_all(&inner.session_dir);
+    }
+
+    #[test]
+    fn after_a_renumber_each_resumed_screen_finds_its_own_monitor() {
+        // The session started on `before`; while paused the outputs on adapter
+        // 0 were renumbered. Resumed supervisors hold the session-start sources.
+        let before = real_outputs();
+        let mut after = real_outputs();
+        (after[0].output_idx, after[1].output_idx, after[2].output_idx) = (2, 0, 1);
+        let ids = identities(&before);
+        let mut seen = Vec::new();
+        for (i, b) in before.iter().enumerate() {
+            let source = TrackSource::Screen {
+                adapter: b.adapter,
+                output_idx: b.output_idx,
+                home_idx: b.output_idx,
+                identity: identity_of(b),
+                encoder: "h264_nvenc".into(),
+                fps: 30,
+            };
+            let plan = Supervision::new(true).plan_relaunch(locate_in(&source, &ids, &after));
+            assert_eq!(plan, RelaunchPlan::Launch(Some(after[i].output_idx)), "{}", b.device_name);
+            seen.push((b.adapter, after[i].output_idx));
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), before.len(), "two screens on one monitor: {seen:?}");
+    }
+
+    #[test]
+    fn a_track_has_at_most_one_supervisor() {
+        let inner = test_inner("claims");
+        let a = claim_supervisor(&inner, "screen-0").expect("first claim");
+        assert!(claim_supervisor(&inner, "screen-0").is_none());
+        assert!(claim_supervisor(&inner, "screen-1").is_some());
+        drop(a);
+        assert!(claim_supervisor(&inner, "screen-0").is_some());
+        let _ = std::fs::remove_dir_all(&inner.session_dir);
+    }
+
+    #[test]
+    fn restart_screens_carries_an_outage_but_not_a_pause_or_idle() {
+        let g = |reason: &str| Gap {
+            from_epoch_ms: 1_000,
+            to_epoch_ms: 2_000,
+            reason: reason.into(),
+        };
+        assert_eq!(
+            carried_downtime(Some(&g("Display was locked or asleep"))).map(|d| d.from),
+            Some(1_000)
+        );
+        assert!(carried_downtime(Some(&g(PAUSED_GAP_REASON))).is_none());
+        assert!(carried_downtime(Some(&g(IDLE_GAP_REASON))).is_none());
+        assert!(carried_downtime(None).is_none());
     }
 }
