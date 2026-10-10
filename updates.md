@@ -32,7 +32,7 @@ Commits `35509d0..f4460a4`. Ledger: `plans/2026-10-10-ux-sprint.md`.
   IPC with per-owner extras, `check-log.ts`, `check-library.ts`.
 - **Reviews:** two read-only reviewers, on the recorder and on export. Every finding was fixed.
 - **Gate (98d1c6f, clean archive):** tsc, vite build, lib 148 ×6, edit_cuts 12,
-  thumbs 6, settings 1, export 17 all exit 0. The review fixes then added more tests (lib 151, export 24).
+  thumbs 6, settings 1, export 17 all exit 0. The review fixes then added more tests (final gate at f4460a4: lib 152, edit_cuts 12, thumbs 6, settings 1, export 24, all exit 0).
 - **Still open:** the live checks Sal has to do himself (`verify.md`).
 
 ## 2026-08-01 — Inactivity trimming for the session recorder
