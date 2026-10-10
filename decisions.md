@@ -6,6 +6,90 @@
 > Entries below dated 2026-03-xx were reconstructed from the code on 2026-07-27
 > when this file was created; the reasoning is inferred from the implementation.
 
+## 2026-10-10 — The session is the unit
+**Why:** all 30 real sessions are continuous recordings. The interval-clip mode
+last ran on 2026-08-02. So the Library, the Player, Marks and Export are all
+organised around sessions on a clock-time map.
+
+## 2026-10-10 — Clips mode removed
+**Why:** nobody used it (Sal: Q5). The calendar, the gallery, the media
+viewer, the widget's Clips pane and the dead Bun CLI were all deleted. The Rust
+interval commands are still registered with no caller and are on the Later list.
+This supersedes the 2026-07-27 "second mode" entry and the 2026-03-05 "CLI stays in-tree" entry.
+
+## 2026-10-10 — Paper, light only
+**Why:** Sal said "make it look like the rest of the app", not like After
+Effects. One warm-light system covers the widget, the shell, the Player and
+Export, and the only dark surface is the footage mat. A dark mode that follows
+Windows is deferred. This supersedes the slate/sky `ui.md`, and the dark media
+viewer it described.
+
+## 2026-10-10 — No track lanes
+**Why:** the editing is coarse and subtractive. The timeline is one day ribbon
+plus a zoom strip, and per-track detail lives in the Tracks popover. Stacked
+NLE lanes read as a pro editor and bury the one gesture that matters, which is
+selecting a block of time.
+
+## 2026-10-10 — Delete is immediate with a 10 s undo, then finalize trims with stream copy
+**Why:** Sal wants disk back now, and no "Recently deleted" holding 20 GB.
+Whole segments are renamed into `.trash/<cut>` instantly. Undo works for 10 s.
+At 12 s `finalize_cuts` trims the edge segments with `-c copy` and deletes the
+rest. There is never a re-encode, so it is fast and lossless. Up to one GOP
+survives at each edge and stays masked by the cut.
+
+## 2026-10-10 — Cuts live in a sidecar
+**Why:** `cuts.jsonl` is append-only and holds Pending / Final / Undone lines,
+which are merged into the manifest when it is read. The manifest stays a
+rebuildable index, and a cut is remembered forever: it keeps keyframe slivers
+masked, survives a rebuild, and lets startup recovery finish an interrupted delete.
+
+## 2026-10-10 — An outage retries forever after the first footage
+**Why:** on 2026-08-01, 5 hours of screens were lost when the displays powered
+off at idle and burned the 20-restart cap. A screen that has recorded now waits
+out a dark display indefinitely: 1–30 s backoff, every 2 min while the user is
+away, and 3 s after they come back. A screen that never recorded still spends
+the budget, so a broken encoder fails instead of waiting forever.
+
+## 2026-10-10 — Pause leaves a "paused" gap
+**Why:** Sal took the Q28 recommendation. Pause stops every ffmpeg rather
+than recording black. On resume, each track that had recorded gets one gap
+with the exact reason `"paused"`. The log shows it as "Paused 12m", and health
+checks treat it like idle: intentional, not a failure.
+
+## 2026-10-10 — Cursor track: CTC1, 8-byte records, change-or-1 s keepalive
+**Why:** Follow-mouse (Player and export) needs where the mouse was, and it has
+to be small. The cursor is sampled at 10 Hz. Each run writes
+`cursor/<start>.bin`: a 4-byte magic, then `u32` ms offset + `i16` x + `i16` y
+per record. A record is written only on a move, or once a second while the
+cursor is still. The worst case is about 2.3 MB for 8 h, and a torn last record is dropped.
+
+## 2026-10-10 — Export is a single filter_complex over per-track concat lists
+**Why:** an 8 h range must not open hundreds of inputs. Each track is one
+concat-demuxer input that places its segments at wall-clock offsets, so gaps
+stay gaps. One graph selects the kept pieces, composes the layout, mixes the
+audio and applies the speed. Everything up to the argument list is pure and tested.
+
+## 2026-10-10 — Share targets ≤25 MB with a two-pass encode
+**Why:** "small enough to paste in Slack or Discord" is a hard size, which
+only two-pass rate control hits reliably. It tries 1080p, then 720p, then 480p,
+and refuses with a reason if the export can't fit at 480p.
+
+## 2026-10-10 — Browser harness: `?mock=1` + the fixture server
+**Why:** `invoke()` fails in a plain browser, and Sal's dev app can't be the
+test bed. `dev/mockIpc.ts` answers commands from synthetic fixtures. It is DEV
+only, and each owner has an extras file. `scripts/fixture-server.ts` serves
+`/files` and `/thumb` on 9120. Every screen can then be checked with bx and no
+real footage, which also keeps the public repo clean.
+
+## 2026-10-10 — Vite on port 7460
+**Why:** Sal's banned-port rule (Q32). 5173 is a default port. 7460 is strict in `vite.config.ts` and in `tauri.conf.json` `devUrl`.
+
+## 2026-10-10 — One action lock for recorder controls
+**Why:** the widget, the tray and three hotkeys can all fire at once. A review
+found that a double start orphaned a recorder. Start, stop, pause, resume and
+Restart screens now run one at a time under `controls::ActionLock`. Toggles that
+arrive while it is busy are dropped, not queued, so a double press never starts and then stops.
+
 ## 2026-08-01 — Idle footage is trimmed by deleting closed segments, not by pausing
 **Why:** a life recorder that runs all day fills a disk with footage of nobody
 being there (~5–8 GB/hr). The user asked for it to be "smarter" — drop stretches
@@ -204,6 +288,7 @@ which either half produces nothing, `split_pair` hands the mic to its own
 supervisor and the webcam continues solo — recording beats lip-sync.
 
 ## 2026-07-27 — Continuous recording is a second mode in the widget, not a replacement
+**Superseded 2026-10-10:** sessions are the only mode; Clips was removed.
 **Why:** the interval chirp/clip capture and the all-day session recorder answer
 different questions ("what was I doing at 3pm" vs "replay the last four hours"),
 and the spec is explicit that `run_capture_cycle` keeps working unchanged. They
@@ -218,6 +303,7 @@ of which pane is showing, so the inactive tab still carries a live red dot — a
 user can never hide a running recording by switching tabs.
 
 ## 2026-07-27 — `ts` means epoch-ms for a session link and `HH-MM-SS` for a clip link
+**Superseded 2026-10-10:** clip links are gone; `?session=&ts=` is migrated onto `#/session/<id>?t=`.
 **Why:** the viewer already deep-links clips as `?mode=viewer&date=…&ts=HH-MM-SS`.
 A session has no per-clip timestamps to name — its playhead is an absolute
 instant on the master clock, which is epoch-ms everywhere in the engine and the
@@ -244,6 +330,7 @@ gets an amber **Interrupted** badge explaining that the footage is intact but th
 last segment of each track may be unplayable.
 
 ## 2026-07-27 — Amber is the widget's advisory tone
+**Superseded 2026-10-10:** amber now means health only, in the Paper system (`ui.md`).
 **Why:** the session recorder has a class of outcome that is neither fine nor
 broken: the mic was skipped because the only one is a Bluetooth headset, a
 monitor is not capturable, a track is restarting. ui.md's light palette had only
@@ -258,6 +345,7 @@ failures, and amber was already the marker/`drift-warn` colour on dark surfaces,
 so nothing new entered the palette. Documented in ui.md.
 
 ## 2026-07-27 — Session options live in the widget, not in `CaptureConfig`
+**Updated 2026-10-10:** the full options live in Settings; the widget keeps only what changes the next recording. Still not in `CaptureConfig`.
 **Why:** `SessionOptions` is read once, when `start_session` spawns the tracks;
 `CaptureConfig` is the interval capture's persistent-ish state. Merging them
 would have implied that changing fps mid-session does something (it does not) and
@@ -412,6 +500,7 @@ current users.
 web `getDisplayMedia` (no background capture without a visible prompt).
 
 ## 2026-03-05 — Tauri app supersedes the Bun CLI; the CLI stays in-tree
+**Superseded 2026-10-10:** the CLI was deleted (Q33).
 **Why:** the original `src/index.ts` + `src/viewer.ts` CLI proved the capture
 pipeline and is kept as a working reference, but the Tauri app owns the product.
 Deleting it wasn't worth the churn while the Rust port was still settling.

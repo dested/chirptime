@@ -1,234 +1,145 @@
 # ChirpTime — Verify
 
-> How to prove the app works. Scale to the change: [cheap] always,
-> flow recipes when touched, [heavy] only after asking.
+> How to prove the app works. Scale to the change: [cheap] always, flows when
+> touched, [heavy] only after asking. Nothing here reads or writes
+> `C:\Users\dested\Videos\ChirpTime` except the live checks Sal runs himself.
 
 ## Commands
 
 | What | Command | Cost |
 | --- | --- | --- |
 | Frontend type-check | `bunx tsc --noEmit` | [cheap] |
-| Rust check | `cargo check --manifest-path src-tauri/Cargo.toml` | [medium] — first run compiles the whole dep tree |
-| Rust unit tests | `cargo test --lib --manifest-path src-tauri/Cargo.toml` | [medium] — 64 pure tests, no hardware, no capture |
-| Settings persistence | `cargo test --test settings_persistence --manifest-path src-tauri/Cargo.toml` | [cheap] — temp `%APPDATA%`, no hardware |
-| Frontend-only build | `bun run vite:build` | [cheap] |
-| Dev app | `bun run dev` → widget window + Vite on http://localhost:5173 | [medium] — spawns a Rust build and a real window |
-| Release bundle | `bun run build` | [heavy — ask first] — full optimized Rust build + installer |
-| FFmpeg present? | `ffmpeg -version` | [cheap] |
-| Media server up? | `curl -I http://localhost:9120/files/` (needs the app running) | [cheap] |
+| Frontend build | `bun run vite:build` | [cheap] |
+| Library / follow / gap rules | `bun scripts/check-library.ts` (pure, no fixtures) | [cheap] |
+| Day-log rules | `bun scripts/check-log.ts` (needs the fixture) | [cheap] |
+| Rust check | `cargo check --manifest-path src-tauri/Cargo.toml` | [medium] |
+| Rust unit tests | `cargo test --lib --manifest-path src-tauri/Cargo.toml` | [medium], about 150 pure tests |
+| Delete / undo / finalize | `cargo test --test edit_cuts --manifest-path src-tauri/Cargo.toml` | [medium], synthetic sessions |
+| Thumbnails | `cargo test --test thumbs --manifest-path src-tauri/Cargo.toml` | [medium] |
+| Settings | `cargo test --test settings_persistence --manifest-path src-tauri/Cargo.toml` | [cheap], temp `%APPDATA%` |
+| Export | `cargo test --test export --manifest-path src-tauri/Cargo.toml` | [medium], includes one small real-ffmpeg export |
+| FFmpeg install (real download) | `cargo test --test ffmpeg_install -- --ignored` | [heavy — ask first], pulls about 110 MB |
+| Release bundle | `bun run build` | [heavy — ask first] |
 
-No frontend test runner is configured. The Rust side has unit tests (`--lib`,
-pure: device selection, encoder choice, ffmpeg arg shapes, drift maths, the
-options contract with the widget) and integration tests under `src-tauri/tests/`.
+- **Never run plain `cargo test`.** It builds and lists `tests/live_session.rs`,
+  which records the real screens, camera and mic when run with `--ignored`.
+  Run the suites above by name.
+- While Sal's `tauri dev` is running, build in your own target dir
+  (`CARGO_TARGET_DIR=src-tauri/target-<you>`) so you don't fight its lock.
+- `rebuild_check` (`--ignored`) is a read-only audit of the real archive. Ask before running it.
 
-**`src-tauri/tests/live_session.rs` starts a real recording** — screen, webcam,
-microphone. Its tests are `#[ignore]`d, so a bare `cargo test` will not run them;
-they only start when passed `-- --ignored`. Never do that while the user is at
-the machine: opening the mic can flip a Bluetooth headset into hands-free mode,
-and the capture contains whatever is on screen. `cargo test --lib` is the safe
-subset.
+## Browser harness (no Tauri, no recording)
 
-Two of those live tests exist to protect webcam/mic lip-sync and are the only way
-to prove it — the bug is invisible in any single track, and shows only as a
-disagreement between two. Each records ~25s. [heavy — ask first]
+Fixtures only. It is the way to check any screen.
 
-```
-cargo test --release --test live_session -- --ignored --nocapture lipsync
-cargo test --release --test live_session -- --ignored --nocapture pair_split
-```
-
-`lipsync` asserts the webcam and mic tracks land within 45ms of each other
-(measured +22ms; it was +1239ms when they were two processes). `pair_split`
-points the recorder at a camera that does not exist and asserts the microphone
-still records — i.e. that a broken camera cannot take the mic down with it. It
-never opens the real camera, so it is the cheaper of the two to run.
-
-## Environment / data
-
-- **FFmpeg** must be on PATH (confirmed present: 7.1.1-full_build) or at
-  `C:\ffmpeg\bin\ffmpeg.exe` / `C:\Program Files\ffmpeg\bin\ffmpeg.exe`.
-- **Capture archive** lives at `output/` (gitignored) and already contains real
-  days going back to 2026-02-27 — good fixture data for viewer work; no seeding
-  needed. Deleting from the viewer deletes real files, permanently.
-- **Output directory** is whatever `%APPDATA%\com.chirptime.app\settings.json`
-  says, defaulting to `%USERPROFILE%\Videos\ChirpTime`
-  (`state::default_output_dir`). The pre-2026-07-27 recordings under
-  `G:/code/screener/output` are therefore *not* what a fresh install reads —
-  the first-run panel reports that folder rather than adopting it.
-- No credentials or secrets of any kind.
-
-## Critical flows
-
-### Widget starts and stops recording [medium]
-Touchpoints: `CompactApp.tsx`, `commands.rs` (`start_capture`/`stop_capture`/
-`get_capture_status`), `capture.rs`, `state.rs`
-
-1. `bun run dev` → the 320×540 widget appears, always on top, status chip reads **Idle**.
-2. Click **Start Recording** → chirp sounds, chip turns red and reads **Recording**
-   with a pulsing dot, "Next capture in" counts down from the interval.
-3. Within a few seconds a new row appears in **Recent**, and the **Today** stat
-   increments. A new `output/<today>/screenshots/HH-MM-SS.png` plus
-   `output/<today>/video/HH-MM-SS_{screen,webcam,combined}.mp4` exist on disk.
-4. Click **Stop Recording** → chip returns to Idle, countdown disappears.
-
-Expect **no console window to flash** at any point — if one does, a subprocess is
-bypassing `silent_command()`.
-
-### First run and settings persistence [medium]
-Touchpoints: `settings.rs`, `nativeui.rs`, `commands.rs`, `CompactApp.tsx`
-(`Onboarding` / `OutputFolder`)
-
-1. `del "%APPDATA%\com.chirptime.app\settings.json"`, then `bun run dev` → the
-   widget opens on **Where your recordings go**, not on the Clips pane. The path
-   shown is absolute and expanded (never `%USERPROFILE%\...`), with real free
-   space beside it.
-2. **Choose Folder** opens the native picker *in front of* the always-on-top
-   widget; picking a folder updates the path in place. **Open** opens it in
-   Explorer, creating it if it does not exist yet.
-3. If a non-empty `output/` exists beside the exe or repo and is not the
-   configured folder, an amber notice names it with day/session counts. **Nothing
-   there may be moved or deleted** — only `Use This Folder` repoints the config.
-4. **Continue** → the panes appear. `settings.json` now exists with
-   `"onboarded": true`. Restart → the panel does not come back and the chosen
-   folder is still in place.
-5. Corrupt the file (`echo garbage > settings.json`) and restart → the app starts
-   normally on defaults; stderr carries one line saying the settings were not
-   valid JSON.
-6. The titlebar folder button opens the recordings folder from either tab.
-
-### Capture Now [cheap] (with the app already running)
-Touchpoints: `commands.rs::run_single_capture`, `capture.rs::run_capture_cycle`
-
-1. Click **Capture Now** → chirp, button disables for the clip duration (~5s).
-2. Today's count increments and a new Recent row appears with the right timestamp.
-
-### Browse the archive [cheap] (with the app already running)
-Touchpoints: `ViewerApp.tsx`, `commands.rs` (`get_dates`/`get_date_entries`), `fileserver.rs`
-
-1. Click **Browse All Captures** → viewer window opens on the calendar.
-2. Days with captures render as white cards with a sky capture count; empty days
-   are inert.
-3. Click a day → gallery of thumbnails with `Video` / `Cam` / `Photo` badges.
-   Thumbnails loading at all proves the :9120 server is serving.
-4. Click a card → media viewer autoplays the combined clip; the filmstrip
-   highlights the current cell; ← / → move between captures; `Escape` steps back.
-
-### Per-monitor zoom [cheap] (multi-monitor machines)
-Touchpoints: `ViewerApp.tsx` (`zoomStyle`), `capture.rs::detect_monitors`, `commands.rs::get_monitor_config`
-
-1. Open any clip in the media viewer with more than one monitor detected.
-2. Press `1`…`9` (or click a numbered segment) → the view crops to exactly that
-   monitor, **with no letterboxing or squashed aspect** and playback continuing
-   from the same position.
-3. Press `W` → webcam-only clip. Press `0` / `` ` `` / **All** → back to full desktop.
-
-### Deep link from the widget [cheap]
-Touchpoints: `CompactApp.tsx`, `commands.rs::open_viewer`
-
-1. With the viewer closed, click a row in the widget's **Recent** list.
-2. The viewer opens straight into the media viewer on that exact capture.
-3. Click another Recent row → the viewer window closes and reopens on the new one.
-
-### Multi-track session playback stays in sync [medium]
-Touchpoints: `src/ui/session/*`, `types.ts`, `hooks/useApi.ts`
-
-Needs a recorded session under `output/sessions/<id>/` with a `session.json`.
-The frontend runs standalone: `bun run vite:dev`, then
-`http://localhost:5173/?mode=viewer&session=<id>` (media still comes from :9120,
-so the app — or a stand-in file server rooted at the output dir — must be up).
-
-1. `?mode=viewer&tab=sessions` lists the session with duration, tracks, segments, size.
-2. Open it → **Grid** shows every video track; press Space.
-3. Turn on **Sync**. Every track's drift stays green (≤30ms) and the transport's
-   **Spread** readout stays under ~50ms. Red drift or a climbing `cold` count
-   means the pre-roll is not landing.
-4. Let it run through a 60s boundary. `swap` increments, `cold` does not, and no
-   track visibly stutters.
-5. Scrub the timeline anywhere → every track lands on the same instant; tracks
-   with a gap there show **No footage** and rejoin on time when the gap ends.
-6. **Focus** puts one monitor full-bleed with the webcam as PiP; **Overlay**
-   arranges the monitors in their real desktop positions. Both stay in sync.
-
-1x and 2x are clean in every layout. 4x in Grid saturates three 4K/5K decoders —
-that is a hardware limit, not a regression; check 4x in Focus instead.
-
-To verify sync *objectively* rather than by eye, the session must carry a
-burned-in timecode. Recordings do not; generate a fixture with ffmpeg
-(`drawtext=text='%{pts\:hms\:<segment start offset>}'` per segment) and confirm
-every tile shows the same number.
-
-### Session UI against the sessions already on disk [cheap — no recording]
-Touchpoints: `src/ui/session/*`, `CompactApp.tsx`, `types.ts`, `hooks/useApi.ts`
-
-Everything below runs headless and starts nothing. Useful when changing the
-manifest contract, the browser, the player, or the widget's session pane.
-
-1. `bunx tsc --noEmit` and `bun run vite:build` — the widget and viewer both
-   compile and bundle.
-2. Server-render the session UI against the real manifests. In a scratch `.tsx`
-   at the repo root, `JSON.parse` each `output/sessions/*/session.json` and
-   `renderToString(<SessionPlayer manifest={m} onBack={()=>{}} />)`. Assert: no
-   throw; every `segment.file` the manifest indexes exists on disk at the path
-   `segmentUrl()` builds; the output contains neither `undefined` nor `NaN`; and
-   `new SyncEngine(m).seekTo(<absurd value>)` clamps to the session bounds.
-   Delete the scratch file afterwards.
-3. The widget's session pane renders the same way, but `CompactApp.tsx` calls
-   `getCurrentWindow()` at module scope — stub `@tauri-apps/api/window` and
-   `@tauri-apps/api/core` with a `Bun.plugin` `build.module(...)` before
-   importing it, then render the exported `SessionPane` with a fabricated
-   `SessionStatus`. Effects do not run under SSR, so anything the pane needs at
-   first paint must be derived during render, not set in a `useEffect`.
-
-Real data worth knowing about: 6 sessions, 5 tracks each; three of them have one
-unfinalized segment per track on disk that the manifest correctly omits; two have
-`ended_epoch_ms === null` because they were force-killed, which must render as
-**Interrupted**, not **Recording**.
-
-### Continuous session recording end to end [heavy — ask first, starts real capture]
-Touchpoints: `CompactApp.tsx` session pane, `commands.rs`, `recorder.rs`, `sysaudio.rs`
-
-This grabs every monitor, the webcam and the microphone, and it beeps nothing —
-but it does hold the camera and can switch a Bluetooth headset into hands-free
-mode. Only run it with the user's knowledge, and stop it when done.
-
-1. Widget → **Session** tab → **Settings**: monitors list the four displays with
-   the iGPU one marked capturable only if `h264_qsv` exists; the mic picker's
-   Bluetooth entries are labelled as such.
-2. **Start Session** → the chip turns red, the elapsed clock ticks, and within
-   `segment_seconds` the Tracks list shows one sky pulsing dot per track with
-   rising segment counts and bytes. `output/sessions/<id>/session.json` appears.
-3. A device that is unavailable (unplug the webcam, or hold it in another app)
-   must appear as a red **is not recording** notice naming the device, while the
-   other tracks keep counting up.
-4. Type into the marker field and press **Flag** → a line confirms the wall-clock
-   time and `markers.jsonl` gains a row.
-5. **Stop Session** → the pane goes Idle, the footer offers **Open Last Session**,
-   and that link opens the viewer straight into the player for that id.
-
-### Delete a capture [medium — destructive, deletes real files]
-Touchpoints: `commands.rs::delete_entry`, `ViewerApp.tsx`, `CompactApp.tsx`
-
-1. In the media viewer press `Delete` (or the trash button) → `confirm()` names the time.
-2. Accept → the entry leaves the filmstrip, the neighbour is selected, and all four
-   files for that timestamp are gone from `output/<date>/`.
-
-Use a throwaway capture you just took, never an archive day.
-
-## Viewer in a browser (no Tauri, no recording)
-Cheap check. Fixtures only; it never reads `C:\Users\dested\Videos\ChirpTime`.
-1. `bun scripts/make-fixture.ts` builds `G:\code\chirptime\fixtures\sessions\` (gitignored): 2 sessions, about 196 MB. `--force` rebuilds it.
-2. `bun scripts/fixture-server.ts` serves `/files` (with Range) and `/thumb/<sid>/<track>/<epoch>.jpg?w=` on 9120. It refuses to start if 9120 is taken, which means the real app is up.
+1. `bun scripts/make-fixture.ts` builds `G:\code\chirptime\fixtures\sessions\`
+   (gitignored, about 370 MB). `--force` rebuilds it. If you change the
+   fixtures, restart the fixture server.
+2. `bun scripts/fixture-server.ts` serves `/files` (with Range) and
+   `/thumb/<sid>/<track>/<epoch>.jpg?w=` on 9120. It refuses to start if 9120 is
+   taken, which means the real app is running: leave it alone.
 3. `bun run vite:dev` starts Vite on 7460.
-4. Open http://localhost:7460/?mode=viewer&mock=1#/session/2026-08-01_10-30-12. `?mock=1` (DEV only) answers invoke() from the fixtures: list/get session, status, environment, start/stop, and delete_range/undo_cut with a 12 s finalize. The compact widget is at http://localhost:7460/?mock=1.
-5. `bun scripts/check-log.ts` checks the day-log rules against the fixture, with no browser. It should exit 0.
-6. Stop Vite and the fixture server when you're done.
+4. Open the pages below. `?mock=1` (DEV only) answers `invoke()` from the
+   fixtures, through `src/ui/dev/mockIpc.ts` plus the `dev/extra/*` handlers.
+   Deletes, notes, exports and recorder actions change an in-memory copy, with
+   the real undo and finalize timings.
+5. Stop Vite and the fixture server when you're done.
 
-What the fixture covers:
-- Idle 11:10–11:30 on every picture track.
-- Screen 4 down 11:45–12:10 ("stopped reporting", which shows as "The display went dark").
-- Screens 1–3 down 11:52–12:10 ("Display was locked or asleep").
-- Marks at 10:52 (no label) and 12:18 ("Bug repro").
+App window (`?mode=viewer&mock=1`):
+- Library: http://localhost:7460/?mode=viewer&mock=1#/library
+- Player: http://localhost:7460/?mode=viewer&mock=1#/session/2026-08-01_10-30-12
+- Export: http://localhost:7460/?mode=viewer&mock=1#/export/2026-08-01_10-30-12
+- Marks: http://localhost:7460/?mode=viewer&mock=1#/marks
+- Exports: http://localhost:7460/?mode=viewer&mock=1#/exports
+- Settings: http://localhost:7460/?mode=viewer&mock=1#/settings
+- First run: http://localhost:7460/?mode=viewer&mock=1&scene=firstrun#/library
+- No FFmpeg found: http://localhost:7460/?mode=viewer&mock=1&scene=noffmpeg#/settings
 
-bx pins 1280×800. For 1920×1080 use a playwright viewport, and `window.__chirpEngine` (DEV only) to seek.
+Recorder widget (`?mock=1`, at 320×540). `?scene=` comes from `src/ui/dev/extra/widget.ts`:
+- Idle: http://localhost:7460/?mock=1
+- Recording, with screen 4 restarting: http://localhost:7460/?mock=1&scene=recording
+- Outage alert, screens 1–3 down for 14 min: http://localhost:7460/?mock=1&scene=alert
+- Paused for 3 min: http://localhost:7460/?mock=1&scene=paused
+- First run (not onboarded, so the widget sends you to the app): http://localhost:7460/?mock=1&scene=firstrun
+- No FFmpeg: http://localhost:7460/?mock=1&scene=noffmpeg
 
-> The "Delete" and media-viewer recipes above predate the redesign: the interval-clip viewer is gone.
+bx pins 1280×800. For 1920×1080, use a playwright viewport. In DEV,
+`window.__chirpEngine` seeks the Player.
+
+### The fixture: 7 sessions (`scripts/make-fixture.ts`)
+
+| Id | Shape | What it exercises |
+| --- | --- | --- |
+| `2026-07-30_09-12-05` | 2h 30m, 1 screen + camera + mic | Idle 70–95 min; mark "Standup notes" at 31 min |
+| `2026-07-31_13-05-40` | 1h 15m, 1 screen + camera + mic | A `"paused"` gap at 35–47 min; a mark with no note at 60 min |
+| `2026-08-01_10-30-12` | about 2 h (10:30–12:32), 4 screens + camera + mic + system audio | The main Player session. Idle 11:10–11:30 on every picture track; screen 4 down 11:45–12:10 ("stopped reporting", shown as "The display went dark"); screens 1–3 down 11:52–12:10 ("Display was locked or asleep"); marks at 10:52 (no note) and 12:18 ("Bug repro") |
+| `2026-08-02_09-04-40` | 3 min, one 5120×2160 screen + camera + mic | A short single-screen session |
+| `2026-08-02_14-10-02` | 30 s | Short-session clean-up |
+| `2026-08-02_14-11-09` | 20 s | Short-session clean-up (pressed Start twice) |
+| `2026-08-03_23-20-30` | 1h 15m | Crosses midnight; mark "After midnight" |
+
+## Flows to click through (harness)
+
+- **Delete a block of time (Player):**
+  1. Drag on the ribbon, or press I / O, or use Delete on an away line in the log.
+  2. The selection bar shows the length chip, the range and the size. Press X.
+  3. The confirm row reads "Delete 1h 43m? Frees … now. Undo for 10 seconds."
+  4. Press Enter. The range collapses to a red seam, and the toast counts down.
+  5. Undo (or Ctrl Z) brings it back. Let it run out and it finalizes at 12 s.
+- **Library:**
+  1. Click a block to open the inspector. Double-click to open the Player.
+  2. Delete the session, then Undo from the toast.
+  3. "N sessions under a minute · Clean up" removes the two short fixtures with one undo.
+- **Marks:** edit a note inline (Enter saves, Esc cancels). Open seeks the Player to the mark.
+- **Export:**
+  1. Change the layout, screen, camera corner (drag it) and speed. The preview
+     and the estimate update.
+  2. Export. Progress runs in the footer, then "Saved · Show in folder", and
+     the row appears on `#/exports`.
+- **Widget:**
+  1. Start, then Mark with an inline note, Pause / Resume, the pill and back, and Stop.
+  2. The alert scene's "Restart screens" works.
+  3. Options change only the next recording.
+
+## Live checks (Sal)
+
+These have only run in the harness and the tests. They need the real app
+(`bun run dev` or a release build) and real hardware, and Sal runs them.
+
+- [ ] **Tray:**
+  - [ ] The icon shows idle, recording and paused.
+  - [ ] The menu's Start/Stop, Pause/Resume, Mark, Open ChirpTime, Show recorder and Quit all work.
+  - [ ] Closing the widget while recording hides it to the tray.
+- [ ] **Hotkeys:**
+  - [ ] Ctrl Alt R, M and P work from another app.
+  - [ ] A hotkey another app already holds shows its error in Settings, and the app still starts.
+  - [ ] A double press never starts and then stops.
+- [ ] **Content protection:** a session's footage doesn't show the widget or the
+  app window. Turn it off in Settings and they appear.
+- [ ] **Transparent widget:** the rounded corners have no square backdrop, the
+  pill resizes cleanly, and dragging works.
+- [ ] **Exit hold:** Quit from the tray while recording. The app waits, stops
+  the session, writes `ended_epoch_ms`, then exits. The session plays back
+  complete and no ffmpeg is left in Task Manager.
+- [ ] **Display sleep:**
+  1. Start a session and let the displays power off when idle (or force it).
+  2. Come back after more than 20 minutes.
+  3. Screens resume within a few seconds of input. The gap reads "Display was
+     locked or asleep". You get one toast per outage, not one per retry.
+  4. No screen records another monitor's picture.
+- [ ] **Real export:**
+  1. Export about 10 minutes of a real session in Devlog with Follow mouse,
+     then again in Share.
+  2. The file plays, Share is ≤25 MB, and the audio ducks while you talk.
+  3. Delete it from `#/exports` and Undo.
+  4. Quitting during an export leaves no `.part` file after the next start.
+- [ ] **Delete on real footage:** delete a block from a real session, then check
+  that disk space is freed about 12 s later and playback skips the hole.
+
+## Environment
+
+- FFmpeg comes from the picked folder, then PATH, then `C:\ffmpeg\bin`, then
+  `C:\Program Files\ffmpeg\bin`, then the managed install under `%APPDATA%`.
+- Recordings live where `settings.json` says, by default `%USERPROFILE%\Videos\ChirpTime`.
+- Ports: Vite 7460, file server 9120. Don't touch either while Sal's dev app is running.
+- No credentials or secrets.

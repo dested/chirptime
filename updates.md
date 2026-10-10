@@ -3,6 +3,38 @@
 > Terse log of every task: what was asked → what was done. Newest first.
 > Older entries: `updates-archive.md` (created once this passes ~300 lines).
 
+## 2026-10-10 — Redesign sprint: Paper app, delete time, export, recorder rebuilt
+Sal asked for a full UI/UX rethink, the ability to delete blocks of time, and
+export. He took every recommendation, with overrides: the player looks like the
+rest of the app, delete frees disk now with an undo, and the UI is light only.
+Commits `35509d0..f4460a4`. Ledger: `plans/2026-10-10-ux-sprint.md`.
+
+- **Backend:**
+  - Idle trimming committed.
+  - `edit.rs`: cuts sidecar, instant delete with a 10 s undo, then stream-copy
+    finalize, whole-session delete, crash recovery.
+  - `/thumb` with a cache purged inside cuts.
+  - Screens wait out display outages, and restarts keep the session-start identity.
+  - Pause leaves `"paused"` gaps.
+  - New: the `cursor.rs` CTC1 track; `controls.rs` (one action lock, exit hold,
+    short-session discard with Undo); the tray, hotkeys and content protection.
+  - `export.rs`: one filter_complex over per-track concat lists; Share two-pass ≤25 MB;
+    raw tracks; index + `.work`; leftovers swept at startup, jobs killed on exit.
+  - Finalize waits while an export reads the session.
+- **Frontend:**
+  - Paper tokens and bundled fonts; a hash router.
+  - The app shell, Library time map, Player (stage, log, ribbon, zoom strip,
+    select / confirm / undo, follow-mouse), Marks with inline notes, Export
+    composer, Exports, Settings and first run.
+  - The recorder widget, rebuilt (idle, recording, alert, options, pill).
+  - Clips, the old viewer and the dead CLI deleted. Vite moved to 7460.
+- **Harness:** `make-fixture.ts` (7 sessions), `fixture-server.ts`, `?mock=1`
+  IPC with per-owner extras, `check-log.ts`, `check-library.ts`.
+- **Reviews:** two read-only reviewers, on the recorder and on export. Every finding was fixed.
+- **Gate (98d1c6f, clean archive):** tsc, vite build, lib 148 ×6, edit_cuts 12,
+  thumbs 6, settings 1, export 17 all exit 0. The review fixes then added more tests (lib 151, export 24).
+- **Still open:** the live checks Sal has to do himself (`verify.md`).
+
 ## 2026-08-01 — Inactivity trimming for the session recorder
 User wanted the continuous recorder to stop keeping footage of idle time —
 "delete that part in real time" once there's been no keyboard/mouse input for a
