@@ -265,6 +265,17 @@ pub async fn resume_session(app: tauri::AppHandle) -> Result<RecorderControl, St
     resume(&app).await
 }
 
+/// Retry every screen that is waiting out an outage or gave up.
+#[tauri::command]
+pub async fn restart_screens(app: tauri::AppHandle) -> Result<usize, String> {
+    let rec = live_recorder(&*app.state::<State>().lock().await)?;
+    let n = tokio::task::spawn_blocking(move || rec.restart_screens())
+        .await
+        .map_err(|e| format!("restart panicked: {e}"))??;
+    announce(&app).await;
+    Ok(n)
+}
+
 #[tauri::command]
 pub async fn mark_now(app: tauri::AppHandle, label: Option<String>) -> Result<crate::session::Marker, String> {
     mark(&app, label.unwrap_or_default()).await

@@ -180,6 +180,7 @@ pub fn run() {
             controls::stop_recording,
             controls::pause_session,
             controls::resume_session,
+            controls::restart_screens,
             controls::mark_now,
             controls::set_live_marker_label,
             controls::open_app,

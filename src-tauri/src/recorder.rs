@@ -1613,6 +1613,9 @@ struct Inner {
     /// Every worker winds down as if stopping, for a pause. Cleared by resume
     /// once they have all exited. See [`Recorder::pause`].
     pausing: AtomicBool,
+    /// Bumped by "Restart screens": every screen waiting out an outage retries
+    /// at once. See [`wait_for_retry`].
+    retry_asked: AtomicI64,
     logs: Mutex<std::collections::HashMap<String, RingLog>>,
     warnings: Mutex<Vec<String>>,
     fatal: Mutex<Option<String>>,
@@ -2074,6 +2077,7 @@ impl Recorder {
             manifest: Mutex::new(manifest),
             stop: AtomicBool::new(false),
             pausing: AtomicBool::new(false),
+            retry_asked: AtomicI64::new(0),
             logs: Mutex::new(Default::default()),
             warnings: Mutex::new(warnings),
             fatal: Mutex::new(None),
@@ -2173,6 +2177,60 @@ impl Recorder {
         *self.joins.lock().unwrap() = joins;
         *self.paused_since.lock().unwrap() = None;
         Ok(())
+    }
+
+    /// "Restart screens": every screen waiting out an outage retries now, and
+    /// every screen that gave up gets a new supervisor, its downtime gap
+    /// carrying on until footage resumes. Returns how many screens were down.
+    pub fn restart_screens(&self) -> Result<usize, String> {
+        let _g = self.control.lock().unwrap();
+        if self.stopped.load(Ordering::SeqCst) || self.inner.stop.load(Ordering::SeqCst) {
+            return Err("This session has already stopped".to_string());
+        }
+        if self.paused_since().is_some() {
+            return Err("Paused: resume to restart the screens".to_string());
+        }
+        self.inner.retry_asked.fetch_add(1, Ordering::SeqCst);
+        let (waiting, failed): (usize, Vec<(String, Option<Gap>)>) = {
+            let m = self.inner.manifest.lock().unwrap();
+            let screens = m.tracks.iter().filter(|t| t.kind == "screen");
+            let waiting = screens
+                .clone()
+                .filter(|t| t.status == TrackStatus::Restarting)
+                .count();
+            let failed = screens
+                .filter(|t| t.status == TrackStatus::Failed)
+                .map(|t| (t.id.clone(), t.gaps.last().cloned()))
+                .collect();
+            (waiting, failed)
+        };
+        for (id, last_gap) in &failed {
+            let Some(spec) = self.specs.iter().find(|s| s.id == *id).cloned() else {
+                continue;
+            };
+            let mut outs: Vec<OutputState> = spec
+                .outputs
+                .iter()
+                .map(|o| OutputState::new(&self.inner.session_dir, o))
+                .collect();
+            for o in outs.iter_mut() {
+                // Pick the gap back up rather than starting a second one.
+                o.downtime = last_gap.as_ref().map(|g| Downtime {
+                    from: g.from_epoch_ms,
+                    reason: g.reason.clone(),
+                });
+            }
+            self.inner.clear_health(&outs);
+            set_all_status(&self.inner, &outs, TrackStatus::Restarting, None);
+            let inner = self.inner.clone();
+            let h = std::thread::Builder::new()
+                .name(format!("rec-{}", spec.id))
+                .spawn(move || supervise_outputs(inner, spec, outs))
+                .map_err(|e| format!("spawn supervisor: {}", e))?;
+            self.joins.lock().unwrap().push(h);
+        }
+        self.inner.flush();
+        Ok(waiting + failed.len())
     }
 
     /// Signal every track to finish the in-flight segment gracefully, then join.
@@ -3329,9 +3387,15 @@ enum Wake {
 /// what makes recovery take seconds rather than up to a full backoff step.
 fn wait_for_retry(inner: &Arc<Inner>, ms: u64, away: &mut bool) -> Wake {
     let deadline = std::time::Instant::now() + Duration::from_millis(ms);
+    let asked = inner.retry_asked.load(Ordering::SeqCst);
     while std::time::Instant::now() < deadline {
         if inner.stopping() {
             return Wake::Stopping;
+        }
+        // "Restart screens": the user says the display is back, so retry now
+        // and start the schedule over, as when they come back to the desk.
+        if inner.retry_asked.load(Ordering::SeqCst) != asked {
+            return Wake::UserBack;
         }
         if user_came_back(away, now_ms(), poll_last_input_ms()) {
             return if sleep_unless_stopping(inner, WAKE_SETTLE_MS) {
@@ -6163,6 +6227,7 @@ mod tests {
             manifest: Mutex::new(manifest),
             stop: AtomicBool::new(false),
             pausing: AtomicBool::new(false),
+            retry_asked: AtomicI64::new(0),
             logs: Mutex::new(Default::default()),
             warnings: Mutex::new(Vec::new()),
             fatal: Mutex::new(None),
@@ -6335,6 +6400,26 @@ mod tests {
         assert!(!inner.stop.load(Ordering::SeqCst), "the edit gate must not see a stop");
         inner.pausing.store(false, Ordering::SeqCst);
         assert!(!inner.stopping());
+        let _ = std::fs::remove_dir_all(&inner.session_dir);
+    }
+
+    #[test]
+    fn restart_screens_ends_an_outage_wait_at_once() {
+        let inner = test_inner("asked");
+        let waiter = {
+            let inner = inner.clone();
+            std::thread::spawn(move || {
+                let mut away = false;
+                let t = std::time::Instant::now();
+                let woke = wait_for_retry(&inner, 60_000, &mut away);
+                (matches!(woke, Wake::UserBack), t.elapsed())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        inner.retry_asked.fetch_add(1, Ordering::SeqCst);
+        let (asked, took) = waiter.join().expect("waiter");
+        assert!(asked, "an asked-for retry starts the schedule over");
+        assert!(took < Duration::from_secs(5), "took {took:?}");
         let _ = std::fs::remove_dir_all(&inner.session_dir);
     }
 }
