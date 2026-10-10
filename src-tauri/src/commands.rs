@@ -703,6 +703,8 @@ pub struct TrackSummary {
     pub gap_count: usize,
     pub restarts: u32,
     pub error: Option<String>,
+    #[serde(flatten)]
+    pub health: crate::recorder::TrackHealth,
 }
 
 #[derive(Serialize)]
@@ -773,6 +775,7 @@ impl SessionStatus {
                     gap_count: t.gaps.len(),
                     restarts: t.restarts,
                     error: t.error.clone(),
+                    health: rec.track_health(&t.id),
                 })
                 .collect(),
             total_bytes: m.total_bytes(),

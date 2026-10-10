@@ -270,6 +270,12 @@ export interface TrackSummary {
   gap_count: number;
   restarts: number;
   error: string | null;
+  /** Why the track is not recording, as a sentence ("Display was locked or asleep"). Null while it records. */
+  last_error_human: string | null;
+  /** Set while a screen waits out an outage. It keeps retrying until capture works or the session stops. */
+  waiting_since_epoch_ms: number | null;
+  /** When the next attempt is due, while it is restarting or waiting. */
+  next_attempt_epoch_ms: number | null;
 }
 
 /** Mirrors `commands::SessionStatus`. Returned by start/stop/get_session_status. */
