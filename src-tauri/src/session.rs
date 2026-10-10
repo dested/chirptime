@@ -299,7 +299,15 @@ pub fn read_markers(session_dir: &Path) -> Vec<Marker> {
 pub fn append_cut(session_dir: &Path, cut: &Cut) -> Result<(), String> {
     use std::io::Write;
     let path = session_dir.join(CUTS_FILE);
-    let line = serde_json::to_string(cut).map_err(|e| e.to_string())?;
+    let mut line = serde_json::to_string(cut).map_err(|e| e.to_string())?;
+    // A crash mid-append can leave a torn last line with no newline; start on a
+    // fresh one so this line is not glued onto it (and lost with it).
+    let torn = std::fs::read(&path)
+        .map(|b| b.last().is_some_and(|c| *c != b'\n'))
+        .unwrap_or(false);
+    if torn {
+        line.insert(0, '\n');
+    }
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

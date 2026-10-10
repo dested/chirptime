@@ -90,6 +90,10 @@ pub struct AppState {
     /// Continuous-session recorder. Independent of the interval capture loop
     /// above — both can run at once.
     pub recorder: Option<std::sync::Arc<crate::recorder::Recorder>>,
+    /// The session whose recorder `stop_session` has taken out of `recorder` but
+    /// whose `stop()` has not returned yet. Its final flush still writes the
+    /// manifest, so edits refuse it until then.
+    pub stopping_id: Option<String>,
     /// Last-used `recorder::SessionOptions`, kept as raw JSON because that type
     /// is deserialize-only. Written by the settings panel, read back by it, and
     /// handed to `start_session` by the frontend. `Null` = never configured.

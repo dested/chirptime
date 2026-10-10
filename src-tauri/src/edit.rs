@@ -29,7 +29,9 @@ pub const UNDO_WINDOW_MS: i64 = 10_000;
 /// When the scheduled finalize / purge runs. A little after the undo window so a
 /// last-second undo never races it.
 pub const FINALIZE_AFTER_MS: u64 = 12_000;
-/// A kept piece shorter than this is not worth a file: it is removed instead.
+/// A kept piece shorter than this is not worth a file. Footage outside the range
+/// is never thrown away for it, though: such a segment is left untouched and
+/// the cut masks the part inside.
 pub const MIN_PIECE_MS: i64 = 1_000;
 /// Parking area for pending deletes, both inside a session and under the
 /// sessions root (whole sessions).
@@ -39,9 +41,16 @@ pub const SIDECAR_DIR: &str = "mic-16k";
 
 pub const LIVE_SESSION_ERR: &str = "Stop recording before deleting from this session";
 pub const UNDO_EXPIRED_ERR: &str = "That delete can no longer be undone";
+pub const STOPPING_SESSION_ERR: &str =
+    "That session is still finishing its recording; try again in a moment";
+pub const FINALIZING_ERR: &str = "That delete is already being finalized";
 
 const PLAN_FILE: &str = "plan.json";
 const JOURNAL_FILE: &str = "finalize.json";
+/// Written into a cut's trash folder when an undo failed and was rolled back.
+/// The timer leaves such a cut alone; only an explicit finalize (or a retried
+/// undo) settles it.
+const UNDO_FAILED_FILE: &str = "undo-failed.json";
 /// Suffix of a kept piece while ffmpeg is still writing it. Never `.mp4`, so a
 /// crash can't leave something the rebuild would index.
 const TMP_SUFFIX: &str = ".cut.tmp";
@@ -170,9 +179,15 @@ pub fn classify_segments(
         if e <= from || s >= to {
             continue;
         }
-        let keep_head = s < from && from - s >= MIN_PIECE_MS;
-        let keep_tail = e > to && e - to >= MIN_PIECE_MS;
-        let bucket = match (keep_head, keep_tail) {
+        let head_ms = from - s;
+        let tail_ms = e - to;
+        // Never lose footage outside the range: a sliver under a second outside
+        // the cut is not worth a file, so the segment stays as it is and the cut
+        // masks the part inside. It frees less disk, which is fine.
+        if (head_ms > 0 && head_ms < MIN_PIECE_MS) || (tail_ms > 0 && tail_ms < MIN_PIECE_MS) {
+            continue;
+        }
+        let bucket = match (head_ms > 0, tail_ms > 0) {
             (false, false) => &mut tc.remove,
             (true, false) => &mut tc.trim_head,
             (false, true) => &mut tc.trim_tail,
@@ -256,18 +271,42 @@ pub fn plan_cut(
 // Small file helpers
 // ---------------------------------------------------------------------------
 
-/// Session ids come from the frontend and become paths.
+/// Session and cut ids come from the frontend and become paths, so they are an
+/// allowlist: ASCII letters, digits, `_` and `-`. No dot, no space, no separator.
 pub fn check_id(id: &str) -> Result<(), String> {
-    if id.is_empty()
-        || id.starts_with('.')
-        || id.contains('/')
-        || id.contains('\\')
-        || id.contains("..")
-        || id.contains(':')
-    {
-        return Err(format!("Not a session id: {}", id));
+    if !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        Ok(())
+    } else {
+        Err(format!("Not a valid id: {:?}", id))
     }
-    Ok(())
+}
+
+/// The gate every edit command passes before touching a session: a valid id,
+/// and neither the session that is recording nor the one whose recorder is
+/// still stopping (its last flush would overwrite the manifest).
+pub fn editable_dir(
+    root: &Path,
+    recording: Option<&str>,
+    stopping: Option<&str>,
+    id: &str,
+) -> Result<PathBuf, String> {
+    check_id(id)?;
+    if recording == Some(id) {
+        return Err(LIVE_SESSION_ERR.to_string());
+    }
+    if stopping == Some(id) {
+        return Err(STOPPING_SESSION_ERR.to_string());
+    }
+    Ok(root.join(id))
+}
+
+/// `rebuild_manifest_from_disk` + write, serialized with every edit so a rebuild
+/// can never interleave with a delete, an undo or a finalize.
+pub fn rebuild_session(session_dir: &Path) -> Result<SessionManifest, String> {
+    let _g = edit_lock();
+    let m = session::rebuild_manifest_from_disk(session_dir)?;
+    session::write_manifest(session_dir, &m)?;
+    Ok(m)
 }
 
 fn trash_dir(session_dir: &Path, cut_id: &str) -> PathBuf {
@@ -519,29 +558,54 @@ pub fn delete_range(
     })
 }
 
-/// Put back everything a plan parked: files, segment records, markers. Does not
-/// write the manifest.
-fn restore_parked(session_dir: &Path, trash: &Path, pf: &PlanFile, m: &mut SessionManifest) -> Result<(), String> {
+/// Move every file a plan parked back home. All or nothing: on any failure the
+/// files already moved go back into the trash and the error is returned.
+fn unpark(session_dir: &Path, trash: &Path, pf: &PlanFile) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let fail = |moved: &[(PathBuf, PathBuf)], e: String| {
+        repark(moved);
+        Err(e)
+    };
     for tc in &pf.plan.tracks {
         for seg in &tc.remove {
             let parked = trash.join(&tc.dir).join(&seg.file);
             let home = session_dir.join(&tc.dir).join(&seg.file);
-            if parked.is_file() && !home.exists() {
-                std::fs::rename(&parked, &home)
-                    .map_err(|e| format!("Could not restore {}: {}", home.display(), e))?;
+            if !parked.is_file() {
+                if home.is_file() {
+                    continue; // never parked: the delete was interrupted before it
+                }
+                return fail(&moved, format!("{} is missing", parked.display()));
             }
-            if tc.sidecar {
-                continue;
+            if home.exists() {
+                return fail(&moved, format!("{} is in the way", home.display()));
             }
-            if let Some(t) = m.tracks.iter_mut().find(|t| t.id == tc.track_id) {
+            if let Err(e) = std::fs::rename(&parked, &home) {
+                return fail(&moved, format!("could not restore {}: {}", home.display(), e));
+            }
+            moved.push((parked, home));
+        }
+    }
+    Ok(moved)
+}
+
+/// Undo `unpark`.
+fn repark(moved: &[(PathBuf, PathBuf)]) {
+    for (parked, home) in moved.iter().rev() {
+        let _ = std::fs::rename(home, parked);
+    }
+}
+
+/// Put back the segment records and markers a plan took out. Pure.
+fn restore_records(pf: &PlanFile, m: &mut SessionManifest) {
+    for tc in pf.plan.tracks.iter().filter(|tc| !tc.sidecar) {
+        if let Some(t) = m.tracks.iter_mut().find(|t| t.id == tc.track_id) {
+            for seg in &tc.remove {
                 if !t.segments.iter().any(|s| s.file == seg.file) {
                     t.segments.push(seg.clone());
                 }
             }
+            t.segments.sort_by_key(|s| s.start_epoch_ms);
         }
-    }
-    for t in m.tracks.iter_mut() {
-        t.segments.sort_by_key(|s| s.start_epoch_ms);
     }
     for mk in &pf.markers {
         if !m.markers.contains(mk) {
@@ -549,11 +613,17 @@ fn restore_parked(session_dir: &Path, trash: &Path, pf: &PlanFile, m: &mut Sessi
         }
     }
     m.markers.sort_by_key(|mk| mk.epoch_ms);
-    Ok(())
 }
 
-/// Undo a delete while it is still `Pending`.
+fn undo_failed(trash: &Path) -> bool {
+    trash.join(UNDO_FAILED_FILE).is_file()
+}
+
+/// Undo a delete while it is still `Pending`. All or nothing: if any step fails,
+/// everything it did is rolled back, the cut stays `Pending` and is marked
+/// undo-failed so the timer leaves it alone.
 pub fn undo_cut(session_dir: &Path, cut_id: &str) -> Result<SessionManifest, String> {
+    check_id(cut_id)?;
     let _g = edit_lock();
     let cut = session::read_cuts(session_dir)
         .into_iter()
@@ -561,19 +631,37 @@ pub fn undo_cut(session_dir: &Path, cut_id: &str) -> Result<SessionManifest, Str
         .filter(|c| c.state == CutState::Pending)
         .ok_or(UNDO_EXPIRED_ERR)?;
     let trash = trash_dir(session_dir, cut_id);
+    if trash.join(JOURNAL_FILE).exists() {
+        return Err(FINALIZING_ERR.to_string());
+    }
     let pf: PlanFile = read_json(&trash.join(PLAN_FILE)).ok_or(UNDO_EXPIRED_ERR)?;
+    let original = load_manifest(session_dir)?;
 
-    let mut m = load_manifest(session_dir)?;
-    restore_parked(session_dir, &trash, &pf, &mut m)?;
+    let fail = |e: String| -> String {
+        let note = serde_json::json!({ "error": e, "at_epoch_ms": session::now_epoch_ms() });
+        let _ = write_json_atomic(&trash.join(UNDO_FAILED_FILE), &note);
+        log_edit(session_dir, &format!("{}: undo failed and was rolled back: {}", cut_id, e));
+        format!("Could not undo that delete: {}", e)
+    };
+
+    let moved = unpark(session_dir, &trash, &pf).map_err(fail)?;
+    let mut m = original.clone();
+    restore_records(&pf, &mut m);
     m.cuts.retain(|c| c.id != cut_id);
-    session::write_manifest(session_dir, &m)?;
-    session::append_cut(
-        session_dir,
-        &Cut {
-            state: CutState::Undone,
-            ..cut
-        },
-    )?;
+    if let Err(e) = session::write_manifest(session_dir, &m) {
+        repark(&moved);
+        return Err(fail(e));
+    }
+    let undone = Cut {
+        state: CutState::Undone,
+        ..cut
+    };
+    if let Err(e) = session::append_cut(session_dir, &undone) {
+        let _ = session::write_manifest(session_dir, &original);
+        repark(&moved);
+        return Err(fail(e));
+    }
+    // Leftovers are harmless: recovery removes the trash of an Undone cut.
     let _ = std::fs::remove_dir_all(&trash);
     session::read_manifest(session_dir)
 }
@@ -582,7 +670,8 @@ pub fn undo_cut(session_dir: &Path, cut_id: &str) -> Result<SessionManifest, Str
 // finalize
 // ---------------------------------------------------------------------------
 
-/// Finalize every `Pending` cut now, undo window or not.
+/// Finalize every `Pending` cut now, undo window or not, including one whose
+/// undo failed. This is the explicit "free the disk now".
 pub fn finalize_cuts(session_dir: &Path) -> Result<SessionManifest, String> {
     let _g = edit_lock();
     finalize_where(session_dir, |_| true)
@@ -590,11 +679,19 @@ pub fn finalize_cuts(session_dir: &Path) -> Result<SessionManifest, String> {
 
 /// Finalize the `Pending` cuts whose undo window has passed. This is what the
 /// scheduled task runs, so a timer from one delete never cuts short the undo
-/// window of a later one.
+/// window of a later one. A cut whose undo failed is left alone.
 pub fn finalize_due_cuts(session_dir: &Path) -> Result<SessionManifest, String> {
+    finalize_due_cuts_at(session_dir, session::now_epoch_ms())
+}
+
+/// `finalize_due_cuts` as if the clock read `now_ms`.
+pub fn finalize_due_cuts_at(session_dir: &Path, now_ms: i64) -> Result<SessionManifest, String> {
     let _g = edit_lock();
-    let now = session::now_epoch_ms();
-    finalize_where(session_dir, |c| now - c.created_epoch_ms >= UNDO_WINDOW_MS)
+    finalize_where(session_dir, |c| is_due(session_dir, c, now_ms))
+}
+
+fn is_due(session_dir: &Path, c: &Cut, now_ms: i64) -> bool {
+    now_ms - c.created_epoch_ms >= UNDO_WINDOW_MS && !undo_failed(&trash_dir(session_dir, &c.id))
 }
 
 fn finalize_where(session_dir: &Path, due: impl Fn(&Cut) -> bool) -> Result<SessionManifest, String> {
@@ -615,8 +712,8 @@ fn finalize_where(session_dir: &Path, due: impl Fn(&Cut) -> bool) -> Result<Sess
 fn finalize_one(session_dir: &Path, cut: &Cut, ffmpeg: &str, ffprobe: &str) -> Result<(), String> {
     let trash = trash_dir(session_dir, &cut.id);
 
-    // A crash after the journal was written: every kept piece already exists, so
-    // roll forward.
+    // A crash after the journal was written: every kept piece already exists
+    // (as `*.cut.tmp`), so roll forward.
     if let Some(j) = read_json::<Journal>(&trash.join(JOURNAL_FILE)) {
         return apply_journal(session_dir, cut, &j);
     }
@@ -694,16 +791,20 @@ fn finalize_one(session_dir: &Path, cut: &Cut, ffmpeg: &str, ffprobe: &str) -> R
     }
     journal.freed_bytes = freed;
 
-    std::fs::create_dir_all(&trash).map_err(|e| format!("{}: {}", trash.display(), e))?;
-    if let Err(e) = write_json_atomic(&trash.join(JOURNAL_FILE), &journal) {
-        // Nothing references the new pieces yet; drop them and try again later.
+    let written = std::fs::create_dir_all(&trash)
+        .map_err(|e| format!("{}: {}", trash.display(), e))
+        .and_then(|_| write_json_atomic(&trash.join(JOURNAL_FILE), &journal));
+    if let Err(e) = written {
+        // The pieces are still `*.cut.tmp` and nothing names them; drop them
+        // and try again later.
         for r in &journal.replace {
             for p in &r.pieces {
-                let _ = std::fs::remove_file(session_dir.join(&r.dir).join(&p.file));
+                let _ = std::fs::remove_file(tmp_path(&session_dir.join(&r.dir), &p.file));
             }
         }
         return Err(e);
     }
+    crash_point(&trash, "after-journal")?;
     apply_journal(session_dir, cut, &journal)
 }
 
@@ -711,7 +812,37 @@ fn finalize_one(session_dir: &Path, cut: &Cut, ffmpeg: &str, ffprobe: &str) -> R
 /// the trash dir. Idempotent, so recovery can replay it any number of times.
 fn apply_journal(session_dir: &Path, cut: &Cut, j: &Journal) -> Result<(), String> {
     let mut m = load_manifest(session_dir)?;
-    for r in j.replace.iter().filter(|r| !r.sidecar) {
+
+    // Promote the pieces from `*.cut.tmp` to their real names. Only now, with
+    // the journal on disk, so a crash can never leave a piece that nothing
+    // names. A replacement whose pieces cannot all be promoted is dropped and
+    // its original kept.
+    let mut replace: Vec<&Replacement> = Vec::new();
+    for r in &j.replace {
+        let dir = session_dir.join(&r.dir);
+        let promoted = r.pieces.iter().all(|p| {
+            let tmp = tmp_path(&dir, &p.file);
+            if tmp.is_file() {
+                std::fs::rename(&tmp, dir.join(&p.file)).is_ok()
+            } else {
+                dir.join(&p.file).is_file()
+            }
+        });
+        if promoted {
+            replace.push(r);
+        } else {
+            log_edit(
+                session_dir,
+                &format!("{}: kept {}/{}: a trimmed piece went missing", cut.id, r.dir, r.original),
+            );
+            for p in r.pieces.iter().filter(|p| !referenced(&m, &r.dir, &p.file)) {
+                let _ = std::fs::remove_file(dir.join(&p.file));
+                let _ = std::fs::remove_file(tmp_path(&dir, &p.file));
+            }
+        }
+    }
+
+    for r in replace.iter().filter(|r| !r.sidecar) {
         if let Some(t) = m.tracks.iter_mut().find(|t| t.dir == r.dir) {
             t.segments
                 .retain(|s| s.file != r.original && !r.pieces.iter().any(|p| p.file == s.file));
@@ -737,7 +868,7 @@ fn apply_journal(session_dir: &Path, cut: &Cut, j: &Journal) -> Result<(), Strin
     }
     session::write_manifest(session_dir, &m)?;
 
-    for r in &j.replace {
+    for r in &replace {
         remove_if_present(session_dir, &session_dir.join(&r.dir).join(&r.original));
     }
     for (dir, file) in &j.delete {
@@ -747,8 +878,30 @@ fn apply_journal(session_dir: &Path, cut: &Cut, j: &Journal) -> Result<(), Strin
     // trash dir, which recovery just removes.
     session::append_cut(session_dir, &fin)?;
     let trash = trash_dir(session_dir, &cut.id);
+    crash_point(&trash, "before-trash-removal")?;
     if trash.exists() {
         std::fs::remove_dir_all(&trash).map_err(|e| format!("{}: {}", trash.display(), e))?;
+    }
+    Ok(())
+}
+
+/// Does the manifest list `file` in the track stored in `dir`?
+fn referenced(m: &SessionManifest, dir: &str, file: &str) -> bool {
+    m.tracks
+        .iter()
+        .any(|t| t.dir == dir && t.segments.iter().any(|s| s.file == file))
+}
+
+/// Where a kept piece lives until its finalize commits.
+fn tmp_path(track_dir: &Path, file: &str) -> PathBuf {
+    track_dir.join(format!("{}{}", file, TMP_SUFFIX))
+}
+
+/// Test hook: a file named `crash-<point>` in a cut's trash folder stops the
+/// finalize at that point, as a crash would. Debug builds only.
+fn crash_point(trash: &Path, point: &str) -> Result<(), String> {
+    if cfg!(debug_assertions) && trash.join(format!("crash-{}", point)).exists() {
+        return Err(format!("simulated crash at {}", point));
     }
     Ok(())
 }
@@ -769,10 +922,12 @@ fn piece_name(track_dir: &Path, epoch_ms: i64, ext: &str, taken: &[String]) -> S
     use chrono::TimeZone;
     let base = chrono::Local
         .timestamp_millis_opt(epoch_ms.div_euclid(1000) * 1000)
-        .single()
+        .earliest()
         .map(|t| t.format(session::SEGMENT_STRFTIME).to_string())
         .unwrap_or_else(|| epoch_ms.to_string());
-    let free = |n: &str| !taken.iter().any(|t| t == n) && !track_dir.join(n).exists();
+    let free = |n: &str| {
+        !taken.iter().any(|t| t == n) && !track_dir.join(n).exists() && !tmp_path(track_dir, n).exists()
+    };
     let first = format!("{}.{}", base, ext);
     if free(&first) {
         return first;
@@ -842,9 +997,11 @@ fn secs(ms: i64) -> String {
     format!("{:.3}", ms as f64 / 1000.0)
 }
 
-/// Write the kept piece(s) of one partly-covered segment next to it, by stream
-/// copy. On any failure every piece made so far is removed and the original is
-/// left exactly as it was.
+/// Write the kept piece(s) of one partly-covered segment next to it as
+/// `*.cut.tmp`, by stream copy, and check each against what was planned. On any
+/// failure every piece made so far is removed and the original is left exactly
+/// as it was. The returned records carry the final names `apply_journal`
+/// promotes them to.
 #[allow(clippy::too_many_arguments)]
 fn cut_pieces(
     track_dir: &Path,
@@ -878,9 +1035,16 @@ fn cut_pieces(
         .collect();
 
     let mut made: Vec<Segment> = Vec::new();
-    let mut make = |start: i64, args_before: Vec<String>, args_after: Vec<String>| -> Result<(), String> {
+    // What a piece must be to replace footage: never take ffmpeg's word for it.
+    enum Check {
+        /// Runs at least this long, less 100 ms (a head stops at the cut).
+        AtLeast(i64),
+        /// Ends within 250 ms of this instant (a tail runs to the original's end).
+        EndsAt(i64),
+    }
+    let mut make = |start: i64, args_before: Vec<String>, args_after: Vec<String>, check: Check| -> Result<(), String> {
         let name = piece_name(track_dir, start, &ext, &taken);
-        let tmp = track_dir.join(format!("{}{}", name, TMP_SUFFIX));
+        let tmp = tmp_path(track_dir, &name);
         let mut args: Vec<std::ffi::OsString> = args_before.into_iter().map(Into::into).collect();
         args.push("-i".into());
         args.push(src.clone().into_os_string());
@@ -891,16 +1055,22 @@ fn cut_pieces(
         let refs: Vec<&std::ffi::OsStr> = args.iter().map(|a| a.as_os_str()).collect();
         let res = run_ffmpeg(ffmpeg, &refs)
             .and_then(|_| session::probe_segment(ffprobe, &tmp))
-            .and_then(|p| {
-                std::fs::rename(&tmp, track_dir.join(&name))
-                    .map(|_| p)
-                    .map_err(|e| format!("rename {}: {}", name, e))
+            .and_then(|p| match check {
+                Check::AtLeast(len) if p.duration_ms < len - 100 => Err(format!(
+                    "head piece runs {} ms, planned {} ms",
+                    p.duration_ms, len
+                )),
+                Check::EndsAt(end) if (start + p.duration_ms - end).abs() > 250 => Err(format!(
+                    "tail piece ends {} ms from the original's end",
+                    start + p.duration_ms - end
+                )),
+                _ => Ok(p),
             });
         match res {
             Ok(p) => {
                 taken.push(name.clone());
                 made.push(Segment {
-                    bytes: file_len(&track_dir.join(&name)),
+                    bytes: file_len(&tmp),
                     file: name,
                     start_epoch_ms: start,
                     duration_ms: p.duration_ms,
@@ -917,7 +1087,7 @@ fn cut_pieces(
     let result = (|| -> Result<(), String> {
         if head {
             let len = cut.from_epoch_ms - seg.start_epoch_ms;
-            make(seg.start_epoch_ms, vec![], vec!["-t".into(), secs(len)])?;
+            make(seg.start_epoch_ms, vec![], vec!["-t".into(), secs(len)], Check::AtLeast(len))?;
         }
         if tail {
             let off_ms = cut.to_epoch_ms - seg.start_epoch_ms;
@@ -939,6 +1109,7 @@ fn cut_pieces(
                 seg.start_epoch_ms + kf_ms,
                 vec!["-ss".into(), format!("{:.4}", kf_ms as f64 / 1000.0 + 0.0005)],
                 vec!["-avoid_negative_ts".into(), "make_zero".into()],
+                Check::EndsAt(seg.start_epoch_ms + seg.duration_ms),
             )?;
         }
         Ok(())
@@ -948,7 +1119,7 @@ fn cut_pieces(
         Ok(()) => Ok(made),
         Err(e) => {
             for p in &made {
-                let _ = std::fs::remove_file(track_dir.join(&p.file));
+                let _ = std::fs::remove_file(tmp_path(track_dir, &p.file));
             }
             Err(e)
         }
@@ -1046,7 +1217,10 @@ pub fn purge_session(root: &Path, id: &str, token: i64) -> Result<bool, String> 
 /// every session finish or roll back interrupted cuts and finalize `Pending`
 /// ones whose undo window has passed. Undo is only promised while the app stays
 /// open. Run on a background thread at start, before anything records.
-pub fn recover_sessions(root: &Path) {
+///
+/// Returns the sessions holding `Pending` cuts still inside their undo window;
+/// the caller runs `finalize_due_cuts` on them `FINALIZE_AFTER_MS` later.
+pub fn recover_sessions(root: &Path) -> Vec<PathBuf> {
     let _g = edit_lock();
     if let Ok(rd) = std::fs::read_dir(root.join(TRASH_DIR)) {
         for e in rd.flatten() {
@@ -1056,24 +1230,29 @@ pub fn recover_sessions(root: &Path) {
         }
     }
     let Ok(rd) = std::fs::read_dir(root) else {
-        return;
+        return Vec::new();
     };
+    let mut later = Vec::new();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         if name.starts_with('.') || !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue;
         }
         let dir = e.path();
-        if let Err(err) = recover_session(&dir) {
-            log_edit(&dir, &format!("recovery failed: {}", err));
+        match recover_session(&dir) {
+            Ok(true) => later.push(dir),
+            Ok(false) => {}
+            Err(err) => log_edit(&dir, &format!("recovery failed: {}", err)),
         }
     }
+    later
 }
 
-fn recover_session(session_dir: &Path) -> Result<(), String> {
+/// Whether `session_dir` still holds young `Pending` cuts afterwards.
+fn recover_session(session_dir: &Path) -> Result<bool, String> {
     let trash_root = session_dir.join(TRASH_DIR);
     if !trash_root.is_dir() && !session_dir.join(session::CUTS_FILE).is_file() {
-        return Ok(());
+        return Ok(false);
     }
     let cuts = session::read_cuts(session_dir);
 
@@ -1086,30 +1265,84 @@ fn recover_session(session_dir: &Path) -> Result<(), String> {
                 None => {
                     if let Some(pf) = read_json::<PlanFile>(&trash.join(PLAN_FILE)) {
                         let mut m = load_manifest(session_dir)?;
-                        restore_parked(session_dir, &trash, &pf, &mut m)?;
+                        unpark(session_dir, &trash, &pf)?;
+                        restore_records(&pf, &mut m);
                         m.cuts.retain(|c| c.id != cut_id);
                         session::write_manifest(session_dir, &m)?;
                     }
                     let _ = std::fs::remove_dir_all(&trash);
                     log_edit(session_dir, &format!("{}: rolled back an uncommitted delete", cut_id));
                 }
-                Some(c) if c.state == CutState::Final => {
-                    if let Some(j) = read_json::<Journal>(&trash.join(JOURNAL_FILE)) {
-                        apply_journal(session_dir, c, &j)?;
-                    }
-                    let _ = std::fs::remove_dir_all(&trash);
-                }
+                Some(c) if c.state == CutState::Final => clear_final_trash(session_dir, &trash)?,
                 // Undo moves everything back before it appends Undone.
                 Some(c) if c.state == CutState::Undone => {
                     let _ = std::fs::remove_dir_all(&trash);
                 }
-                Some(_) => {} // Pending: finalized below.
+                // Pending with a journal: the finalize had committed its pieces,
+                // so roll it forward whatever the cut's age.
+                Some(c) => {
+                    if let Some(j) = read_json::<Journal>(&trash.join(JOURNAL_FILE)) {
+                        apply_journal(session_dir, c, &j)?;
+                    }
+                }
             }
         }
     }
 
     let now = session::now_epoch_ms();
-    finalize_where(session_dir, |c| now - c.created_epoch_ms >= UNDO_WINDOW_MS).map(|_| ())
+    finalize_where(session_dir, |c| is_due(session_dir, c, now))?;
+    sweep_tmp(session_dir);
+
+    Ok(session::read_cuts(session_dir).iter().any(|c| {
+        c.state == CutState::Pending
+            && now - c.created_epoch_ms < UNDO_WINDOW_MS
+            && !undo_failed(&trash_dir(session_dir, &c.id))
+    }))
+}
+
+/// A `Final` cut whose trash folder survived a crash. Final means the manifest
+/// was already written, so the manifest is never touched here: only originals
+/// the journal replaced (and files it deleted) that the manifest no longer
+/// references are removed, then the folder.
+fn clear_final_trash(session_dir: &Path, trash: &Path) -> Result<(), String> {
+    if let Some(j) = read_json::<Journal>(&trash.join(JOURNAL_FILE)) {
+        let m = load_manifest(session_dir)?;
+        for r in &j.replace {
+            let dir = session_dir.join(&r.dir);
+            let pieces_home = r.pieces.iter().all(|p| dir.join(&p.file).is_file());
+            if pieces_home && !referenced(&m, &r.dir, &r.original) {
+                remove_if_present(session_dir, &dir.join(&r.original));
+            }
+        }
+        for (dir, file) in &j.delete {
+            if !referenced(&m, dir, file) {
+                remove_if_present(session_dir, &session_dir.join(dir).join(file));
+            }
+        }
+    }
+    std::fs::remove_dir_all(trash).map_err(|e| format!("{}: {}", trash.display(), e))
+}
+
+/// Remove every `*.cut.tmp` left in the session's media folders. Only safe when
+/// no finalize is running, i.e. under the edit lock with every journal applied.
+fn sweep_tmp(session_dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(session_dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(e.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            if f.file_name().to_string_lossy().ends_with(TMP_SUFFIX) {
+                remove_if_present(session_dir, &f.path());
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,7 +1438,8 @@ mod tests {
         let p = plan_cut(&m, 3_000, 20_000, None).unwrap();
         let tc = &p.tracks[0];
         assert_eq!(files(&tc.trim_head), vec!["a.mp4"]); // keeps 0 → 3s
-        assert_eq!(files(&tc.remove), vec!["b.mp4"]); // 2.5 → 16.5: head 0.5s < 1s
+        // b: 2.5 → 16.5 has only 0.5s outside the cut: left whole, masked.
+        assert!(tc.remove.is_empty() && tc.split.is_empty());
         assert_eq!(files(&tc.trim_tail), vec!["c.mp4"]);
         // A cut entirely inside the hole touches nothing but is still a valid cut.
         let p = plan_cut(&m, 33_000, 39_000, None).unwrap();
@@ -1239,15 +1473,18 @@ mod tests {
     }
 
     #[test]
-    fn kept_piece_under_a_second_becomes_a_remove() {
+    fn kept_piece_under_a_second_leaves_the_segment_whole() {
         let m = manifest(vec![uniform("screen-0", 3, 60_000)]);
-        // keeps 0.5s of segment 0 and 0.4s of segment 2
+        // 0.5s of segment 0 and 0.4s of segment 2 lie outside: both stay whole,
+        // only segment 1 goes.
         let p = plan_cut(&m, 500, 179_600, None).unwrap();
-        assert_eq!(p.tracks[0].remove.len(), 3);
-        // a split whose tail is under a second is a head trim
+        let t = &p.tracks[0];
+        assert_eq!(files(&t.remove), vec!["screen-0-1.mp4"]);
+        assert!(t.trim_head.is_empty() && t.trim_tail.is_empty() && t.split.is_empty());
+        // A split whose tail is under a second is not turned into a head trim
+        // (that would lose the 0.5s): the segment stays whole.
         let p = plan_cut(&m, 10_000, 59_500, None).unwrap();
-        assert_eq!(files(&p.tracks[0].trim_head), vec!["screen-0-0.mp4"]);
-        assert!(p.tracks[0].split.is_empty());
+        assert!(p.tracks.is_empty());
     }
 
     #[test]
@@ -1267,10 +1504,25 @@ mod tests {
     }
 
     #[test]
-    fn ids_that_escape_the_root_are_refused() {
+    fn ids_are_an_allowlist() {
         assert!(check_id("2026-07-27_11-56-40").is_ok());
-        for bad in ["", ".trash", "../x", "a/b", "a\\b", "C:x"] {
-            assert!(check_id(bad).is_err(), "{}", bad);
+        assert!(check_id("cut-1760100000000").is_ok());
+        for bad in ["", ".trash", "x.", "x ", "..\\y", "../x", "a/b", "a\\b", "C:x", "é"] {
+            assert!(check_id(bad).is_err(), "{:?}", bad);
+        }
+    }
+
+    /// The gate every edit command passes (`commands::editable_session`).
+    #[test]
+    fn edit_commands_refuse_bad_ids_and_busy_sessions() {
+        let root = Path::new("root");
+        let id = "2026-07-27_11-56-40";
+        assert_eq!(editable_dir(root, None, None, id).unwrap(), root.join(id));
+        assert_eq!(editable_dir(root, Some("other"), Some("other2"), id).unwrap(), root.join(id));
+        assert_eq!(editable_dir(root, Some(id), None, id).unwrap_err(), LIVE_SESSION_ERR);
+        assert_eq!(editable_dir(root, None, Some(id), id).unwrap_err(), STOPPING_SESSION_ERR);
+        for bad in ["x.", "x ", "..\\y"] {
+            assert!(editable_dir(root, None, None, bad).is_err(), "{:?}", bad);
         }
     }
 }

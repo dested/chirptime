@@ -55,6 +55,11 @@ fn templates() -> &'static PathBuf {
             "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000", "-t", "60",
             "-ac", "1", "-c:a", "pcm_s16le", "-f", "wav", &p("mic16k.wav"),
         ]);
+        // A damaged segment: the manifest will claim 10s, the file holds 6s.
+        ffmpeg(&[
+            "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=30", "-t", "6",
+            "-c:v", "libx264", "-g", "60", "-pix_fmt", "yuv420p", "-f", "mp4", &p("short.mp4"),
+        ]);
         dir
     })
 }
@@ -335,12 +340,13 @@ fn a_crash_before_finalize_is_finished_by_startup_recovery() {
     let r = edit::delete_range(&dir, from, to, None).unwrap();
 
     // The app dies here: no finalize ever runs. Recovery only takes cuts whose
-    // undo window has passed, so first it must leave this one alone.
-    edit::recover_sessions(&root);
+    // undo window has passed, so first it must leave this one alone, and hand the
+    // session back for a finalize once the window closes.
+    assert_eq!(edit::recover_sessions(&root), vec![dir.clone()]);
     assert_eq!(session::read_cuts(&dir)[0].state, CutState::Pending);
 
     std::thread::sleep(std::time::Duration::from_millis(edit::UNDO_WINDOW_MS as u64 + 300));
-    edit::recover_sessions(&root);
+    assert!(edit::recover_sessions(&root).is_empty());
 
     let m = session::read_manifest(&dir).unwrap();
     assert_eq!(m.cuts.len(), 1);
@@ -372,4 +378,191 @@ fn whole_session_delete_undo_and_purge() {
     assert!(!listed(&root));
     assert!(!root.join(".trash").join(ID).exists());
     assert_eq!(edit::undo_delete_session(&root, ID).unwrap_err(), edit::UNDO_EXPIRED_ERR);
+}
+
+fn tmp_files(dir: &Path) -> Vec<String> {
+    ["screen-0", "mic", "mic-16k"]
+        .iter()
+        .flat_map(|d| files_in(&dir.join(d)).into_iter().map(move |f| format!("{}/{}", d, f)))
+        .filter(|f| f.ends_with(".cut.tmp"))
+        .collect()
+}
+
+#[test]
+fn a_crash_mid_finalize_is_replayed_by_recovery() {
+    let (root, dir) = build_session("crash-mid");
+    let (from, to) = cut_range();
+    let before = session::read_manifest(&dir).unwrap();
+    let r = edit::delete_range(&dir, from, to, None).unwrap();
+    let trash = dir.join(".trash").join(&r.cut.id);
+    std::fs::write(trash.join("crash-after-journal"), b"").unwrap();
+
+    // The pieces exist and the journal is written; then the app "dies".
+    assert!(edit::finalize_cuts(&dir).unwrap_err().contains("simulated crash"));
+    assert!(trash.join("finalize.json").is_file());
+    let tmps = tmp_files(&dir);
+    assert!(tmps.len() >= 4, "pieces stay *.cut.tmp until the commit: {:?}", tmps);
+    let m = session::read_manifest(&dir).unwrap();
+    assert_eq!(m.cuts[0].state, CutState::Pending);
+    let seg1 = &seg_files(&before, "screen-0")[1];
+    assert!(seg_files(&m, "screen-0").contains(seg1), "originals still referenced");
+    assert!(dir.join("screen-0").join(seg1).is_file());
+    // Undo is off the table once the finalize has committed its pieces.
+    assert_eq!(edit::undo_cut(&dir, &r.cut.id).unwrap_err(), edit::FINALIZING_ERR);
+
+    std::fs::remove_file(trash.join("crash-after-journal")).unwrap();
+    // The cut is younger than the undo window, but a journaled finalize rolls forward.
+    assert!(edit::recover_sessions(&root).is_empty());
+
+    let m = session::read_manifest(&dir).unwrap();
+    assert_eq!(m.cuts[0].state, CutState::Final);
+    assert!(!trash.exists());
+    assert!(tmp_files(&dir).is_empty());
+    assert_consistent(&dir, &m);
+    assert_eq!(files_in(&dir.join("mic-16k")).len(), 2);
+}
+
+#[test]
+fn recovery_of_a_final_cut_never_touches_the_manifest() {
+    let (root, dir) = build_session("crash-final");
+    let (from, to) = cut_range();
+    let r = edit::delete_range(&dir, from, to, None).unwrap();
+    let trash = dir.join(".trash").join(&r.cut.id);
+    std::fs::write(trash.join("crash-before-trash-removal"), b"").unwrap();
+
+    assert!(edit::finalize_cuts(&dir).unwrap_err().contains("simulated crash"));
+    assert_eq!(session::read_cuts(&dir)[0].state, CutState::Final);
+    assert!(trash.join("finalize.json").is_file());
+    let manifest_bytes = std::fs::read(dir.join("session.json")).unwrap();
+
+    edit::recover_sessions(&root);
+    assert_eq!(std::fs::read(dir.join("session.json")).unwrap(), manifest_bytes);
+    assert!(!trash.exists());
+    assert_consistent(&dir, &session::read_manifest(&dir).unwrap());
+}
+
+#[test]
+fn overlapping_cuts_finalize_into_their_union() {
+    let (_root, dir) = build_session("overlap");
+    let base = base_epoch();
+    // A: t+15 → t+43, then B: t+38 → t+52 while A is still pending.
+    edit::delete_range(&dir, base + 15_000, base + 43_000, None).unwrap();
+    edit::delete_range(&dir, base + 38_000, base + 52_000, None).unwrap();
+    let m = edit::finalize_cuts(&dir).unwrap();
+
+    assert_eq!(m.cuts.len(), 2);
+    assert!(m.cuts.iter().all(|c| c.state == CutState::Final));
+    assert_consistent(&dir, &m);
+    assert!(tmp_files(&dir).is_empty());
+
+    let spans = |track: &str| -> Vec<(i64, i64)> {
+        m.tracks
+            .iter()
+            .find(|t| t.id == track)
+            .unwrap()
+            .segments
+            .iter()
+            .map(|s| (s.start_epoch_ms - base, s.start_epoch_ms + s.duration_ms - base))
+            .collect()
+    };
+    // screen-0: [0,10) [10,15) | union cut | [52 snapped back to its keyframe at 52, 60)
+    let screen = spans("screen-0");
+    assert_eq!(screen.len(), 3, "{:?}", screen);
+    assert_eq!(screen[0], (0, 10_000));
+    assert!(screen[1].0 == 10_000 && (5_000..=5_100).contains(&(screen[1].1 - 10_000)), "{:?}", screen[1]);
+    assert!((screen[2].0 - 52_000).abs() <= 50 && (screen[2].1 - 60_000).abs() <= 50, "{:?}", screen[2]);
+    // mic: [0,15) and [52,60); nothing outside the union lost.
+    let mic = spans("mic");
+    assert_eq!(mic.len(), 2, "{:?}", mic);
+    assert!(mic[0].0 == 0 && (mic[0].1 - 15_000).abs() <= 50, "{:?}", mic[0]);
+    assert!(mic[1].0 == 52_000 && (mic[1].1 - 60_000).abs() <= 50, "{:?}", mic[1]);
+    let fp = ffprobe();
+    let wav_total: i64 = files_in(&dir.join("mic-16k"))
+        .iter()
+        .map(|w| session::probe_segment(&fp, &dir.join("mic-16k").join(w)).unwrap().duration_ms)
+        .sum();
+    assert!((wav_total - 23_000).abs() <= 100, "{}", wav_total);
+}
+
+#[test]
+fn a_failed_undo_rolls_back_and_the_timer_leaves_it_alone() {
+    let (_root, dir) = build_session("undo-fail");
+    let before = hashes(&dir);
+    let (from, to) = cut_range();
+    let r = edit::delete_range(&dir, from, to, None).unwrap();
+    let after_delete = hashes(&dir);
+    let manifest_after_delete = std::fs::read(dir.join("session.json")).unwrap();
+    let trash = dir.join(".trash").join(&r.cut.id);
+
+    // Something sits where the second parked segment has to go back.
+    let blocker = dir.join("screen-0").join(name_at(base_epoch() + 30_000, "mp4"));
+    std::fs::write(&blocker, b"in the way").unwrap();
+    let err = edit::undo_cut(&dir, &r.cut.id).unwrap_err();
+    assert!(err.starts_with("Could not undo that delete"), "{}", err);
+
+    // All or nothing: the first segment went back into the trash.
+    std::fs::remove_file(&blocker).unwrap();
+    assert_eq!(hashes(&dir), after_delete);
+    assert_eq!(files_in(&trash.join("screen-0")).len(), 2);
+    assert_eq!(std::fs::read(dir.join("session.json")).unwrap(), manifest_after_delete);
+    assert_eq!(session::read_cuts(&dir)[0].state, CutState::Pending);
+    assert!(trash.join("undo-failed.json").is_file());
+    assert!(std::fs::read_to_string(dir.join("logs").join("edit.log")).unwrap().contains("undo failed"));
+
+    // The timer fires long after the window: it must do nothing to this cut.
+    edit::finalize_due_cuts_at(&dir, r.cut.created_epoch_ms + 60_000).unwrap();
+    assert_eq!(session::read_cuts(&dir)[0].state, CutState::Pending);
+    assert_eq!(hashes(&dir), after_delete, "nothing trimmed");
+    assert_eq!(files_in(&trash.join("screen-0")).len(), 2, "nothing deleted");
+
+    // A retried undo, with the way clear, restores everything.
+    edit::undo_cut(&dir, &r.cut.id).unwrap();
+    assert_eq!(hashes(&dir), before);
+    assert!(!trash.exists());
+}
+
+#[test]
+fn a_damaged_segment_keeps_its_original() {
+    let (_root, dir) = build_session("damaged");
+    let base = base_epoch();
+    // The manifest says segment 4 (t+40s) runs 10s; the file holds 6s, so its
+    // tail piece cannot end where the original should.
+    let seg4 = name_at(base + 40_000, "mp4");
+    std::fs::copy(templates().join("short.mp4"), dir.join("screen-0").join(&seg4)).unwrap();
+    let seg4_hash = hashes(&dir)[&format!("screen-0/{}", seg4)].clone();
+
+    let (from, to) = cut_range();
+    edit::delete_range(&dir, from, to, None).unwrap();
+    let m = edit::finalize_cuts(&dir).unwrap();
+
+    assert_eq!(m.cuts[0].state, CutState::Final);
+    assert!(seg_files(&m, "screen-0").contains(&seg4), "the original stays in the manifest");
+    assert_eq!(hashes(&dir)[&format!("screen-0/{}", seg4)], seg4_hash, "and on disk, untouched");
+    assert!(tmp_files(&dir).is_empty());
+    let log = std::fs::read_to_string(dir.join("logs").join("edit.log")).unwrap();
+    assert!(log.contains(&seg4) && log.contains("tail piece"), "{}", log);
+    // The good trims still happened.
+    assert_eq!(seg_files(&m, "mic").len(), 2);
+    assert!(seg_files(&m, "screen-0").len() == 4);
+}
+
+#[test]
+fn a_torn_cuts_line_does_not_swallow_the_next() {
+    let dir = std::env::temp_dir()
+        .join("chirptime-edit-cuts")
+        .join(format!("torn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("cuts.jsonl"), b"{\"id\":\"cut-1\",\"from_ep").unwrap();
+    let cut = session::Cut {
+        id: "cut-2".into(),
+        from_epoch_ms: 1,
+        to_epoch_ms: 2,
+        tracks: None,
+        created_epoch_ms: 3,
+        state: CutState::Pending,
+        freed_bytes: 0,
+    };
+    session::append_cut(&dir, &cut).unwrap();
+    assert_eq!(session::read_cuts(&dir), vec![cut]);
 }

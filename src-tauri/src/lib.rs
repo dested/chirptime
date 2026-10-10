@@ -47,7 +47,19 @@ pub fn run() {
     // Finish deletes a previous run left half done (crash recovery for
     // `edit.rs`). Nothing can be recording yet, and it never blocks startup.
     let recovery_root = recorder::sessions_root(&capture::get_output_dir(&saved.capture));
-    std::thread::spawn(move || edit::recover_sessions(&recovery_root));
+    std::thread::spawn(move || {
+        // Cuts still inside their undo window get the finalize their timer
+        // would have run.
+        let young = edit::recover_sessions(&recovery_root);
+        if !young.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(edit::FINALIZE_AFTER_MS));
+            for dir in young {
+                if let Err(e) = edit::finalize_due_cuts(&dir) {
+                    eprintln!("[chirptime] edit: finalize failed: {}", e);
+                }
+            }
+        }
+    });
 
     let app_state = Arc::new(Mutex::new(AppState::from_settings(saved)));
 

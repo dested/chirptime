@@ -820,7 +820,11 @@ pub async fn start_session(
 pub async fn stop_session(state: tauri::State<'_, State>) -> Result<SessionStatus, String> {
     let recorder = {
         let mut s = state.lock().await;
-        s.recorder.take()
+        let rec = s.recorder.take();
+        // Until `stop()` returns, its final flush can still overwrite the
+        // manifest; the edit commands refuse this id meanwhile.
+        s.stopping_id = rec.as_ref().map(|r| r.manifest().id);
+        rec
     };
     let Some(recorder) = recorder else {
         return Err("No session is recording".to_string());
@@ -829,9 +833,9 @@ pub async fn stop_session(state: tauri::State<'_, State>) -> Result<SessionStatu
     // `stop` joins the supervisor threads and can take several seconds waiting on
     // graceful ffmpeg shutdowns — never block the async runtime on that.
     let rec = recorder.clone();
-    tokio::task::spawn_blocking(move || rec.stop())
-        .await
-        .map_err(|e| format!("stop panicked: {}", e))?;
+    let stopped = tokio::task::spawn_blocking(move || rec.stop()).await;
+    state.lock().await.stopping_id = None;
+    stopped.map_err(|e| format!("stop panicked: {}", e))?;
 
     Ok(SessionStatus::from_recorder(&recorder))
 }
@@ -912,40 +916,33 @@ pub async fn rebuild_session(
     state: tauri::State<'_, State>,
     id: String,
 ) -> Result<crate::session::SessionManifest, String> {
+    crate::edit::check_id(&id)?;
     let dir = {
         let s = state.lock().await;
-        if let Some(rec) = &s.recorder {
-            if rec.manifest().id == id && !rec.is_stopping() {
-                return Err("Cannot rebuild a session that is still recording".to_string());
-            }
+        let recording = s
+            .recorder
+            .as_ref()
+            .is_some_and(|rec| rec.manifest().id == id && !rec.is_stopping());
+        if recording || s.stopping_id.as_deref() == Some(id.as_str()) {
+            return Err("Cannot rebuild a session that is still recording".to_string());
         }
         sessions_root_for(&s.config).join(&id)
     };
-    tokio::task::spawn_blocking(move || {
-        let m = crate::session::rebuild_manifest_from_disk(&dir)?;
-        crate::session::write_manifest(&dir, &m)?;
-        Ok(m)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    // Under the edit lock, so a rebuild never interleaves with a delete or finalize.
+    blocking(move || crate::edit::rebuild_session(&dir)).await
 }
 
 // ---------------------------------------------------------------------------
 // Deleting time (see edit.rs)
 // ---------------------------------------------------------------------------
 
-/// The sessions root, and `id`'s directory under it, refusing the session that
-/// is recording.
+/// The sessions root, and `id`'s directory under it, through `edit::editable_dir`:
+/// a valid id, and neither the session recording nor the one still stopping.
 async fn editable_session(state: &State, id: &str) -> Result<(PathBuf, PathBuf), String> {
-    crate::edit::check_id(id)?;
     let s = state.lock().await;
-    if let Some(rec) = &s.recorder {
-        if rec.manifest().id == id {
-            return Err(crate::edit::LIVE_SESSION_ERR.to_string());
-        }
-    }
+    let recording = s.recorder.as_ref().map(|rec| rec.manifest().id);
     let root = sessions_root_for(&s.config);
-    let dir = root.join(id);
+    let dir = crate::edit::editable_dir(&root, recording.as_deref(), s.stopping_id.as_deref(), id)?;
     Ok((root, dir))
 }
 
@@ -989,6 +986,7 @@ pub async fn undo_cut(
     id: String,
     cut_id: String,
 ) -> Result<crate::session::SessionManifest, String> {
+    crate::edit::check_id(&cut_id)?;
     let (_, dir) = editable_session(state.inner(), &id).await?;
     blocking(move || crate::edit::undo_cut(&dir, &cut_id)).await
 }
