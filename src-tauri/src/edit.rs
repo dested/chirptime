@@ -281,17 +281,28 @@ pub fn check_id(id: &str) -> Result<(), String> {
     }
 }
 
+/// What the edit gate knows about the recorder still held in app state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecorderPhase {
+    /// Capturing: its supervisors still write segments and the manifest.
+    Recording,
+    /// It stopped itself (disk full, a fatal error) and its `stop()` has since
+    /// returned, so nothing is left to flush or write.
+    StoppedItself,
+}
+
 /// The gate every edit command passes before touching a session: a valid id,
-/// and neither the session that is recording nor the one whose recorder is
-/// still stopping (its last flush would overwrite the manifest).
+/// and neither the session that is recording nor one whose `stop()` is still
+/// running (its last flush would overwrite the manifest). A recorder that
+/// stopped itself and finished stopping does not block its session.
 pub fn editable_dir(
     root: &Path,
-    recording: Option<&str>,
+    recorder: Option<(&str, RecorderPhase)>,
     stopping: Option<&str>,
     id: &str,
 ) -> Result<PathBuf, String> {
     check_id(id)?;
-    if recording == Some(id) {
+    if recorder == Some((id, RecorderPhase::Recording)) {
         return Err(LIVE_SESSION_ERR.to_string());
     }
     if stopping == Some(id) {
@@ -1517,12 +1528,25 @@ mod tests {
     fn edit_commands_refuse_bad_ids_and_busy_sessions() {
         let root = Path::new("root");
         let id = "2026-07-27_11-56-40";
+        let rec = |id| Some((id, RecorderPhase::Recording));
         assert_eq!(editable_dir(root, None, None, id).unwrap(), root.join(id));
-        assert_eq!(editable_dir(root, Some("other"), Some("other2"), id).unwrap(), root.join(id));
-        assert_eq!(editable_dir(root, Some(id), None, id).unwrap_err(), LIVE_SESSION_ERR);
+        assert_eq!(editable_dir(root, rec("other"), Some("other2"), id).unwrap(), root.join(id));
+        assert_eq!(editable_dir(root, rec(id), None, id).unwrap_err(), LIVE_SESSION_ERR);
         assert_eq!(editable_dir(root, None, Some(id), id).unwrap_err(), STOPPING_SESSION_ERR);
         for bad in ["x.", "x ", "..\\y"] {
             assert!(editable_dir(root, None, None, bad).is_err(), "{:?}", bad);
         }
+    }
+
+    /// A recorder that stopped itself stays in app state. While the command is
+    /// finishing its `stop()` the session is refused; once that returns, it is
+    /// editable even though the recorder is still held.
+    #[test]
+    fn a_self_stopped_session_is_editable_once_it_finished_stopping() {
+        let root = Path::new("root");
+        let id = "2026-07-27_11-56-40";
+        let stopped = Some((id, RecorderPhase::StoppedItself));
+        assert_eq!(editable_dir(root, stopped, Some(id), id).unwrap_err(), STOPPING_SESSION_ERR);
+        assert_eq!(editable_dir(root, stopped, None, id).unwrap(), root.join(id));
     }
 }

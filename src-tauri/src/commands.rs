@@ -919,18 +919,16 @@ pub async fn rebuild_session(
     state: tauri::State<'_, State>,
     id: String,
 ) -> Result<crate::session::SessionManifest, String> {
-    crate::edit::check_id(&id)?;
-    let dir = {
-        let s = state.lock().await;
-        let recording = s
-            .recorder
-            .as_ref()
-            .is_some_and(|rec| rec.manifest().id == id && !rec.is_stopping());
-        if recording || s.stopping_id.as_deref() == Some(id.as_str()) {
-            return Err("Cannot rebuild a session that is still recording".to_string());
-        }
-        sessions_root_for(&s.config).join(&id)
-    };
+    // The same gate as the edits: a self-stopped recorder is finished first, so
+    // its last flush can never land on top of the rebuilt manifest.
+    let (_, dir) = editable_session(state.inner(), &id)
+        .await
+        .map_err(|e| match e.as_str() {
+            crate::edit::LIVE_SESSION_ERR => {
+                "Cannot rebuild a session that is still recording".to_string()
+            }
+            _ => e,
+        })?;
     // Under the edit lock, so a rebuild never interleaves with a delete or finalize.
     blocking(move || crate::edit::rebuild_session(&dir)).await
 }
@@ -942,11 +940,54 @@ pub async fn rebuild_session(
 /// The sessions root, and `id`'s directory under it, through `edit::editable_dir`:
 /// a valid id, and neither the session recording nor the one still stopping.
 async fn editable_session(state: &State, id: &str) -> Result<(PathBuf, PathBuf), String> {
+    crate::edit::check_id(id)?;
+    finish_self_stop(state, id).await?;
     let s = state.lock().await;
-    let recording = s.recorder.as_ref().map(|rec| rec.manifest().id);
+    let held = s.recorder.as_ref().map(|rec| {
+        let phase = if rec.is_stopping() {
+            crate::edit::RecorderPhase::StoppedItself
+        } else {
+            crate::edit::RecorderPhase::Recording
+        };
+        (rec.manifest().id, phase)
+    });
     let root = sessions_root_for(&s.config);
-    let dir = crate::edit::editable_dir(&root, recording.as_deref(), s.stopping_id.as_deref(), id)?;
+    let dir = crate::edit::editable_dir(
+        &root,
+        held.as_ref().map(|(rid, phase)| (rid.as_str(), *phase)),
+        s.stopping_id.as_deref(),
+        id,
+    )?;
     Ok((root, dir))
+}
+
+/// A recorder that stopped itself (disk full, a fatal error) stays in state with
+/// its `stop()` never run, and that final flush would overwrite any edit. Run it
+/// now, marked as stopping meanwhile; `stop()` is idempotent, so a later
+/// `stop_session` only reads the result. The recorder stays in state so its
+/// error is still reported.
+async fn finish_self_stop(state: &State, id: &str) -> Result<(), String> {
+    let rec = {
+        let mut s = state.lock().await;
+        match &s.recorder {
+            Some(rec)
+                if rec.is_stopping()
+                    && s.stopping_id.as_deref() != Some(id)
+                    && rec.manifest().id == id =>
+            {
+                let rec = rec.clone();
+                s.stopping_id = Some(id.to_string());
+                rec
+            }
+            _ => return Ok(()),
+        }
+    };
+    let done = tokio::task::spawn_blocking(move || {
+        rec.stop();
+    })
+    .await;
+    state.lock().await.stopping_id = None;
+    done.map_err(|e| format!("stop panicked: {}", e))
 }
 
 async fn blocking<T: Send + 'static>(
