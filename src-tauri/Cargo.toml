@@ -4,9 +4,16 @@ version = "1.0.0"
 edition = "2021"
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon: the recorder's tray (src/tray.rs).
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-fs = "2"
+# Ctrl Alt R / M / P, registered from Rust (src/hotkeys.rs). Both plugins are
+# held to the minor that runs on tauri 2.10: their next minors pull tauri 2.12,
+# which would split from @tauri-apps/api 2.10 in package.json.
+tauri-plugin-global-shortcut = "~2.3.1"
+# The one toast per screen outage (src/tray.rs).
+tauri-plugin-notification = "~2.3.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

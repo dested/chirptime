@@ -1,5 +1,7 @@
 mod capture;
 mod commands;
+// Recorder actions shared by the widget, the tray and the hotkeys (S3).
+mod controls;
 pub mod cursor;
 mod export;
 // Public so the cut / undo / finalize paths can be exercised on synthetic
@@ -9,6 +11,7 @@ pub mod edit;
 // without a window system.
 pub mod ffmpeg_install;
 mod fileserver;
+mod hotkeys;
 mod nativeui;
 // Public so the settings round-trip can be exercised without a window system.
 pub mod settings;
@@ -18,9 +21,11 @@ pub mod recorder;
 pub mod session;
 pub mod state;
 mod sysaudio;
+mod tray;
 
 use state::AppState;
 use std::sync::Arc;
+use tauri::Manager;
 use tokio::sync::Mutex;
 
 const FILE_SERVER_PORT: u16 = 9120;
@@ -63,6 +68,10 @@ pub fn run() {
         }
     });
 
+    let hotkeys = saved.hotkeys.clone();
+    let window_prefs = controls::WindowPrefs {
+        content_protected: std::sync::atomic::AtomicBool::new(saved.content_protection),
+    };
     let app_state = Arc::new(Mutex::new(AppState::from_settings(saved)));
 
     // Start file server in background
@@ -75,7 +84,47 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(hotkeys::plugin())
+        // Content protection for every window as it is created: the recorder
+        // from the config, and the app window `open_viewer` builds later.
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry>::new("chirptime-windows")
+                .on_window_ready(|w| controls::protect(w.app_handle(), &w))
+                .build(),
+        )
         .manage(app_state)
+        .manage(window_prefs)
+        .manage(hotkeys::HotkeyState::default())
+        .setup(move |app| {
+            let handle = app.handle().clone();
+            // Neither may keep the app from starting: a tray or a hotkey that
+            // fails is reported, and recording still works from the widget.
+            if let Err(e) = tray::init(&handle) {
+                eprintln!("[chirptime] tray not created: {e}");
+            }
+            hotkeys::register(&handle, &hotkeys);
+            Ok(())
+        })
+        // Closing the recorder while a session runs hides it to the tray; the
+        // recording goes on. Idle, it closes as before.
+        .on_window_event(|window, event| {
+            if window.label() != "main" {
+                return;
+            }
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let state = window.app_handle().state::<Arc<Mutex<AppState>>>();
+                // Contended means something is mid-change: keep it running.
+                let recording = state
+                    .try_lock()
+                    .map(|s| s.recorder.as_ref().is_some_and(|r| !r.is_stopping()))
+                    .unwrap_or(true);
+                if recording {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_dates,
             commands::get_date_entries,
@@ -125,6 +174,20 @@ pub fn run() {
             commands::set_marker_label,
             // Cursor track (S3, owner: widget)
             cursor::get_cursor_track,
+            // Recorder controls, tray and hotkeys (S3, owner: widget)
+            controls::get_recorder_control,
+            controls::start_recording,
+            controls::stop_recording,
+            controls::pause_session,
+            controls::resume_session,
+            controls::mark_now,
+            controls::set_live_marker_label,
+            controls::open_app,
+            controls::show_recorder_window,
+            controls::set_content_protection,
+            controls::set_discard_short_sessions,
+            hotkeys::get_hotkeys,
+            hotkeys::set_hotkeys,
             // Export composer (S5, owner: export)
             export::estimate_export,
             export::start_export,

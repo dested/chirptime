@@ -81,6 +81,9 @@ const MISSING_PROBE_EVERY: u32 = 10;
 const MOVED_ADAPTER_CONFIRMATIONS: u32 = 3;
 /// The reason on every gap left by inactivity trimming.
 const IDLE_GAP_REASON: &str = "idle — no keyboard or mouse activity";
+/// The reason on the gap a pause leaves on every track that had recorded. The
+/// Player's log matches it exactly.
+pub const PAUSED_GAP_REASON: &str = "paused";
 /// Wait this long for a graceful `q` shutdown before killing.
 const GRACEFUL_STOP_MS: u64 = 5_000;
 /// No `-progress` line for this long means the process is wedged.
@@ -1605,7 +1608,11 @@ struct Inner {
     ffmpeg: String,
     ffprobe: String,
     manifest: Mutex<SessionManifest>,
+    /// The session is ending. Never cleared.
     stop: AtomicBool,
+    /// Every worker winds down as if stopping, for a pause. Cleared by resume
+    /// once they have all exited. See [`Recorder::pause`].
+    pausing: AtomicBool,
     logs: Mutex<std::collections::HashMap<String, RingLog>>,
     warnings: Mutex<Vec<String>>,
     fatal: Mutex<Option<String>>,
@@ -1685,8 +1692,9 @@ impl Inner {
         self.stop.store(true, Ordering::SeqCst);
     }
 
+    /// Whether workers should wind down: the session is stopping, or pausing.
     fn stopping(&self) -> bool {
-        self.stop.load(Ordering::SeqCst)
+        self.stop.load(Ordering::SeqCst) || self.pausing.load(Ordering::SeqCst)
     }
 
     fn set_health(&self, outs: &[OutputState], health: TrackHealth) {
@@ -1708,6 +1716,12 @@ pub struct Recorder {
     inner: Arc<Inner>,
     joins: Mutex<Vec<JoinHandle<()>>>,
     stopped: AtomicBool,
+    /// What `start` launched, relaunched as-is by `resume`.
+    specs: Vec<TrackSpec>,
+    /// When the session was paused, while it is.
+    paused_since: Mutex<Option<i64>>,
+    /// Serialises pause, resume and stop.
+    control: Mutex<()>,
 }
 
 impl std::fmt::Debug for Recorder {
@@ -1736,8 +1750,28 @@ impl Recorder {
         self.inner.fatal.lock().unwrap().clone()
     }
 
+    /// The session is ending (asked to, or stopped itself). A pause is not
+    /// stopping: the edit gate and `start_session` read this.
     pub fn is_stopping(&self) -> bool {
-        self.inner.stopping()
+        self.inner.stop.load(Ordering::SeqCst)
+    }
+
+    /// When the session was paused, while it is.
+    pub fn paused_since(&self) -> Option<i64> {
+        *self.paused_since.lock().unwrap()
+    }
+
+    /// Each track's id, kind and status, without cloning the segment lists:
+    /// the tray reads this every second.
+    pub fn track_overview(&self) -> Vec<(String, String, TrackStatus)> {
+        self.inner
+            .manifest
+            .lock()
+            .unwrap()
+            .tracks
+            .iter()
+            .map(|t| (t.id.clone(), t.kind.clone(), t.status))
+            .collect()
     }
 
     pub fn track_log(&self, track: &str) -> Vec<String> {
@@ -1774,6 +1808,25 @@ impl Recorder {
         }
         self.inner.flush();
         Ok(marker)
+    }
+
+    /// Set the note on one of this live session's marks; empty means no note.
+    /// The recorder owns the manifest while it records, so a live note goes
+    /// through it (the sidecar's last line per instant wins on a rebuild).
+    pub fn set_marker_label(&self, epoch_ms: i64, label: &str) -> Result<session::Marker, String> {
+        let out = {
+            let mut m = self.inner.manifest.lock().unwrap();
+            let mk = m
+                .markers
+                .iter_mut()
+                .find(|mk| mk.epoch_ms == epoch_ms)
+                .ok_or("That mark is not in this session")?;
+            mk.label = label.trim().to_string();
+            mk.clone()
+        };
+        session::append_marker(&self.inner.session_dir, &out)?;
+        self.inner.flush();
+        Ok(out)
     }
 
     // -----------------------------------------------------------------------
@@ -2020,6 +2073,7 @@ impl Recorder {
             ffprobe,
             manifest: Mutex::new(manifest),
             stop: AtomicBool::new(false),
+            pausing: AtomicBool::new(false),
             logs: Mutex::new(Default::default()),
             warnings: Mutex::new(warnings),
             fatal: Mutex::new(None),
@@ -2031,78 +2085,231 @@ impl Recorder {
         });
         inner.flush();
 
-        // Spawn every supervisor as close together as possible; each records its
-        // own measured start instant, so a few ms of skew here is recovered later.
-        let mut joins = Vec::new();
-        for spec in specs {
-            let inner = inner.clone();
-            joins.push(
-                std::thread::Builder::new()
-                    .name(format!("rec-{}", spec.id))
-                    .spawn(move || supervise_track(inner, spec))
-                    .map_err(|e| format!("spawn supervisor: {}", e))?,
-            );
-        }
-
-        // Disk-space guard.
-        {
-            let inner = inner.clone();
-            joins.push(
-                std::thread::Builder::new()
-                    .name("rec-diskguard".into())
-                    .spawn(move || disk_guard(inner))
-                    .map_err(|e| format!("spawn disk guard: {}", e))?,
-            );
-        }
-
-        // Inactivity tracker — only when trimming is on.
-        if inner.drop_idle_after_ms > 0 {
-            let inner = inner.clone();
-            joins.push(
-                std::thread::Builder::new()
-                    .name("rec-idle".into())
-                    .spawn(move || idle_poll_loop(inner))
-                    .map_err(|e| format!("spawn idle tracker: {}", e))?,
-            );
-        }
+        let joins = spawn_workers(&inner, &specs, None)?;
 
         Ok(Arc::new(Recorder {
             inner,
             joins: Mutex::new(joins),
             stopped: AtomicBool::new(false),
+            specs,
+            paused_since: Mutex::new(None),
+            control: Mutex::new(()),
         }))
+    }
+
+    /// Join every worker, including supervisors spawned after `start`.
+    fn join_workers(&self) {
+        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.joins.lock().unwrap());
+        for h in handles {
+            let _ = h.join();
+        }
+        // A supervisor may have spawned another one while shutting down, so
+        // drain until the list stays empty rather than taking it once.
+        loop {
+            let extra: Vec<JoinHandle<()>> =
+                std::mem::take(&mut *self.inner.extra_joins.lock().unwrap());
+            if extra.is_empty() {
+                break;
+            }
+            for h in extra {
+                let _ = h.join();
+            }
+        }
+    }
+
+    /// Stop every track's ffmpeg (each finishes its segment, as at stop) and
+    /// the cursor sampler, keeping the session open. Returns when the pause
+    /// began. Blocking — call from `spawn_blocking`.
+    ///
+    /// Nothing is written for the pause until `resume` or `stop`, which close
+    /// it as one [`PAUSED_GAP_REASON`] gap per track that had recorded.
+    pub fn pause(&self) -> Result<i64, String> {
+        let _g = self.control.lock().unwrap();
+        if self.stopped.load(Ordering::SeqCst) || self.inner.stop.load(Ordering::SeqCst) {
+            return Err("This session has already stopped".to_string());
+        }
+        if let Some(t) = self.paused_since() {
+            return Ok(t);
+        }
+        let at = now_ms();
+        self.inner.pausing.store(true, Ordering::SeqCst);
+        self.join_workers();
+        *self.paused_since.lock().unwrap() = Some(at);
+        self.inner.flush();
+        Ok(at)
+    }
+
+    /// Restart every track into the same session. Each track that had recorded
+    /// gets one `paused` gap from where its footage (or its last gap) ended to
+    /// where its footage resumes. Blocking — call from `spawn_blocking`.
+    pub fn resume(&self) -> Result<(), String> {
+        let _g = self.control.lock().unwrap();
+        if self.stopped.load(Ordering::SeqCst) || self.inner.stop.load(Ordering::SeqCst) {
+            return Err(self
+                .fatal()
+                .unwrap_or_else(|| "This session has already stopped".to_string()));
+        }
+        if self.paused_since().is_none() {
+            return Ok(());
+        }
+        if let Some(free) = free_space_bytes(&self.inner.session_dir) {
+            if free < MIN_FREE_BYTES {
+                return Err(format!(
+                    "Only {} MB free on the recording drive. Free some space, then resume.",
+                    free / 1024 / 1024
+                ));
+            }
+        }
+        let now = now_ms();
+        let edges = {
+            let mut m = self.inner.manifest.lock().unwrap();
+            close_pause(&mut m, now)
+        };
+        self.inner.flush();
+        // Pressing Resume was input; the poller's reading is up to 2 s stale.
+        self.inner.last_input_ms.fetch_max(now, Ordering::Relaxed);
+        self.inner.pausing.store(false, Ordering::SeqCst);
+        let joins = spawn_workers(&self.inner, &self.specs, Some(&edges))?;
+        *self.joins.lock().unwrap() = joins;
+        *self.paused_since.lock().unwrap() = None;
+        Ok(())
     }
 
     /// Signal every track to finish the in-flight segment gracefully, then join.
     /// Blocking — call from `spawn_blocking`.
     pub fn stop(&self) -> SessionManifest {
+        let _g = self.control.lock().unwrap();
         if !self.stopped.swap(true, Ordering::SeqCst) {
             self.inner.stop.store(true, Ordering::SeqCst);
-            let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *self.joins.lock().unwrap());
-            for h in handles {
-                let _ = h.join();
-            }
-            // A supervisor may have spawned another one while shutting down, so
-            // drain until the list stays empty rather than taking it once.
-            loop {
-                let extra: Vec<JoinHandle<()>> =
-                    std::mem::take(&mut *self.inner.extra_joins.lock().unwrap());
-                if extra.is_empty() {
-                    break;
-                }
-                for h in extra {
-                    let _ = h.join();
-                }
-            }
+            self.join_workers();
             {
                 let mut m = self.inner.manifest.lock().unwrap();
-                m.ended_epoch_ms = Some(now_ms());
+                let now = now_ms();
+                // Stopped while paused: the pause runs to the end.
+                if self.paused_since.lock().unwrap().take().is_some() {
+                    close_pause(&mut m, now);
+                }
+                m.ended_epoch_ms = Some(now);
                 m.error = self.inner.fatal.lock().unwrap().clone();
             }
             self.inner.flush();
         }
         self.manifest()
     }
+}
+
+/// Where each recorded track's pause begins: the later of its footage's end and
+/// its last gap's end (an idle stretch or an outage that ran into the pause
+/// keeps its own name). Tracks that never recorded have no hole to describe.
+fn pause_edges(m: &SessionManifest) -> Vec<(String, i64)> {
+    m.tracks
+        .iter()
+        .filter_map(|t| {
+            let end = t.end_epoch_ms()?;
+            let gaps = t.gaps.iter().map(|g| g.to_epoch_ms).max().unwrap_or(end);
+            Some((t.id.clone(), end.max(gaps)))
+        })
+        .collect()
+}
+
+/// Write each recorded track's `paused` gap up to `now` and return the edges
+/// they start from. Pure over the manifest, for the tests.
+fn close_pause(m: &mut SessionManifest, now: i64) -> Vec<(String, i64)> {
+    let edges = pause_edges(m);
+    for (track, from) in &edges {
+        if let Some(t) = m.track_mut(track) {
+            let d = Downtime {
+                from: *from,
+                reason: PAUSED_GAP_REASON.to_string(),
+            };
+            stretch_downtime_gap(&mut t.gaps, &d, now);
+        }
+    }
+    edges
+}
+
+/// Start a run's workers: one supervisor per spec, the disk guard, the idle
+/// poller (when trimming is on) and the cursor sampler. `resumed` carries each
+/// track's pause edge on a resume.
+fn spawn_workers(
+    inner: &Arc<Inner>,
+    specs: &[TrackSpec],
+    resumed: Option<&[(String, i64)]>,
+) -> Result<Vec<JoinHandle<()>>, String> {
+    // Spawn every supervisor as close together as possible; each records its
+    // own measured start instant, so a few ms of skew here is recovered later.
+    let mut joins = Vec::new();
+    for spec in specs.iter().cloned() {
+        let inner = inner.clone();
+        let edges: Option<Vec<(String, i64)>> = resumed.map(|r| r.to_vec());
+        joins.push(
+            std::thread::Builder::new()
+                .name(format!("rec-{}", spec.id))
+                .spawn(move || match edges {
+                    None => supervise_track(inner, spec),
+                    Some(edges) => supervise_resumed(inner, spec, &edges),
+                })
+                .map_err(|e| format!("spawn supervisor: {}", e))?,
+        );
+    }
+
+    // Disk-space guard.
+    {
+        let inner = inner.clone();
+        joins.push(
+            std::thread::Builder::new()
+                .name("rec-diskguard".into())
+                .spawn(move || disk_guard(inner))
+                .map_err(|e| format!("spawn disk guard: {}", e))?,
+        );
+    }
+
+    // Inactivity tracker — only when trimming is on.
+    if inner.drop_idle_after_ms > 0 {
+        let inner = inner.clone();
+        joins.push(
+            std::thread::Builder::new()
+                .name("rec-idle".into())
+                .spawn(move || idle_poll_loop(inner))
+                .map_err(|e| format!("spawn idle tracker: {}", e))?,
+        );
+    }
+
+    // Cursor track.
+    {
+        let inner = inner.clone();
+        joins.push(
+            std::thread::Builder::new()
+                .name("rec-cursor".into())
+                .spawn(move || cursor_loop(inner))
+                .map_err(|e| format!("spawn cursor sampler: {}", e))?,
+        );
+    }
+
+    Ok(joins)
+}
+
+/// Sample the cursor every [`crate::cursor::SAMPLE_MS`] into a new run file
+/// until the session stops or pauses. A failure costs the cursor track only,
+/// and says so once.
+fn cursor_loop(inner: Arc<Inner>) {
+    let mut w = match crate::cursor::CursorWriter::create(&inner.session_dir, now_ms()) {
+        Ok(w) => w,
+        Err(e) => {
+            inner.warn(format!("cursor track not recorded: {}", e));
+            return;
+        }
+    };
+    while !inner.stopping() {
+        if let Some((x, y)) = crate::cursor::cursor_pos() {
+            if let Err(e) = w.sample(now_ms(), x, y) {
+                inner.warn(format!("cursor track stopped: {}", e));
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(crate::cursor::SAMPLE_MS));
+    }
+    let _ = w.flush();
 }
 
 fn parse_size(s: &str) -> Option<(u32, u32)> {
@@ -2721,6 +2928,26 @@ fn supervise_track(inner: Arc<Inner>, spec: TrackSpec) {
     supervise_outputs(inner, spec, outs);
 }
 
+/// [`supervise_track`] after a resume: each output that had recorded starts
+/// down, with the pause as its open downtime, so its first segment closes the
+/// `paused` gap where its content begins and no drift gap lands on top.
+fn supervise_resumed(inner: Arc<Inner>, spec: TrackSpec, edges: &[(String, i64)]) {
+    let mut outs: Vec<OutputState> = spec
+        .outputs
+        .iter()
+        .map(|o| OutputState::new(&inner.session_dir, o))
+        .collect();
+    for o in outs.iter_mut() {
+        if let Some((_, from)) = edges.iter().find(|(t, _)| *t == o.track_id) {
+            o.downtime = Some(Downtime {
+                from: *from,
+                reason: PAUSED_GAP_REASON.to_string(),
+            });
+        }
+    }
+    supervise_outputs(inner, spec, outs);
+}
+
 /// [`supervise_track`] with its outputs already built, so a microphone split
 /// out of the webcam pair keeps the open downtime and idle tail it had inside
 /// it. See [`split_pair`].
@@ -2843,9 +3070,17 @@ fn supervise_outputs(inner: Arc<Inner>, spec: TrackSpec, mut outs: Vec<OutputSta
 
     // A track still down when the session stops was down until the end.
     let now = now_ms();
+    let pausing = inner.pausing.load(Ordering::SeqCst);
     for o in outs.iter_mut() {
         if let Some(d) = o.downtime.take() {
             upsert_downtime_gap(&inner, &o.track_id, &d, now);
+        }
+        // Footage just dropped for inactivity keeps its own name, and the
+        // pause begins where it ends (`pause_edges`).
+        if pausing {
+            if let Some(t) = o.idle_tail.take() {
+                record_gap(&inner, &o.track_id, t.from, t.to, IDLE_GAP_REASON);
+            }
         }
     }
     inner.clear_health(&outs);
@@ -4053,6 +4288,12 @@ fn track_end(inner: &Arc<Inner>, track_id: &str) -> Option<i64> {
 /// starting at the same instant and each quoting raw stderr.
 fn note_downtime(inner: &Arc<Inner>, o: &mut OutputState, now: i64, reason: &str) {
     let from = match &o.downtime {
+        // The first failure after a resume ends the pause; the outage after it
+        // is a gap of its own, not more of the pause.
+        Some(d) if d.reason == PAUSED_GAP_REASON => {
+            upsert_downtime_gap(inner, &o.track_id, d, now);
+            now
+        }
         Some(d) => d.from,
         None => {
             // Footage deleted for inactivity just before the failure closes as its
@@ -5921,6 +6162,7 @@ mod tests {
             ffprobe: "unused".into(),
             manifest: Mutex::new(manifest),
             stop: AtomicBool::new(false),
+            pausing: AtomicBool::new(false),
             logs: Mutex::new(Default::default()),
             warnings: Mutex::new(Vec::new()),
             fatal: Mutex::new(None),
@@ -6009,5 +6251,90 @@ mod tests {
         place_segment(&mut t, 49_500, Some(48_000), None, None);
         assert_eq!(t.gaps.len(), 2);
         assert_eq!(t.gaps[1].reason, "track restarted");
+    }
+
+    // -- pause and resume --------------------------------------------------------
+
+    fn seg(start: i64, dur: i64) -> Segment {
+        Segment {
+            file: format!("{}.mp4", start),
+            start_epoch_ms: start,
+            duration_ms: dur,
+            bytes: 1,
+        }
+    }
+
+    #[test]
+    fn a_pause_is_one_paused_gap_per_recorded_track_from_its_last_edge() {
+        let mut m = SessionManifest::new("p".into(), 0, 60, Rect::default());
+        // Footage to 10 s, then an idle stretch that ran into the pause.
+        let mut a = new_track("screen-0", "screen", "a", None, "h264", 0, 0, 30);
+        a.segments.push(seg(0, 10_000));
+        a.gaps.push(Gap {
+            from_epoch_ms: 10_000,
+            to_epoch_ms: 70_000,
+            reason: IDLE_GAP_REASON.into(),
+        });
+        let mut b = new_track("mic", "mic", "b", None, "aac", 0, 0, 0);
+        b.segments.push(seg(0, 12_000));
+        // A camera that never opened has no hole to describe.
+        let c = new_track("webcam", "webcam", "c", None, "h264", 0, 0, 30);
+        m.tracks.extend([a, b, c]);
+
+        let edges = close_pause(&mut m, 100_000);
+        assert_eq!(edges, vec![("screen-0".to_string(), 70_000), ("mic".to_string(), 12_000)]);
+        let last = |i: usize| m.tracks[i].gaps.last().cloned();
+        let g = last(0).unwrap();
+        assert_eq!((g.from_epoch_ms, g.to_epoch_ms, g.reason.as_str()), (70_000, 100_000, PAUSED_GAP_REASON));
+        assert_eq!(m.tracks[0].gaps.len(), 2, "the idle stretch keeps its own name");
+        let g = last(1).unwrap();
+        assert_eq!((g.from_epoch_ms, g.to_epoch_ms), (12_000, 100_000));
+        assert!(m.tracks[2].gaps.is_empty());
+    }
+
+    #[test]
+    fn the_first_segment_after_resume_closes_the_paused_gap_with_no_drift_gap() {
+        let mut t = new_track("screen-0", "screen", "a", None, "h264", 0, 0, 30);
+        t.segments.push(seg(0, 12_000));
+        let d = down(12_000, PAUSED_GAP_REASON);
+        stretch_downtime_gap(&mut t.gaps, &d, 100_000);
+        // The screen's first file appears 1.2 s after Resume.
+        assert_eq!(place_segment(&mut t, 101_200, None, None, Some(&d)), 101_200);
+        assert_eq!(t.gaps.len(), 1, "{:?}", t.gaps);
+        assert_eq!((t.gaps[0].from_epoch_ms, t.gaps[0].to_epoch_ms), (12_000, 101_200));
+        assert_eq!(t.gaps[0].reason, "paused");
+    }
+
+    #[test]
+    fn a_failure_after_resume_ends_the_pause_and_opens_its_own_gap() {
+        let inner = test_inner("pausefail");
+        inner.manifest.lock().unwrap().tracks[0].segments.push(seg(0, 10_000));
+        let edges = close_pause(&mut inner.manifest.lock().unwrap(), 20_000);
+        assert_eq!(edges, vec![("screen-0".to_string(), 10_000)]);
+        let mut o = screen_out(&inner);
+        o.downtime = Some(down(10_000, PAUSED_GAP_REASON));
+        note_downtime(&inner, &mut o, 21_000, "Display was locked or asleep");
+        note_downtime(&inner, &mut o, 40_000, "Display was locked or asleep");
+        let gaps = inner.manifest.lock().unwrap().tracks[0].gaps.clone();
+        let got: Vec<(i64, i64, &str)> = gaps
+            .iter()
+            .map(|g| (g.from_epoch_ms, g.to_epoch_ms, g.reason.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(10_000, 21_000, "paused"), (21_000, 40_000, "Display was locked or asleep")]
+        );
+        let _ = std::fs::remove_dir_all(&inner.session_dir);
+    }
+
+    #[test]
+    fn pausing_winds_workers_down_without_reading_as_a_stop() {
+        let inner = test_inner("pauseflag");
+        inner.pausing.store(true, Ordering::SeqCst);
+        assert!(inner.stopping(), "every worker loop exits on a pause");
+        assert!(!inner.stop.load(Ordering::SeqCst), "the edit gate must not see a stop");
+        inner.pausing.store(false, Ordering::SeqCst);
+        assert!(!inner.stopping());
+        let _ = std::fs::remove_dir_all(&inner.session_dir);
     }
 }

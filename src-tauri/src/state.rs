@@ -105,6 +105,13 @@ pub struct AppState {
     /// `capture::find_ffmpeg` read it off disk, because they run on threads
     /// that never see this state.
     pub ffmpeg_dir: Option<String>,
+    /// Global shortcuts as saved (v2 settings). What actually registered is
+    /// `hotkeys::HotkeyState`, which is Tauri-managed.
+    pub hotkeys: crate::settings::Hotkeys,
+    /// Recorder and app windows excluded from capture (v2 settings).
+    pub content_protection: bool,
+    /// Sessions under a minute are deleted, with undo, when they stop (v2).
+    pub discard_short_sessions: bool,
 }
 
 impl AppState {
@@ -114,6 +121,9 @@ impl AppState {
             session_options: s.session,
             onboarded: s.onboarded,
             ffmpeg_dir: s.ffmpeg_dir,
+            hotkeys: s.hotkeys,
+            content_protection: s.content_protection,
+            discard_short_sessions: s.discard_short_sessions,
             ..Default::default()
         }
     }
@@ -126,6 +136,9 @@ impl AppState {
             session: self.session_options.clone(),
             onboarded: self.onboarded,
             ffmpeg_dir: self.ffmpeg_dir.clone(),
+            hotkeys: self.hotkeys.clone(),
+            content_protection: self.content_protection,
+            discard_short_sessions: self.discard_short_sessions,
         }
     }
 }

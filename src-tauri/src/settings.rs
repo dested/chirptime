@@ -22,7 +22,38 @@ pub const APP_IDENTIFIER: &str = "com.chirptime.app";
 pub const SETTINGS_FILE: &str = "settings.json";
 /// Bumped only for a change old files cannot be read through. Unknown versions
 /// are read best-effort rather than discarded.
-pub const SETTINGS_VERSION: u32 = 1;
+///
+/// - 1: capture, session, onboarded, ffmpeg_dir.
+/// - 2: hotkeys, content_protection, discard_short_sessions. A version 1 file
+///   migrates by taking their defaults; nothing it had changes meaning.
+pub const SETTINGS_VERSION: u32 = 2;
+
+/// The global shortcuts, in the accelerator form the shortcut plugin parses
+/// (`"Ctrl+Alt+R"`). An empty string turns that one off.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Hotkeys {
+    /// Start or stop recording.
+    pub record: String,
+    /// Mark this moment.
+    pub mark: String,
+    /// Pause or resume.
+    pub pause: String,
+}
+
+impl Default for Hotkeys {
+    fn default() -> Self {
+        Self {
+            record: "Ctrl+Alt+R".to_string(),
+            mark: "Ctrl+Alt+M".to_string(),
+            pause: "Ctrl+Alt+P".to_string(),
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -44,6 +75,17 @@ pub struct Settings {
     /// on capture threads with no access to `AppState`.
     #[serde(default)]
     pub ffmpeg_dir: Option<String>,
+    /// Global shortcuts (v2).
+    #[serde(default)]
+    pub hotkeys: Hotkeys,
+    /// Keep the recorder and the app window out of every capture, ChirpTime's
+    /// own included (v2). On unless the user turns it off.
+    #[serde(default = "yes")]
+    pub content_protection: bool,
+    /// Delete a session under a minute when it stops, with the usual undo
+    /// (v2). Off unless the user turns it on: nothing is deleted unasked.
+    #[serde(default)]
+    pub discard_short_sessions: bool,
 }
 
 impl Default for Settings {
@@ -54,6 +96,9 @@ impl Default for Settings {
             session: serde_json::Value::Null,
             onboarded: false,
             ffmpeg_dir: None,
+            hotkeys: Hotkeys::default(),
+            content_protection: true,
+            discard_short_sessions: false,
         }
     }
 }
@@ -119,8 +164,10 @@ pub fn load_from(path: &Path) -> Settings {
         return out;
     };
 
+    // Older files migrate forward: every key they lack takes its default below,
+    // and the file is rewritten at the current version on the next save.
     if let Some(v) = map.get("version").and_then(|v| v.as_u64()) {
-        out.version = v as u32;
+        out.version = (v as u32).max(SETTINGS_VERSION);
     }
 
     if let Some(v) = map.get("capture") {
@@ -156,6 +203,21 @@ pub fn load_from(path: &Path) -> Settings {
         if !v.trim().is_empty() {
             out.ffmpeg_dir = Some(v.to_string());
         }
+    }
+
+    if let Some(v) = map.get("hotkeys") {
+        match serde_json::from_value::<Hotkeys>(v.clone()) {
+            Ok(h) => out.hotkeys = h,
+            Err(e) => eprintln!("[chirptime] settings.hotkeys ignored: {e}"),
+        }
+    }
+
+    if let Some(v) = map.get("content_protection").and_then(|v| v.as_bool()) {
+        out.content_protection = v;
+    }
+
+    if let Some(v) = map.get("discard_short_sessions").and_then(|v| v.as_bool()) {
+        out.discard_short_sessions = v;
     }
 
     out
@@ -318,6 +380,48 @@ mod tests {
         assert!(back.onboarded);
         assert_eq!(back.session["screen_fps"], 15);
         assert_eq!(back.version, SETTINGS_VERSION);
+    }
+
+    #[test]
+    fn a_version_1_file_migrates_with_the_new_defaults() {
+        let dir = tmpdir("v1");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"capture":{"output_dir":"E:\\Keep"},"session":null,"onboarded":true,"ffmpeg_dir":null}"#,
+        )
+        .unwrap();
+        let s = load_from(&path);
+        assert_eq!(s.version, SETTINGS_VERSION);
+        assert_eq!(s.capture.output_dir, r"E:\Keep");
+        assert!(s.onboarded);
+        assert_eq!(s.hotkeys, Hotkeys::default());
+        assert!(s.content_protection, "protection is on unless turned off");
+        assert!(!s.discard_short_sessions, "nothing is deleted unasked");
+    }
+
+    #[test]
+    fn the_v2_fields_round_trip_and_a_bad_one_keeps_its_default() {
+        let dir = tmpdir("v2");
+        let path = dir.join("settings.json");
+        let mut s = Settings::default();
+        s.hotkeys.record = "Ctrl+Shift+F9".to_string();
+        s.hotkeys.pause = String::new();
+        s.content_protection = false;
+        s.discard_short_sessions = true;
+        save_to(&path, &s).unwrap();
+        let back = load_from(&path);
+        assert_eq!(back.hotkeys.record, "Ctrl+Shift+F9");
+        assert_eq!(back.hotkeys.mark, "Ctrl+Alt+M");
+        assert_eq!(back.hotkeys.pause, "");
+        assert!(!back.content_protection);
+        assert!(back.discard_short_sessions);
+
+        std::fs::write(&path, r#"{"hotkeys":"nope","content_protection":"off","onboarded":true}"#).unwrap();
+        let bad = load_from(&path);
+        assert_eq!(bad.hotkeys, Hotkeys::default());
+        assert!(bad.content_protection);
+        assert!(bad.onboarded);
     }
 
     #[test]
