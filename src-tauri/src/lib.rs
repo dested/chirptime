@@ -1,5 +1,7 @@
 mod capture;
 mod commands;
+pub mod cursor;
+mod export;
 // Public so the cut / undo / finalize paths can be exercised on synthetic
 // sessions in `tests/edit_cuts.rs`.
 pub mod edit;
@@ -119,6 +121,17 @@ pub fn run() {
             commands::finalize_cuts,
             commands::delete_session,
             commands::undo_delete_session,
+            // Marks (S6, owner: library)
+            commands::set_marker_label,
+            // Cursor track (S3, owner: widget)
+            cursor::get_cursor_track,
+            // Export composer (S5, owner: export)
+            export::estimate_export,
+            export::start_export,
+            export::cancel_export,
+            export::list_exports,
+            export::delete_export,
+            export::reveal_export,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

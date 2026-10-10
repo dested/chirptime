@@ -14,3 +14,4 @@ plans/*/canvas/project/assets/
 plans/*/shots/
 fixtures/
 plans/*/build-shots/
+src-tauri/target-*/

@@ -911,6 +911,17 @@ pub async fn add_marker(
     rec.add_marker(label)
 }
 
+/// Set or clear a mark's note (S6). Lead pre-wire: `library` replaces the stub.
+#[tauri::command]
+pub async fn set_marker_label(
+    session_id: String,
+    epoch_ms: i64,
+    label: String,
+) -> Result<(), String> {
+    let _ = (session_id, epoch_ms, label);
+    Err("Editing notes is not built yet".into())
+}
+
 /// Reconstruct a session's manifest purely by scanning its directory and
 /// ffprobing every segment. This is the crash-recovery path: it works with no
 /// `session.json` present, and the rebuilt manifest is written back atomically.
