@@ -10,6 +10,11 @@
  */
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import type { InvokeArgs } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
+import { UNHANDLED, type MockCtx } from "./extra/ctx";
+import { handleLibrary } from "./extra/library";
+import { handleWidget } from "./extra/widget";
+import { handleExport } from "./extra/export";
 import type {
   Cut,
   CutReceipt,
@@ -225,8 +230,20 @@ const SETTINGS: Settings = {
   ffmpeg_dir: null,
 };
 
+const ctx: MockCtx = {
+  session,
+  sessionIds: () => order.filter((id) => manifests.has(id)),
+  emit: (event, payload) => {
+    void emit(event, payload);
+  },
+};
+
 function handle(cmd: string, payload: InvokeArgs | undefined): unknown {
   const a = args(payload);
+  for (const extra of [handleLibrary, handleWidget, handleExport]) {
+    const r = extra(cmd, a, ctx);
+    if (r !== UNHANDLED) return r;
+  }
   switch (cmd) {
     case "list_sessions":
       return order.filter((id) => manifests.has(id)).map((id) => summarizeSession(session(id)));
@@ -295,6 +312,6 @@ export async function installMockIpc(windowLabel: string): Promise<void> {
         }
       }, 40);
     });
-  });
+  }, { shouldMockEvents: true });
   console.info(`[mockIpc] answering invoke() from ${manifests.size} fixture sessions`);
 }
