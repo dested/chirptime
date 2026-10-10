@@ -321,6 +321,8 @@ fn a_mic_only_cut_leaves_the_screen_alone() {
     assert_eq!(seg_files(&m, "mic").len(), 2);
     assert_eq!(files_in(&dir.join("mic-16k")).len(), 2);
     assert_eq!(m.cuts[0].tracks.as_deref(), Some(&["mic".to_string()][..]));
+    assert_eq!(m.markers, before.markers, "a per-track cut keeps every marker");
+    assert_eq!(session::rebuild_manifest_from_disk(&dir).unwrap().markers, before.markers);
     assert_consistent(&dir, &m);
 
     assert!(edit::delete_range(&dir, from, to, Some(vec!["webcam".to_string()])).is_err());

@@ -530,11 +530,13 @@ pub fn rebuild_manifest_from_disk(session_dir: &Path) -> Result<SessionManifest,
         }
     }
     // markers.jsonl is append-only, so a marker inside a deleted range is still
-    // in it. The cut is what says it is gone.
+    // in it. An all-track cut is what says it is gone; a per-track cut keeps it.
     let cuts = manifest.cuts.clone();
-    manifest
-        .markers
-        .retain(|mk| !cuts.iter().any(|c| mk.epoch_ms >= c.from_epoch_ms && mk.epoch_ms < c.to_epoch_ms));
+    manifest.markers.retain(|mk| {
+        !cuts.iter().any(|c| {
+            c.tracks.is_none() && mk.epoch_ms >= c.from_epoch_ms && mk.epoch_ms < c.to_epoch_ms
+        })
+    });
 
     let mut track_dirs: Vec<String> = std::fs::read_dir(session_dir)
         .map_err(|e| e.to_string())?

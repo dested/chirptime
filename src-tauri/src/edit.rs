@@ -429,10 +429,13 @@ pub fn delete_range(
         state: CutState::Pending,
         freed_bytes: 0,
     };
+    // Only a cut over every track takes the markers inside it; a per-track cut
+    // (say the mic over a private call) leaves the session's markers alone.
+    let drops_markers = tracks.is_none();
     let markers: Vec<Marker> = original
         .markers
         .iter()
-        .filter(|mk| in_range(mk.epoch_ms, from, to))
+        .filter(|mk| drops_markers && in_range(mk.epoch_ms, from, to))
         .cloned()
         .collect();
 
@@ -481,7 +484,7 @@ pub fn delete_range(
             t.segments.retain(|s| !tc.remove.iter().any(|r| r.file == s.file));
         }
     }
-    m.markers.retain(|mk| !in_range(mk.epoch_ms, from, to));
+    m.markers.retain(|mk| !pf.markers.contains(mk));
     m.cuts.push(cut.clone());
     if let Err(e) = session::write_manifest(session_dir, &m) {
         rollback(&moved);
