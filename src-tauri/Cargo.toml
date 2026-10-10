@@ -43,6 +43,8 @@ windows = { version = "0.61", features = [
     # reports the last system-wide keyboard/mouse input, and GetTickCount is the
     # clock its timestamp is measured in. See recorder::poll_last_input_ms.
     "Win32_UI_Input_KeyboardAndMouse",
+    # Cursor track (src/cursor.rs): GetCursorPos at 10 Hz while recording.
+    "Win32_UI_WindowsAndMessaging",
     "Win32_System_SystemInformation",
     # Native folder picker for the output directory (src/nativeui.rs):
     # IFileOpenDialog + FOS_PICKFOLDERS, owned by the widget window so it cannot
