@@ -11,7 +11,7 @@ import type { SyncEngine } from "../session/engine";
 import { thumbUrl } from "../hooks/mediaUrl";
 import { fmtClock12, fmtHourLabel, fmtSpan, fmtTick, fmtTimeAmPm } from "../session/format";
 import type { Hole } from "../session/cuts";
-import type { Axis, Outage, SnapKind, SnapTarget, Span } from "./timeline";
+import type { Axis, Outage, QuietSpan, SnapKind, SnapTarget, Span } from "./timeline";
 import { epochAt, frac, groupOutages, makeAxis, snap, snapLabel, thumbFor } from "./timeline";
 
 export interface Sel {
@@ -28,7 +28,8 @@ interface Props {
   manifest: SessionManifest;
   axis: Axis;
   holes: readonly Hole[];
-  idle: Span[];
+  /** away and paused stretches, veiled and labelled */
+  idle: QuietSpan[];
   outages: Outage[];
   zoom: { from: number; to: number };
   onZoom: (z: { from: number; to: number }) => void;
@@ -344,7 +345,7 @@ function DayStrip(p: Props & { thH: number }) {
               className="pointer-events-none absolute top-0 grid h-full place-items-center overflow-hidden bg-[rgba(245,243,238,.62)]"
               style={{ left: a, width: b - a }}
             >
-              {b - a > 64 && <span className="whitespace-nowrap text-[11.5px] font-semibold text-ink-2">Away {fmtSpan(s.to - s.from)}</span>}
+              {b - a > 64 && <span className="whitespace-nowrap text-[11.5px] font-semibold text-ink-2">{s.label} {fmtSpan(s.to - s.from)}</span>}
             </div>
           );
         })}
@@ -589,7 +590,7 @@ function ZoomStrip(p: Props & { zoomAxis: Axis; zH: number }) {
               className="pointer-events-none absolute top-0 grid h-full place-items-center overflow-hidden bg-[rgba(245,243,238,.62)]"
               style={{ left: a, width: b - a }}
             >
-              {b - a > 64 && <span className="whitespace-nowrap text-[11.5px] font-semibold text-ink-2">Away {fmtSpan(s.to - s.from)}</span>}
+              {b - a > 64 && <span className="whitespace-nowrap text-[11.5px] font-semibold text-ink-2">{s.label} {fmtSpan(s.to - s.from)}</span>}
             </div>
           );
         })}

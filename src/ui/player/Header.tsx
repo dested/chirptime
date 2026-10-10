@@ -4,7 +4,7 @@ import type { SessionManifest, SessionTrack, TrackKind } from "../types";
 import { href } from "../app/router";
 import { IconBack, IconExport, IconLayers, IconWarn } from "../app/icons";
 import { fmtDayTitle, fmtSize, fmtSpan, fmtTimeAmPm } from "../session/format";
-import { isIdleReason, outageHeadline, screenNumber } from "./timeline";
+import { isExpectedGap, isIdleReason, outageHeadline, screenNumber } from "./timeline";
 import { Popover } from "./Popover";
 
 interface Props {
@@ -107,7 +107,7 @@ function TracksTable({ manifest }: { manifest: SessionManifest }) {
         <tbody>
           {manifest.tracks.map((t) => {
             const bytes = t.segments.reduce((a, s) => a + s.bytes, 0);
-            const failures = t.gaps.filter((g) => !isIdleReason(g.reason) && g.to_epoch_ms - g.from_epoch_ms >= 1000).length;
+            const failures = t.gaps.filter((g) => !isExpectedGap(g.reason) && g.to_epoch_ms - g.from_epoch_ms >= 1000).length;
             const away = t.gaps.filter((g) => isIdleReason(g.reason)).length;
             const bad = t.status === "failed" || failures > 0;
             const video = t.kind === "screen" || t.kind === "webcam";

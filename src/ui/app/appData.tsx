@@ -1,11 +1,17 @@
 /**
- * What every page of the app window shares: the session list, the recorder's
- * status, and the disk. One provider polls; pages read and ask for refreshes.
+ * What every page of the app window shares: the session list, each session's
+ * manifest, the recorder's status, and the disk. One provider polls; pages read
+ * and ask for refreshes.
+ *
+ * Manifests load in the background, one at a time, and are kept until the
+ * session's summary changes (a delete, an undo, a finalize, more footage), so
+ * the Library and Marks read them without asking again.
  */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import type { EnvironmentInfo, SessionStatus, SessionSummary } from "../types";
-import { fetchSession, getEnvironment, getSessionStatus, listSessions, startSession, stopSession } from "../hooks/useApi";
+import type { EnvironmentInfo, SessionManifest, SessionStatus, SessionSummary } from "../types";
+import { listen } from "@tauri-apps/api/event";
+import { countExports, fetchSession, getEnvironment, getSessionStatus, listSessions, startSession, stopSession } from "../hooks/useApi";
 
 export function errorText(e: unknown): string {
   if (e instanceof Error) return e.message;
@@ -17,8 +23,16 @@ interface AppData {
   sessions: SessionSummary[] | null;
   sessionsError: string | null;
   refreshSessions: () => Promise<void>;
+  /** every loaded manifest by session id; fills in as they arrive */
+  manifests: ReadonlyMap<string, SessionManifest>;
+  /** true once every listed session's manifest has been tried */
+  manifestsReady: boolean;
+  /** a note was saved: patch the cached manifest without reading it again */
+  patchMark: (sessionId: string, epochMs: number, label: string) => void;
   /** markers across every session, or null while counting */
   markCount: number | null;
+  /** finished exports, or null when unknown */
+  exportCount: number | null;
   status: SessionStatus | null;
   env: EnvironmentInfo | null;
   recorderBusy: boolean;
@@ -37,6 +51,11 @@ export function useAppData(): AppData {
 
 const STATUS_POLL_MS = 2_000;
 
+/** What changes about a session when its manifest does. */
+function summarySig(s: SessionSummary): string {
+  return `${s.ended_epoch_ms}:${s.segment_count}:${s.bytes}:${s.duration_ms}`;
+}
+
 export function AppDataProvider({ children }: { children: ReactNode }) {
   const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
   const [sessionsError, setSessionsError] = useState<string | null>(null);
@@ -44,8 +63,10 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const [env, setEnv] = useState<EnvironmentInfo | null>(null);
   const [recorderBusy, setRecorderBusy] = useState(false);
   const [recorderError, setRecorderError] = useState<string | null>(null);
-  const [markCount, setMarkCount] = useState<number | null>(null);
-  const markCache = useRef(new Map<string, number>());
+  const [manifests, setManifests] = useState<ReadonlyMap<string, SessionManifest>>(() => new Map());
+  const [manifestsReady, setManifestsReady] = useState(false);
+  /** the summary each cached manifest was read against */
+  const readAgainst = useRef(new Map<string, string>());
 
   const refreshSessions = useCallback(async () => {
     try {
@@ -96,35 +117,83 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     };
   }, [refreshSessions, refreshEnv]);
 
-  // Count marks in the background, one manifest at a time, cached per session.
-  // A finished session's markers never change; a live one is re-read each time.
+  // Load manifests in the background, newest first, one at a time. A cached one
+  // is kept while its summary is unchanged; a live one is read again each time.
   useEffect(() => {
     if (!sessions) return;
     let alive = true;
+    const listed = new Set(sessions.map((s) => s.id));
+    setManifests((prev) => {
+      const gone = [...prev.keys()].filter((id) => !listed.has(id));
+      if (!gone.length) return prev;
+      const next = new Map(prev);
+      for (const id of gone) {
+        next.delete(id);
+        readAgainst.current.delete(id);
+      }
+      return next;
+    });
     void (async () => {
-      let total = 0;
       for (const s of sessions) {
         if (!s.has_manifest) continue;
-        const cached = s.ended_epoch_ms !== null ? markCache.current.get(s.id) : undefined;
-        if (cached !== undefined) {
-          total += cached;
-          continue;
-        }
+        const sig = summarySig(s);
+        if (s.ended_epoch_ms !== null && readAgainst.current.get(s.id) === sig) continue;
         try {
           const m = await fetchSession(s.id);
-          markCache.current.set(s.id, m.markers.length);
-          total += m.markers.length;
+          if (!alive) return;
+          readAgainst.current.set(s.id, sig);
+          setManifests((prev) => new Map(prev).set(s.id, m));
         } catch {
-          // an unreadable manifest has no marks we can show
+          // an unreadable manifest: the Library falls back to the summary
         }
         if (!alive) return;
       }
-      if (alive) setMarkCount(total);
+      if (alive) setManifestsReady(true);
     })();
     return () => {
       alive = false;
     };
   }, [sessions]);
+
+  // The Exports count: read at start, whenever an export finishes, and when the
+  // window comes back into focus (an export deleted on the Exports page).
+  const [exportCount, setExportCount] = useState<number | null>(null);
+  useEffect(() => {
+    let alive = true;
+    const read = () =>
+      countExports()
+        .then((n) => alive && setExportCount(n))
+        .catch(() => alive && setExportCount(null));
+    void read();
+    const onHash = () => void read();
+    window.addEventListener("hashchange", onHash);
+    window.addEventListener("focus", onHash);
+    const off = listen<{ state?: unknown }>("export-progress", (e) => {
+      if (e.payload.state === "done") void read();
+    });
+    return () => {
+      alive = false;
+      window.removeEventListener("hashchange", onHash);
+      window.removeEventListener("focus", onHash);
+      void off.then((f) => f()).catch(() => {});
+    };
+  }, []);
+
+  const markCount = useMemo(() => {
+    if (!manifestsReady) return null;
+    let n = 0;
+    for (const m of manifests.values()) n += m.markers.length;
+    return n;
+  }, [manifests, manifestsReady]);
+
+  const patchMark = useCallback((sessionId: string, epochMs: number, label: string) => {
+    setManifests((prev) => {
+      const m = prev.get(sessionId);
+      if (!m) return prev;
+      const markers = m.markers.map((mk) => (mk.epoch_ms === epochMs ? { ...mk, label } : mk));
+      return new Map(prev).set(sessionId, { ...m, markers });
+    });
+  }, []);
 
   const start = useCallback(async () => {
     setRecorderBusy(true);
@@ -160,7 +229,11 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       sessions,
       sessionsError,
       refreshSessions,
+      manifests,
+      manifestsReady,
+      patchMark,
       markCount,
+      exportCount,
       status,
       env,
       recorderBusy,
@@ -168,7 +241,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       start,
       stop,
     }),
-    [sessions, sessionsError, refreshSessions, markCount, status, env, recorderBusy, recorderError, start, stop],
+    [sessions, sessionsError, refreshSessions, manifests, manifestsReady, patchMark, markCount, exportCount, status, env, recorderBusy, recorderError, start, stop],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

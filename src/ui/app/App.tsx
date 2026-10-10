@@ -1,22 +1,54 @@
-/** The app window (Tauri label `viewer`): shell + hash router. */
-import { useEffect } from "react";
+/** The app window (Tauri label `viewer`): shell + hash router, behind the first-run gate. */
+import { useEffect, useState } from "react";
 import { AppShell } from "./AppShell";
 import { AppDataProvider } from "./appData";
 import { migrateLegacyLink, useRoute } from "./router";
-import { LaterPage, LibraryPage } from "./pages";
+import { LibraryPage } from "./LibraryPage";
+import { MarksPage } from "./MarksPage";
 import { PlayerPage } from "../player/PlayerPage";
 import { ExportPage } from "../export/ExportPage";
 import { ExportsPage } from "../export/ExportsPage";
 import { SettingsPage } from "../settings/SettingsPage";
+import { FirstRun } from "../settings/FirstRun";
+import { getSettings } from "../hooks/useApi";
 
 migrateLegacyLink();
 
+/**
+ * Whether first run still has to happen: read once. Until the answer arrives
+ * nothing renders; if settings cannot be read, the app opens rather than
+ * trapping someone in first run.
+ */
+function useOnboarded(): [boolean | null, () => void] {
+  const [onboarded, setOnboarded] = useState<boolean | null>(null);
+  useEffect(() => {
+    let alive = true;
+    getSettings()
+      .then((s) => alive && setOnboarded(s.onboarded))
+      .catch(() => alive && setOnboarded(true));
+    return () => {
+      alive = false;
+    };
+  }, []);
+  return [onboarded, () => setOnboarded(true)];
+}
+
 export function App() {
   const route = useRoute();
+  const [onboarded, finishFirstRun] = useOnboarded();
 
   useEffect(() => {
     document.title = "ChirpTime";
   }, []);
+
+  if (onboarded === null) return <div className="h-full bg-paper" />;
+  if (!onboarded) {
+    return (
+      <AppDataProvider>
+        <FirstRun onDone={finishFirstRun} />
+      </AppDataProvider>
+    );
+  }
 
   let page;
   switch (route.name) {
@@ -31,7 +63,7 @@ export function App() {
       page = <ExportPage key={route.id} id={route.id} from={route.from} to={route.to} />;
       break;
     case "marks":
-      page = <LaterPage title="Marks" line="Every mark across your sessions, with notes, comes later" />;
+      page = <MarksPage />;
       break;
     case "exports":
       page = <ExportsPage />;

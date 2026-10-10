@@ -56,7 +56,7 @@ function DeletedToast({ toast, onUndo }: { toast: Extract<ToastState, { kind: "d
   const remaining = Math.max(0, toast.until - Date.now());
 
   return (
-    <div className="toast-in pointer-events-auto relative flex h-[42px] w-[400px] items-center gap-2.5 overflow-hidden rounded-card bg-ink pl-4 pr-2 text-white shadow-[0_12px_30px_-10px_rgba(26,25,23,.55)]">
+    <div className="toast-in pointer-events-auto relative flex h-[42px] min-w-[400px] items-center gap-2.5 overflow-hidden rounded-card bg-ink pl-4 pr-2 text-white shadow-[0_12px_30px_-10px_rgba(26,25,23,.55)]">
       <span className="whitespace-nowrap text-[13px] font-semibold">{toast.title}</span>
       <span className="num whitespace-nowrap text-[11.5px] text-white/60">{toast.detail}</span>
       <div className="flex-1" />
@@ -66,7 +66,7 @@ function DeletedToast({ toast, onUndo }: { toast: Extract<ToastState, { kind: "d
         disabled={toast.undoing}
       >
         {toast.undoing ? "Undoing" : "Undo"}
-        <span className="kbd !border-white/25 !bg-transparent !text-white/55">Ctrl Z</span>
+        <span className="kbd whitespace-nowrap !border-white/25 !bg-transparent !text-white/55">Ctrl Z</span>
       </button>
       <span
         key={toast.cutId}

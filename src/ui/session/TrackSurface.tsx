@@ -19,6 +19,12 @@ interface Props {
   onSelect?: () => void;
   className?: string;
   style?: React.CSSProperties;
+  /**
+   * While the track has no footage: the last frame before the hole (a /thumb
+   * URL, or null when there is none) and why it is empty ("Away", "Cut",
+   * "The display went dark"), shown dimmed instead of a blank panel.
+   */
+  still?: { url: string | null; reason: string | null };
 }
 
 const EMPTY_TEXT: Record<Exclude<TrackState, "playing">, string> = {
@@ -36,7 +42,7 @@ const MEDIA_STYLE: React.CSSProperties = {
   background: "#000",
 };
 
-export function TrackSurface({ engine, track, state, fit = "contain", label, onSelect, className, style }: Props) {
+export function TrackSurface({ engine, track, state, fit = "contain", label, onSelect, className, style, still }: Props) {
   const aRef = useRef<HTMLVideoElement>(null);
   const bRef = useRef<HTMLVideoElement>(null);
 
@@ -59,11 +65,33 @@ export function TrackSurface({ engine, track, state, fit = "contain", label, onS
       <video ref={aRef} style={{ ...MEDIA_STYLE, objectFit: fit }} playsInline muted preload="auto" />
       <video ref={bRef} style={{ ...MEDIA_STYLE, objectFit: fit, opacity: 0 }} playsInline muted preload="auto" />
 
-      {s !== "playing" && (
-        <div className="absolute inset-0 z-[2] grid place-items-center bg-[#141412] text-[12px] font-medium text-[#F3F0E8]/45">
-          {EMPTY_TEXT[s]}
-        </div>
-      )}
+      {s !== "playing" &&
+        (still && (s === "gap" || s === "ended") ? (
+          <div className="absolute inset-0 z-[2] bg-[#141412]">
+            {still.url && (
+              <img
+                key={still.url}
+                src={still.url}
+                alt=""
+                draggable={false}
+                className="absolute inset-0 h-full w-full opacity-[.32] [filter:grayscale(.4)]"
+                style={{ objectFit: fit }}
+                onError={(e) => {
+                  e.currentTarget.style.visibility = "hidden";
+                }}
+              />
+            )}
+            <div className="absolute inset-0 grid place-items-center">
+              <span className="rounded-[7px] bg-black/45 px-2.5 py-1 text-[12px] font-medium text-[#F3F0E8]/75">
+                No footage{still.reason ? ` · ${still.reason}` : ""}
+              </span>
+            </div>
+          </div>
+        ) : (
+          <div className="absolute inset-0 z-[2] grid place-items-center bg-[#141412] text-[12px] font-medium text-[#F3F0E8]/45">
+            {EMPTY_TEXT[s]}
+          </div>
+        ))}
 
       {label && (
         <span className="absolute left-1.5 bottom-1 z-[3] text-[10px] font-semibold text-white [text-shadow:0_1px_2px_rgba(0,0,0,.8)]">

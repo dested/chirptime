@@ -175,6 +175,13 @@ export interface SessionMarker {
   label: string;
 }
 
+/** Mirrors `cursor::CursorSample`: where the mouse was at wall-clock `t`, in virtual-desktop pixels (the space of `desktop` and `TrackMonitor`). */
+export interface CursorSample {
+  t: number;
+  x: number;
+  y: number;
+}
+
 export interface DesktopRect {
   x: number;
   y: number;

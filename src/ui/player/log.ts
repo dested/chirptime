@@ -10,9 +10,9 @@ import type { SessionManifest } from "../types";
 import { sessionHoles } from "../session/cuts";
 import { sessionBounds } from "../session/engine";
 import { fmtSpan } from "../session/format";
-import { groupOutages, humanReason, idleSpans, numberList, screenOutages } from "./timeline";
+import { groupOutages, humanReason, idleSpans, numberList, pausedSpans, screenOutages } from "./timeline";
 
-export type LogKind = "start" | "mark" | "away" | "stopped" | "back" | "cut" | "end" | "interrupted";
+export type LogKind = "start" | "mark" | "away" | "paused" | "stopped" | "back" | "cut" | "end" | "interrupted";
 
 export interface LogLine {
   /** stable across re-derivations, for React keys */
@@ -26,6 +26,8 @@ export interface LogLine {
   subMuted?: boolean;
   /** a range the line can select for deletion (away stretches) */
   range?: { from: number; to: number };
+  /** a mark's note, editable in place */
+  note?: { epochMs: number; label: string };
   /** for a pending cut: its id and when undo runs out */
   cutId?: string;
   undoUntil?: number;
@@ -63,6 +65,7 @@ const ORDER: Record<LogKind, number> = {
   back: 1,
   cut: 2,
   away: 3,
+  paused: 3,
   stopped: 4,
   mark: 5,
   end: 6,
@@ -93,6 +96,7 @@ export function deriveLog(m: SessionManifest, opts: LogOptions): LogLine[] {
       title: "Mark",
       sub: label || "Add a note",
       subMuted: !label,
+      note: { epochMs: mk.epoch_ms, label },
     });
   });
 
@@ -105,6 +109,17 @@ export function deriveLog(m: SessionManifest, opts: LogOptions): LogLine[] {
       title: `Away ${fmtSpan(s.to - s.from)}`,
       sub: "Not recorded, no keyboard or mouse",
       range: { from: s.from, to: s.to },
+    });
+  }
+
+  for (const s of pausedSpans(m)) {
+    if (deleted(s.from)) continue;
+    lines.push({
+      key: `paused-${s.from}`,
+      kind: "paused",
+      at: s.from,
+      title: `Paused ${fmtSpan(s.to - s.from)}`,
+      sub: "Not recorded",
     });
   }
 

@@ -15,14 +15,15 @@ import { errorText, useAppData } from "../app/appData";
 import { navigate } from "../app/router";
 import { Header } from "./Header";
 import { Stage } from "./Stage";
-import type { View } from "./Stage";
+import type { FollowMode, View } from "./Stage";
+import { useCursorFollow } from "./useFollow";
 import { LogCard } from "./LogCard";
 import { ConfirmRow, SelectionBar, Transport } from "./Transport";
 import { Ribbon, placeZoom } from "./Ribbon";
 import type { Sel, SelPhase } from "./Ribbon";
 import { Toast } from "./Toast";
 import type { ToastState } from "./Toast";
-import { idleSpans, makeAxis, rangeBytes, screenOutages, screenTracks, sessionTotals, snapTargets } from "./timeline";
+import { makeAxis, quietSpans, rangeBytes, screenOutages, screenTracks, sessionTotals, snapTargets } from "./timeline";
 
 const WIDE_PX = 1600;
 const COLLAPSE_MS = 240;
@@ -100,7 +101,7 @@ function Player({
   initialT: number | null;
 }) {
   const id = manifest.id;
-  const { status, refreshSessions } = useAppData();
+  const { status, refreshSessions, patchMark } = useAppData();
   const live = status?.recording === true && status.session_id === id;
   const wide = useWindowWide();
   const [contentRef, contentW] = useContentWidth();
@@ -133,7 +134,7 @@ function Player({
   const bounds = useMemo(() => sessionBounds(manifest), [manifest]);
   const axis = useMemo(() => makeAxis(holes, bounds.start, bounds.end), [holes, bounds]);
   const totals = useMemo(() => sessionTotals(manifest), [manifest]);
-  const idle = useMemo(() => idleSpans(manifest), [manifest]);
+  const idle = useMemo(() => quietSpans(manifest), [manifest]);
   const outages = useMemo(() => screenOutages(manifest), [manifest]);
   const targets = useMemo(() => snapTargets(manifest), [manifest]);
   const screens = useMemo(() => screenTracks(manifest), [manifest]);
@@ -148,7 +149,33 @@ function Player({
     const big = [...screens].sort((a, b) => (b.monitor ? b.monitor.w * b.monitor.h : b.width * b.height) - (a.monitor ? a.monitor.w * a.monitor.h : a.width * a.height))[0];
     return big?.id ?? null;
   });
-  const focused = screens.find((t) => t.id === focusedId) ?? screens[0] ?? webcam;
+  // Focus follows the mouse when the session has a cursor track; 1–9 (or a
+  // click on a screen) pins one, F or 0 goes back to following.
+  const [follow, setFollow] = useState(true);
+  const cursor = useCursorFollow(engine, id, screens, focusedId);
+  const followMode: FollowMode = !cursor.hasData ? "none" : follow ? "on" : "pinned";
+  const shownId = followMode === "on" && cursor.followedId ? cursor.followedId : focusedId;
+  const focused = screens.find((t) => t.id === shownId) ?? screens[0] ?? webcam;
+  const pin = useCallback((fid: string) => {
+    setFocusedId(fid);
+    setFollow(false);
+    setView("focus");
+  }, []);
+
+  /* ---- mark notes: edited in place, without rebuilding the engine ---- */
+  const [notes, setNotes] = useState<ReadonlyMap<number, string>>(() => new Map());
+  useEffect(() => setNotes(new Map()), [manifest]);
+  const logManifest = useMemo(
+    () => (notes.size ? { ...manifest, markers: manifest.markers.map((mk) => ({ ...mk, label: notes.get(mk.epoch_ms) ?? mk.label })) } : manifest),
+    [manifest, notes],
+  );
+  const onNoteSaved = useCallback(
+    (epochMs: number, label: string) => {
+      setNotes((prev) => new Map(prev).set(epochMs, label));
+      patchMark(id, epochMs, label);
+    },
+    [id, patchMark],
+  );
 
   /* ---- zoom bracket: default 2 h around the playhead, at most 40% of a short day ---- */
   const [zoom, setZoom] = useState(() => {
@@ -302,8 +329,8 @@ function Player({
   /* ---- keys ---- */
   const keyState = useRef({ sel, phase, edge, toast, screens, view, live });
   keyState.current = { sel, phase, edge, toast, screens, view, live };
-  const actions = useRef({ doDelete, doUndo, doMark, goExport, clearSel, choose });
-  actions.current = { doDelete, doUndo, doMark, goExport, clearSel, choose };
+  const actions = useRef({ doDelete, doUndo, doMark, goExport, clearSel, choose, pin });
+  actions.current = { doDelete, doUndo, doMark, goExport, clearSel, choose, pin };
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -380,13 +407,15 @@ function Player({
         case "m":
           if (k.live) void a.doMark();
           break;
+        case "f":
+        case "0":
+          setFollow(true);
+          setView("focus");
+          break;
         default:
           if (/^[1-9]$/.test(key)) {
             const s = k.screens[Number(key) - 1];
-            if (s) {
-              setFocusedId(s.id);
-              setView("focus");
-            }
+            if (s) a.pin(s.id);
           }
       }
     };
@@ -409,10 +438,8 @@ function Player({
             view={view}
             focusedId={focused?.id ?? null}
             wide={wide}
-            onFocus={(fid) => {
-              setFocusedId(fid);
-              setView("focus");
-            }}
+            follow={followMode}
+            onFocus={pin}
             onView={setView}
           />
           <div className="mt-3">
@@ -440,7 +467,7 @@ function Player({
         </div>
         <LogCard
           engine={engine}
-          manifest={manifest}
+          manifest={logManifest}
           live={live}
           width={logW}
           onSeek={seek}
@@ -449,6 +476,7 @@ function Player({
             seek(from);
             choose({ from, to, snapFrom: "gap", snapTo: "gap" }, true, "other");
           }}
+          onNoteSaved={onNoteSaved}
         />
       </div>
 

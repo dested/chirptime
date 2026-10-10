@@ -47,6 +47,18 @@ export function isIdleReason(reason: string): boolean {
   return reason.trim().toLowerCase().startsWith("idle");
 }
 
+/** The recorder's Pause writes this reason on every track it stopped. */
+export const PAUSED_REASON = "paused";
+
+export function isPausedReason(reason: string): boolean {
+  return reason.trim().toLowerCase().startsWith(PAUSED_REASON);
+}
+
+/** A hole the person chose (away, paused), not a failure. */
+export function isExpectedGap(reason: string): boolean {
+  return isIdleReason(reason) || isPausedReason(reason);
+}
+
 /** `screen-2` → 3. Screens are numbered from 1 for people. */
 export function screenNumber(t: SessionTrack): number {
   const m = /(\d+)$/.exec(t.id);
@@ -102,6 +114,24 @@ export function idleSpans(m: SessionManifest): Span[] {
   return mergeGaps(gaps).map((g) => ({ from: g.from_epoch_ms, to: g.to_epoch_ms }));
 }
 
+/** Paused stretches: the recorder stops every track, so any track's paused gaps say it. */
+export function pausedSpans(m: SessionManifest): Span[] {
+  const gaps = m.tracks.flatMap((t) => t.gaps.filter((g) => isPausedReason(g.reason)));
+  return mergeGaps(gaps).map((g) => ({ from: g.from_epoch_ms, to: g.to_epoch_ms }));
+}
+
+/** Time nobody meant to record, veiled and labelled on the ribbons. */
+export interface QuietSpan extends Span {
+  label: "Away" | "Paused";
+}
+
+export function quietSpans(m: SessionManifest): QuietSpan[] {
+  return [
+    ...idleSpans(m).map((s): QuietSpan => ({ ...s, label: "Away" })),
+    ...pausedSpans(m).map((s): QuietSpan => ({ ...s, label: "Paused" })),
+  ].sort((a, b) => a.from - b.from);
+}
+
 export interface Outage {
   trackId: string;
   screen: number;
@@ -114,7 +144,7 @@ export interface Outage {
 export function screenOutages(m: SessionManifest): Outage[] {
   const out: Outage[] = [];
   for (const t of screenTracks(m)) {
-    const failures = mergeGaps(t.gaps.filter((g) => !isIdleReason(g.reason)));
+    const failures = mergeGaps(t.gaps.filter((g) => !isExpectedGap(g.reason)));
     for (const g of failures) {
       if (g.to_epoch_ms - g.from_epoch_ms <= OUTAGE_MIN_MS) continue;
       out.push({ trackId: t.id, screen: screenNumber(t), from: g.from_epoch_ms, to: g.to_epoch_ms, reason: g.reason });
@@ -244,7 +274,7 @@ export function snapTargets(m: SessionManifest): SnapTarget[] {
     { t: start, kind: "start" },
     { t: end, kind: "end" },
   ];
-  for (const s of idleSpans(m)) out.push({ t: s.from, kind: "gap" }, { t: s.to, kind: "gap" });
+  for (const s of quietSpans(m)) out.push({ t: s.from, kind: "gap" }, { t: s.to, kind: "gap" });
   for (const o of screenOutages(m)) out.push({ t: o.from, kind: "gap" }, { t: o.to, kind: "gap" });
   for (const mk of m.markers) out.push({ t: mk.epoch_ms, kind: "mark" });
   for (const h of sessionHoles(m)) out.push({ t: h.from, kind: "cut" }, { t: h.to, kind: "cut" });
@@ -316,4 +346,47 @@ export function thumbFor(m: SessionManifest, track: SessionTrack, t: number, ste
     if (hasFootage(m, track, c)) return c;
   }
   return null;
+}
+
+/* ---- what a stopped track shows ------------------------------------------- */
+
+/**
+ * The last instant this track had footage before `t`, skipping its holes
+ * (gaps and cuts), or null when nothing came before. The stage shows that
+ * frame, dimmed, while the playhead sits in a gap.
+ */
+export function lastFootageBefore(m: SessionManifest, track: SessionTrack, t: number): number | null {
+  const holes = trackHoles(m, track.id);
+  const segs = track.segments;
+  let probe = t;
+  // each pass steps back over one hole or one segment, so this ends
+  for (let guard = 0; guard < segs.length + holes.length + 2; guard++) {
+    const hole = holes.find((h) => probe > h.from && probe <= h.to);
+    if (hole) {
+      probe = hole.from;
+      continue;
+    }
+    let seg: SessionSegment | null = null;
+    for (const s of segs) {
+      if (s.start_epoch_ms < probe) seg = s;
+      else break;
+    }
+    if (!seg) return null;
+    const end = Math.min(probe, seg.start_epoch_ms + seg.duration_ms);
+    // the last frame sits a moment before the end
+    const at = Math.max(seg.start_epoch_ms, end - 1_000);
+    if (!holes.some((h) => at >= h.from && at < h.to)) return at;
+    probe = at;
+  }
+  return null;
+}
+
+/** Why this track has no footage at `t`, in a few words. */
+export function gapReasonAt(m: SessionManifest, track: SessionTrack, t: number): string | null {
+  if (trackHoles(m, track.id).some((h) => t >= h.from && t < h.to)) return "Cut";
+  const g = track.gaps.find((x) => t >= x.from_epoch_ms && t < x.to_epoch_ms);
+  if (!g) return null;
+  if (isIdleReason(g.reason)) return "Away";
+  if (isPausedReason(g.reason)) return "Paused";
+  return humanReason(g.reason);
 }

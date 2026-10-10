@@ -232,6 +232,69 @@ function shortDay(): SessionPlan {
   };
 }
 
+/**
+ * A small session for the Library's time map: one 1440p screen, a camera and a
+ * mic, at a light 640 px. `gaps` land on every track (paused, idle).
+ */
+function smallDay(
+  start: number,
+  minutes: number,
+  gaps: { from: number; to: number; reason: string }[] = [],
+  markers: { at: number; label: string }[] = [],
+): SessionPlan {
+  const end = start + minutes * MIN;
+  const g: TrackGap[] = gaps.map((x) => ({ from_epoch_ms: start + x.from * MIN, to_epoch_ms: start + x.to * MIN, reason: x.reason }));
+  const runs = runsBetween(start, end, g);
+  const picture = (id: string, kind: TrackKind, title: string, ground: string, monitor: TrackMonitor | null): TrackPlan => ({
+    id,
+    kind,
+    label: kind === "screen" ? "DISPLAY1 (2560x1440)" : "Fixture camera",
+    monitor,
+    width: 640,
+    height: 360,
+    runs,
+    gaps: g,
+    title,
+    ground,
+    pitch: 0,
+  });
+  return {
+    id: sessionId(start),
+    start,
+    end,
+    desktop: { x: 0, y: 0, w: 2560, h: 1440 },
+    tracks: [
+      picture("screen-0", "screen", "Screen 1", GROUNDS[2], { output_idx: 0, adapter: 0, x: 0, y: 0, w: 2560, h: 1440 }),
+      picture("webcam", "webcam", "Camera", "0x3A3833", null),
+      {
+        id: "mic",
+        kind: "mic",
+        label: "Fixture microphone",
+        monitor: null,
+        width: 0,
+        height: 0,
+        runs,
+        gaps: g,
+        title: "Mic",
+        ground: "",
+        pitch: 220,
+      },
+    ],
+    markers: markers.map((m) => ({ epoch_ms: start + m.at * MIN, label: m.label })),
+  };
+}
+
+/** Sessions for the Library: more days, a pause, a midnight crossing, two starts pressed twice. */
+function libraryDays(): SessionPlan[] {
+  return [
+    smallDay(new Date(2026, 6, 30, 9, 12, 5).getTime(), 150, [{ from: 70, to: 95, reason: IDLE_REASON }], [{ at: 31, label: "Standup notes" }]),
+    smallDay(new Date(2026, 6, 31, 13, 5, 40).getTime(), 75, [{ from: 35, to: 47, reason: "paused" }], [{ at: 60, label: "" }]),
+    smallDay(new Date(2026, 7, 2, 14, 10, 2).getTime(), 0.5),
+    smallDay(new Date(2026, 7, 2, 14, 11, 9).getTime(), 1 / 3),
+    smallDay(new Date(2026, 7, 3, 23, 20, 30).getTime(), 75, [], [{ at: 50, label: "After midnight" }]),
+  ];
+}
+
 /* ---- ffmpeg ------------------------------------------------------------- */
 
 /** Retries twice: lavfi under load occasionally dies with ENOMEM on Windows. */
@@ -323,7 +386,7 @@ async function buildTrack(dir: string, t: TrackPlan): Promise<SessionTrack> {
     segments,
     gaps: t.gaps,
     status: "stopped",
-    restarts: t.gaps.filter((g) => g.reason !== IDLE_REASON).length,
+    restarts: t.gaps.filter((g) => g.reason !== IDLE_REASON && g.reason !== "paused").length,
   };
 }
 
@@ -382,7 +445,7 @@ async function buildSession(plan: SessionPlan): Promise<SessionManifest> {
 }
 
 const manifests: SessionManifest[] = [];
-for (const plan of [mainDay(), shortDay()]) manifests.push(await buildSession(plan));
+for (const plan of [mainDay(), shortDay(), ...libraryDays()]) manifests.push(await buildSession(plan));
 // The same list `list_sessions` returns, newest first; `listSessions()` reads it
 // when there is no Tauri backend.
 await writeFile(

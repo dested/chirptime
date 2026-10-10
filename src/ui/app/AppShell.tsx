@@ -41,14 +41,14 @@ function navOwner(r: Route): RouteName {
 
 export function AppShell({ route, children }: { route: Route; children: ReactNode }) {
   const width = useWindowWidth();
-  const { sessions, markCount } = useAppData();
+  const { sessions, markCount, exportCount } = useAppData();
   const collapsed = (route.name === "session" || route.name === "export") && width < WIDE_PX;
   const active = navOwner(route);
 
   const items: NavItem[] = [
     { name: "library", label: "Library", icon: IconLibrary, count: sessions?.length ?? null },
     { name: "marks", label: "Marks", icon: IconFlag, count: markCount },
-    { name: "exports", label: "Exports", icon: IconExport, count: 0 },
+    { name: "exports", label: "Exports", icon: IconExport, count: exportCount },
     { name: "settings", label: "Settings", icon: IconSliders, count: null },
   ];
 

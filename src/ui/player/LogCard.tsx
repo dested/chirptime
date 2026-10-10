@@ -4,6 +4,7 @@ import type { SessionManifest } from "../types";
 import type { SyncEngine } from "../session/engine";
 import { fmtSpan, fmtTimeAmPm } from "../session/format";
 import { IconTrash } from "../app/icons";
+import { NoteField } from "../app/NoteField";
 import { currentLineIndex, deriveLog } from "./log";
 import type { LogKind, LogLine } from "./log";
 
@@ -14,6 +15,7 @@ interface Props {
   width: number;
   onSeek: (t: number) => void;
   onSelectRange: (from: number, to: number) => void;
+  onNoteSaved: (epochMs: number, label: string) => void;
 }
 
 type Filter = "all" | "marks";
@@ -40,7 +42,7 @@ function usePlayhead(engine: SyncEngine): number {
   return t;
 }
 
-export function LogCard({ engine, manifest, live, width, onSeek, onSelectRange }: Props) {
+export function LogCard({ engine, manifest, live, width, onSeek, onSelectRange, onNoteSaved }: Props) {
   const [filter, setFilter] = useState<Filter>("all");
   const hasPending = manifest.cuts.some((c) => c.state === "pending" && c.created_epoch_ms + 10_000 > Date.now());
   const now = useNowWhile(hasPending);
@@ -90,8 +92,11 @@ export function LogCard({ engine, manifest, live, width, onSeek, onSelectRange }
             key={l.key}
             line={l}
             current={lines[current]?.key === l.key}
+            sessionId={manifest.id}
+            live={live}
             onSeek={onSeek}
             onSelectRange={onSelectRange}
+            onNoteSaved={onNoteSaved}
           />
         ))}
       </div>
@@ -108,14 +113,21 @@ const DOT: Partial<Record<LogKind, string>> = {
 function Line({
   line,
   current,
+  sessionId,
+  live,
   onSeek,
   onSelectRange,
+  onNoteSaved,
 }: {
   line: LogLine;
   current: boolean;
+  sessionId: string;
+  live: boolean;
   onSeek: (t: number) => void;
   onSelectRange: (from: number, to: number) => void;
+  onNoteSaved: (epochMs: number, label: string) => void;
 }) {
+  const note = line.note;
   const range = line.range;
   const titleTone =
     line.kind === "stopped" ? "text-[#8A4A05]" : line.kind === "cut" || line.kind === "interrupted" ? "text-ink-3" : "text-ink";
@@ -138,8 +150,17 @@ function Line({
           {DOT[line.kind] && <span className={DOT[line.kind]} />}
           {line.title}
         </div>
-        {line.sub && (
-          <div className={`mt-0.5 text-[12px] leading-[1.38] ${line.subMuted ? "text-ink-4" : "text-ink-3"}`}>{line.sub}</div>
+        {note ? (
+          <NoteField
+            sessionId={sessionId}
+            epochMs={note.epochMs}
+            label={note.label}
+            lockedReason={live ? "Stop recording to edit notes" : null}
+            onSaved={(label) => onNoteSaved(note.epochMs, label)}
+            className="mt-0.5 text-[12px] leading-[1.38]"
+          />
+        ) : (
+          line.sub && <div className={`mt-0.5 text-[12px] leading-[1.38] ${line.subMuted ? "text-ink-4" : "text-ink-3"}`}>{line.sub}</div>
         )}
         {range && (
           <button

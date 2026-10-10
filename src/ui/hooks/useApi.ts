@@ -6,6 +6,7 @@ import type {
   MonitorConfig,
   CaptureConfig,
   CaptureStatus,
+  CursorSample,
   CutReceipt,
   EnvironmentInfo,
   FfmpegSetup,
@@ -231,6 +232,19 @@ export async function addMarker(label: string): Promise<SessionMarker> {
   return invoke<SessionMarker>("add_marker", { label });
 }
 
+/**
+ * Set a mark's note; an empty label clears it. Rejects with
+ * "Stop recording to edit notes" while that session records.
+ */
+export async function setMarkerLabel(sessionId: string, epochMs: number, label: string): Promise<SessionMarker> {
+  return invoke<SessionMarker>("set_marker_label", { sessionId, epochMs, label });
+}
+
+/** Cursor positions in `[fromMs, toMs]`, ascending, cuts excluded. Empty when the session has none. */
+export async function getCursorTrack(sessionId: string, fromMs: number, toMs: number): Promise<CursorSample[]> {
+  return invoke<CursorSample[]>("get_cursor_track", { sessionId, fromMs: Math.floor(fromMs), toMs: Math.ceil(toMs) });
+}
+
 /** Reconstruct a manifest by scanning the session directory and probing every segment. */
 export async function rebuildSession(id: string): Promise<SessionManifest> {
   return invoke<SessionManifest>("rebuild_session", { id });
@@ -274,6 +288,15 @@ export async function deleteSession(id: string): Promise<SessionTrashReceipt> {
 
 export async function undoDeleteSession(id: string): Promise<void> {
   return invoke("undo_delete_session", { id });
+}
+
+/**
+ * How many finished exports there are, for the sidebar. The rows themselves
+ * belong to the Exports page; only the count is read here.
+ */
+export async function countExports(): Promise<number> {
+  const rows = await invoke<unknown>("list_exports");
+  return Array.isArray(rows) ? rows.length : 0;
 }
 
 /** DXGI outputs with the recorder's own `screen_index` and a real capturable flag. */

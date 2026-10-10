@@ -11,9 +11,13 @@ import type { SessionManifest, SessionTrack } from "../types";
 import type { EngineSnapshot, SyncEngine, TrackState } from "../session/engine";
 import { TrackSurface } from "../session/TrackSurface";
 import { thumbUrl } from "../hooks/mediaUrl";
-import { screenNumber, screenTracks, thumbFor } from "./timeline";
+import { gapReasonAt, lastFootageBefore, screenNumber, screenTracks, thumbFor } from "./timeline";
 
 export type View = "focus" | "desk";
+/** on: Focus follows the mouse; pinned: a screen was picked by hand; none: no cursor data */
+export type FollowMode = "on" | "pinned" | "none";
+
+type Still = { url: string | null; reason: string | null };
 
 interface Props {
   engine: SyncEngine;
@@ -21,11 +25,14 @@ interface Props {
   view: View;
   focusedId: string | null;
   wide: boolean;
+  follow: FollowMode;
   onFocus: (id: string) => void;
   onView: (v: View) => void;
 }
 
 const PAD = 10;
+/** the band under Desk that holds its caption and the Focus | Desk switch */
+const DESK_BAND = 36;
 
 function useSize<T extends HTMLElement>() {
   const ref = useRef<T>(null);
@@ -43,12 +50,15 @@ function useSize<T extends HTMLElement>() {
   return [ref, size] as const;
 }
 
-/** The engine's per-track state at 5 Hz, and the playhead rounded for thumbnails. */
-function useTrackStates(engine: SyncEngine): { states: Record<string, TrackState>; thumbT: number } {
+/**
+ * The engine's per-track state at 5 Hz, the playhead rounded for thumbnails,
+ * and the playhead as of the last change to either (for a gap's reason).
+ */
+function useTrackStates(engine: SyncEngine): { states: Record<string, TrackState>; thumbT: number; at: number } {
   const pick = (s: EngineSnapshot) => {
     const states: Record<string, TrackState> = {};
     for (const [id, d] of Object.entries(s.tracks)) states[id] = d.state;
-    return { states, thumbT: s.masterEpochMs - (s.masterEpochMs % 10_000) };
+    return { states, thumbT: s.masterEpochMs - (s.masterEpochMs % 10_000), at: s.masterEpochMs };
   };
   const [v, setV] = useState(() => pick(engine.snapshot()));
   useEffect(() => {
@@ -63,9 +73,29 @@ function useTrackStates(engine: SyncEngine): { states: Record<string, TrackState
   return v;
 }
 
-export function Stage({ engine, manifest, view, focusedId, wide, onFocus, onView }: Props) {
+/** For each picture track with no footage at the playhead: the last frame before it, and why. */
+function useStills(manifest: SessionManifest, states: Record<string, TrackState>, at: number, width: number): Record<string, Still> {
+  return useMemo(() => {
+    const out: Record<string, Still> = {};
+    for (const t of manifest.tracks) {
+      const st = states[t.id];
+      if (t.kind !== "screen" && t.kind !== "webcam") continue;
+      if (st !== "gap" && st !== "ended") continue;
+      const last = lastFootageBefore(manifest, t, at);
+      const shot = last === null ? null : thumbFor(manifest, t, last);
+      out[t.id] = {
+        url: shot === null ? null : thumbUrl(manifest.id, t.id, shot, width),
+        reason: gapReasonAt(manifest, t, at) ?? (st === "ended" ? "Stopped recording" : null),
+      };
+    }
+    return out;
+  }, [manifest, states, at, width]);
+}
+
+export function Stage({ engine, manifest, view, focusedId, wide, follow, onFocus, onView }: Props) {
   const [ref, size] = useSize<HTMLDivElement>();
-  const { states, thumbT } = useTrackStates(engine);
+  const { states, thumbT, at } = useTrackStates(engine);
+  const stills = useStills(manifest, states, at, wide ? 960 : 640);
   const screens = useMemo(() => screenTracks(manifest), [manifest]);
   const webcam = manifest.tracks.find((t) => t.kind === "webcam") ?? null;
   const focused = screens.find((t) => t.id === focusedId) ?? screens[0] ?? webcam;
@@ -74,7 +104,7 @@ export function Stage({ engine, manifest, view, focusedId, wide, onFocus, onView
     <div ref={ref} className="relative min-h-0 flex-1 overflow-hidden rounded-card bg-mat">
       {size.w > 0 &&
         (view === "desk" || !focused ? (
-          <DeskView engine={engine} manifest={manifest} screens={screens} webcam={webcam} states={states} w={size.w} h={size.h} onPick={onFocus} />
+          <DeskView engine={engine} manifest={manifest} screens={screens} webcam={webcam} states={states} stills={stills} w={size.w} h={size.h} onPick={onFocus} />
         ) : (
           <FocusView
             engine={engine}
@@ -83,6 +113,8 @@ export function Stage({ engine, manifest, view, focusedId, wide, onFocus, onView
             webcam={webcam}
             focused={focused}
             states={states}
+            stills={stills}
+            follow={follow}
             thumbT={thumbT}
             w={size.w}
             h={size.h}
@@ -129,6 +161,8 @@ interface FocusProps {
   webcam: SessionTrack | null;
   focused: SessionTrack;
   states: Record<string, TrackState>;
+  stills: Record<string, Still>;
+  follow: FollowMode;
   thumbT: number;
   w: number;
   h: number;
@@ -162,7 +196,7 @@ function focusGeom(focused: SessionTrack, hasScreens: boolean, w: number, h: num
   return { showRow, bx: PAD + (areaW - bw) / 2, by, bw, bh, y2, rowMid: showRow ? y2 + rowH / 2 : h - PAD - 15 };
 }
 
-function FocusView({ engine, manifest, screens, webcam, focused, states, thumbT, w, h, rowH, onFocus }: FocusProps) {
+function FocusView({ engine, manifest, screens, webcam, focused, states, stills, follow, thumbT, w, h, rowH, onFocus }: FocusProps) {
   const { showRow, bx, by, bw, bh, y2 } = focusGeom(focused, screens.length > 0, w, h, rowH);
   const camW = Math.round((rowH * 16) / 9);
   const n = screens.length;
@@ -173,6 +207,7 @@ function FocusView({ engine, manifest, screens, webcam, focused, states, thumbT,
         engine={engine}
         track={focused}
         state={states[focused.id]}
+        still={stills[focused.id]}
         className="rounded-[4px]"
         style={{ left: bx, top: by, width: bw, height: bh, boxShadow: "0 0 0 1.5px rgba(255,216,77,.9)" }}
       />
@@ -183,6 +218,7 @@ function FocusView({ engine, manifest, screens, webcam, focused, states, thumbT,
               engine={engine}
               track={webcam}
               state={states[webcam.id]}
+              still={stills[webcam.id]}
               fit="cover"
               label="Camera"
               className="rounded-[6px]"
@@ -203,14 +239,35 @@ function FocusView({ engine, manifest, screens, webcam, focused, states, thumbT,
             className="pointer-events-none absolute flex flex-col justify-center gap-1 whitespace-nowrap text-[12px] text-[#F3F0E8]/60"
             style={{ left: PAD + (webcam ? camW + 16 : 0) + miniWidth(manifest, rowH - 8) + 14, top: y2, height: rowH }}
           >
-            <span>
-              <span className="font-semibold text-[#F3F0E8]">Screen {screenNumber(focused)}</span>
-              {n > 1 ? ` · press 1–${Math.min(n, 9)} to switch, D for the desk` : " · D for the desk"}
-            </span>
+            <FocusCaption follow={follow} screen={screenNumber(focused)} n={n} />
           </div>
         </>
       )}
     </>
+  );
+}
+
+function FocusCaption({ follow, screen, n }: { follow: FollowMode; screen: number; n: number }) {
+  const keys = `1–${Math.min(n, 9)}`;
+  if (follow === "on" && n > 1) {
+    return (
+      <span>
+        <span className="font-semibold text-[#F3F0E8]">Following your mouse</span> · press {keys} to pin, D for the desk
+      </span>
+    );
+  }
+  if (follow === "pinned" && n > 1) {
+    return (
+      <span>
+        <span className="font-semibold text-[#F3F0E8]">Screen {screen}</span> · F to follow your mouse, D for the desk
+      </span>
+    );
+  }
+  return (
+    <span>
+      <span className="font-semibold text-[#F3F0E8]">Screen {screen}</span>
+      {n > 1 ? ` · press ${keys} to switch, D for the desk` : " · D for the desk"}
+    </span>
   );
 }
 
@@ -308,13 +365,11 @@ function intersects(a: Rect, b: Rect): boolean {
 }
 
 /**
- * The biggest 16:9 camera that fits in a corner of the stage without covering a
- * monitor. Corners are tried at every size from large to small; the largest
- * fit wins. Falls back to a small camera bottom-right.
+ * The biggest 16:9 camera between `minW` and `maxW` wide that fits in a corner
+ * of `stage` without covering a monitor, or null. Corners are tried at every
+ * size from large to small; the largest fit wins.
  */
-export function cameraCorner(stage: Rect, monitors: Rect[], margin = 10): Rect {
-  const maxW = stage.w * 0.3;
-  const minW = 96;
+export function fitCorner(stage: Rect, monitors: Rect[], margin: number, maxW: number, minW: number): Rect | null {
   let best: Rect | null = null;
   for (const corner of ["tl", "tr", "bl", "br"] as const) {
     for (let cw = maxW; cw >= minW; cw -= 8) {
@@ -331,6 +386,19 @@ export function cameraCorner(stage: Rect, monitors: Rect[], margin = 10): Rect {
       }
     }
   }
+  return best;
+}
+
+/**
+ * Where Desk puts the camera: the largest empty corner of the desk itself when
+ * the arrangement leaves one (so the whole composition stays centred), else a
+ * corner of the stage, else small at the bottom right.
+ */
+export function cameraCorner(stage: Rect, monitors: Rect[], desk?: Rect, margin = 10): Rect {
+  const minW = 96;
+  const inDesk = desk ? fitCorner(desk, monitors, 0, Math.min(desk.w * 0.36, stage.w * 0.3), Math.max(minW, desk.w * 0.16)) : null;
+  if (inDesk) return inDesk;
+  const best = fitCorner(stage, monitors, margin, stage.w * 0.3, minW);
   if (best) return best;
   const cw = Math.max(minW, stage.w * 0.16);
   return { x: stage.x + stage.w - margin - cw, y: stage.y + stage.h - margin - (cw * 9) / 16, w: cw, h: (cw * 9) / 16 };
@@ -342,6 +410,7 @@ function DeskView({
   screens,
   webcam,
   states,
+  stills,
   w,
   h,
   onPick,
@@ -351,25 +420,29 @@ function DeskView({
   screens: SessionTrack[];
   webcam: SessionTrack | null;
   states: Record<string, TrackState>;
+  stills: Record<string, Still>;
   w: number;
   h: number;
   onPick: (id: string) => void;
 }) {
   const d = manifest.desktop;
-  // leave the bottom-right free for the Focus | Desk switch
+  // The desk sits at the true centre of the stage, moving up only as far as it
+  // must to clear the caption band at the bottom.
   const areaW = w - PAD * 2;
-  const areaH = h - PAD * 2 - 36;
+  const areaH = h - PAD * 2 - DESK_BAND;
   const placed = screens.filter((t) => t.monitor);
   const sc = d.w && d.h ? Math.min(areaW / d.w, areaH / d.h) : 0;
   const ox = PAD + (areaW - d.w * sc) / 2;
-  const oy = PAD + (areaH - d.h * sc) / 2;
+  const oy = Math.max(PAD, Math.min((h - d.h * sc) / 2, h - PAD - DESK_BAND - d.h * sc));
   const rects = placed.map((t) => {
     const m = t.monitor;
     return m
       ? { t, r: { x: ox + (m.x - d.x) * sc + 2, y: oy + (m.y - d.y) * sc + 2, w: m.w * sc - 4, h: m.h * sc - 4 } }
       : null;
   });
-  const cam = webcam ? cameraCorner({ x: 0, y: 0, w, h: h - 36 }, rects.flatMap((x) => (x ? [x.r] : []))) : null;
+  const cam = webcam
+    ? cameraCorner({ x: 0, y: 0, w, h: h - DESK_BAND }, rects.flatMap((x) => (x ? [x.r] : [])), { x: ox, y: oy, w: d.w * sc, h: d.h * sc })
+    : null;
 
   return (
     <>
@@ -381,6 +454,7 @@ function DeskView({
               engine={engine}
               track={x.t}
               state={states[x.t.id]}
+              still={stills[x.t.id]}
               fit="fill"
               label={`${screenNumber(x.t)}`}
               onSelect={() => onPick(x.t.id)}
@@ -394,6 +468,7 @@ function DeskView({
           engine={engine}
           track={webcam}
           state={states[webcam.id]}
+          still={stills[webcam.id]}
           fit="cover"
           label="Camera"
           className="rounded-[6px]"

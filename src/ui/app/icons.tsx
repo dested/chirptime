@@ -94,6 +94,12 @@ export const IconWarn = (p: P) => (
     <path d="M12 10v4M12 17.5v.5" />
   </Svg>
 );
+export const IconInfo = (p: P) => (
+  <Svg {...p}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 8v5M12 16v.5" />
+  </Svg>
+);
 export const IconCheck = (p: P) => (
   <Svg stroke={2.4} {...p}>
     <path d="M5 12.5l4.5 4.5L19 7.5" />
