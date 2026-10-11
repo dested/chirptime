@@ -3,6 +3,13 @@
 > Terse log of every task: what was asked → what was done. Newest first.
 > Older entries: `updates-archive.md` (created once this passes ~300 lines).
 
+## 2026-10-10 — Player sound, Select button, first release install
+No sound in the viewer: Stage attached only screen and webcam tracks, so mic and
+system audio never had media elements (AudioSink added; sound now on by default).
+Cutting a block was drag-only and undiscoverable: a Select button in the
+transport starts a 1-minute selection at the playhead. Pushed to master; release
+built (`bun run build`) and installed per-user to `%LOCALAPPDATA%\ChirpTime`.
+
 ## 2026-10-10 — Redesign sprint: Paper app, delete time, export, recorder rebuilt
 Sal asked for a full UI/UX rethink, the ability to delete blocks of time, and
 export. He took every recommendation, with overrides: the player looks like the
