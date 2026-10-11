@@ -8,7 +8,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { SessionManifest } from "../types";
 import { addMarker, deleteRange, fetchSession, undoCut } from "../hooks/useApi";
-import { SyncEngine, sessionBounds } from "../session/engine";
+import { SyncEngine, isVideoTrack, sessionBounds } from "../session/engine";
 import { collapse, sessionHoles } from "../session/cuts";
 import { fmtSize, fmtSpan } from "../session/format";
 import { errorText, useAppData } from "../app/appData";
@@ -108,7 +108,8 @@ function Player({
 
   /* ---- the engine, rebuilt per manifest with the transport carried over ---- */
   const carry = useRef({ t: initialT, playing: false, rate: 1 });
-  const [audioIds, setAudioIds] = useState<string[]>([]);
+  // Sound on by default: mic and system audio together, as the transport's "All".
+  const [audioIds, setAudioIds] = useState<string[]>(() => manifest.tracks.filter((t) => !isVideoTrack(t)).map((t) => t.id));
   const engine = useMemo(() => new SyncEngine(manifest), [manifest]);
   useEffect(() => {
     const c = carry.current;
@@ -326,6 +327,15 @@ function Player({
     setPhase("confirm");
   }, [engine, bounds]);
 
+  /** The Select button: one minute from the playhead (or up to the end), its edges ready to drag. */
+  const selectHere = useCallback(() => {
+    const t = engine.masterEpochMs;
+    const to = Math.min(bounds.end, t + 60_000);
+    const from = to - t < 5_000 ? Math.max(bounds.start, bounds.end - 60_000) : t;
+    if (to - from < 1000) return;
+    choose({ from, to, snapFrom: null, snapTo: null }, true, "other");
+  }, [engine, bounds, choose]);
+
   /* ---- keys ---- */
   const keyState = useRef({ sel, phase, edge, toast, screens, view, live });
   keyState.current = { sel, phase, edge, toast, screens, view, live };
@@ -461,7 +471,7 @@ function Player({
                 onClear={clearSel}
               />
             ) : (
-              <Transport engine={engine} axis={axis} manifest={manifest} live={live} audioIds={audioIds} onAudio={setAudioIds} onMark={() => void doMark()} />
+              <Transport engine={engine} axis={axis} manifest={manifest} live={live} audioIds={audioIds} onAudio={setAudioIds} onMark={() => void doMark()} onSelect={selectHere} />
             )}
           </div>
         </div>

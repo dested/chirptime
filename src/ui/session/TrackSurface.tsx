@@ -27,6 +27,30 @@ interface Props {
   still?: { url: string | null; reason: string | null };
 }
 
+/**
+ * A sound-only track (mic, system audio): the same two swapped elements, never
+ * shown. Without one the engine has nothing to unmute.
+ */
+export function AudioSink({ engine, track }: { engine: SyncEngine; track: SessionTrack }) {
+  const aRef = useRef<HTMLAudioElement>(null);
+  const bRef = useRef<HTMLAudioElement>(null);
+
+  useEffect(() => {
+    const a = aRef.current;
+    const b = bRef.current;
+    if (!a || !b) return;
+    engine.attachTrack(track.id, a, b);
+    return () => engine.detachTrack(track.id);
+  }, [engine, track.id]);
+
+  return (
+    <>
+      <audio ref={aRef} muted preload="auto" className="hidden" />
+      <audio ref={bRef} muted preload="auto" className="hidden" />
+    </>
+  );
+}
+
 const EMPTY_TEXT: Record<Exclude<TrackState, "playing">, string> = {
   gap: "No footage here",
   pending: "Not started yet",

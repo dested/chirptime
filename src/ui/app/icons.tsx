@@ -73,6 +73,13 @@ export const IconMuted = (p: P) => (
     <path d="M17 9l4 6M21 9l-4 6" />
   </Svg>
 );
+export const IconScissors = (p: P) => (
+  <Svg {...p}>
+    <circle cx="6" cy="6" r="3" />
+    <circle cx="6" cy="18" r="3" />
+    <path d="M20 4L8.1 15.9M14.5 14.5L20 20M8.1 8.1L12 12" />
+  </Svg>
+);
 export const IconTrash = (p: P) => (
   <Svg stroke={2.2} {...p}>
     <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14" />

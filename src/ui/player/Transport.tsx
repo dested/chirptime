@@ -7,7 +7,7 @@ import type { SessionManifest, SessionTrack } from "../types";
 import type { SyncEngine } from "../session/engine";
 import { isVideoTrack } from "../session/engine";
 import { fmtClock12, fmtHms, fmtSize, fmtSpan, fmtTimeAmPm } from "../session/format";
-import { IconDown, IconFlag, IconMuted, IconPause, IconPlay, IconTrash, IconVolume, IconX } from "../app/icons";
+import { IconDown, IconFlag, IconMuted, IconPause, IconPlay, IconScissors, IconTrash, IconVolume, IconX } from "../app/icons";
 import type { Axis } from "./timeline";
 import { Popover, MenuItem } from "./Popover";
 import { trackName } from "./Header";
@@ -34,9 +34,11 @@ interface TransportProps {
   audioIds: string[];
   onAudio: (ids: string[]) => void;
   onMark: () => void;
+  /** start a selection at the playhead, ready to stretch */
+  onSelect: () => void;
 }
 
-export function Transport({ engine, axis, manifest, live, audioIds, onAudio, onMark }: TransportProps) {
+export function Transport({ engine, axis, manifest, live, audioIds, onAudio, onMark, onSelect }: TransportProps) {
   const clockRef = useRef<HTMLSpanElement>(null);
   const elapsedRef = useRef<HTMLSpanElement>(null);
   const [playing, setPlaying] = useState(engine.playing);
@@ -100,6 +102,14 @@ export function Transport({ engine, axis, manifest, live, audioIds, onAudio, onM
         ))}
       </div>
       <div className="flex-1" />
+      <button
+        className={GHOST}
+        onClick={onSelect}
+        title="Select a stretch to delete or export · or drag across the timeline, or press I and O"
+      >
+        <IconScissors size={15} />
+        Select
+      </button>
       <button
         className={`${GHOST} disabled:cursor-default disabled:opacity-45 disabled:hover:bg-transparent disabled:hover:text-ink-2`}
         disabled={!live}

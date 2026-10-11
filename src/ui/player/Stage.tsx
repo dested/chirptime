@@ -8,8 +8,9 @@
  */
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { SessionManifest, SessionTrack } from "../types";
+import { isVideoTrack } from "../session/engine";
 import type { EngineSnapshot, SyncEngine, TrackState } from "../session/engine";
-import { TrackSurface } from "../session/TrackSurface";
+import { AudioSink, TrackSurface } from "../session/TrackSurface";
 import { thumbUrl } from "../hooks/mediaUrl";
 import { gapReasonAt, lastFootageBefore, screenNumber, screenTracks, thumbFor } from "./timeline";
 
@@ -121,6 +122,11 @@ export function Stage({ engine, manifest, view, focusedId, wide, follow, onFocus
             rowH={wide ? 110 : 78}
             onFocus={onFocus}
           />
+        ))}
+      {manifest.tracks
+        .filter((t) => !isVideoTrack(t))
+        .map((t) => (
+          <AudioSink key={t.id} engine={engine} track={t} />
         ))}
       <ViewSwitch
         view={view}
