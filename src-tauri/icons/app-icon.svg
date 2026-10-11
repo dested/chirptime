@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- ChirpTime app icon: the in-app mark (src/ui/app/icons.tsx Mark) on an ink tile. Source for `tauri icon`. -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2A2925" />
+      <stop offset="1" stop-color="#151412" />
+    </linearGradient>
+    <radialGradient id="dot" cx="0.38" cy="0.34" r="0.75">
+      <stop offset="0" stop-color="#FFE47E" />
+      <stop offset="0.6" stop-color="#FFD84D" />
+      <stop offset="1" stop-color="#E8B800" />
+    </radialGradient>
+  </defs>
+  <rect x="24" y="24" width="976" height="976" rx="224" fill="url(#tile)" />
+  <rect x="25.5" y="25.5" width="973" height="973" rx="222.5" fill="none" stroke="#FFFFFF" stroke-opacity="0.07" stroke-width="3" />
+  <g transform="translate(98 104) scale(34)">
+    <circle cx="9" cy="12" r="5.2" fill="url(#dot)" />
+    <path d="M16.2 8.6a5 5 0 010 6.8" fill="none" stroke="#F5F3EE" stroke-width="2.1" stroke-linecap="round" />
+    <path d="M19.4 5.8a9 9 0 010 12.4" fill="none" stroke="#F5F3EE" stroke-width="2.1" stroke-linecap="round" stroke-opacity="0.5" />
+  </g>
+</svg>
